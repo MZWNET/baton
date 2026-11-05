@@ -6,6 +6,8 @@ baton reads and writes sessions of [pi](https://github.com/earendil-works/pi), [
 
 ## Usage
 
+Tagged versions are published on [Releases](https://github.com/MZWNET/baton/releases). For a preview of the latest code, download your platform's archive from the artifacts of the newest [Build](https://github.com/MZWNET/baton/actions/workflows/build.yml?query=branch%3Amaster) run.
+
 ```sh
 cargo install --path crates/baton-cli
 

@@ -86,10 +86,8 @@ impl Baton {
     ///
     /// Blocks while another baton process uses the same cache directory.
     pub fn open() -> Result<Baton> {
-        let dirs =
-            ProjectDirs::from("", "", "baton").context("cannot locate the home directory")?;
-        let data = env_dir("BATON_HOME").unwrap_or_else(|| dirs.data_dir().to_path_buf());
-        let cache = env_dir("BATON_CACHE_DIR").unwrap_or_else(|| dirs.cache_dir().to_path_buf());
+        let data = env_dir_or("BATON_HOME", ProjectDirs::data_dir)?;
+        let cache = env_dir_or("BATON_CACHE_DIR", ProjectDirs::cache_dir)?;
         fs::create_dir_all(&data).with_context(|| format!("creating {}", data.display()))?;
         fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
         let lock = OpenOptions::new()
@@ -390,8 +388,11 @@ impl Baton {
     }
 }
 
-fn env_dir(name: &str) -> Option<PathBuf> {
-    env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+// An override skips the platform lookup, which fails on Windows when `USERPROFILE` names a profile without `AppData`
+fn env_dir_or(name: &str, platform_dir: fn(&ProjectDirs) -> &Path) -> Result<PathBuf> {
+    if let Some(dir) = env::var_os(name).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    let dirs = ProjectDirs::from("", "", "baton").context("cannot locate the home directory")?;
+    Ok(platform_dir(&dirs).to_path_buf())
 }
