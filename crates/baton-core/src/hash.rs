@@ -4,7 +4,7 @@ use sha2::Sha256;
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
 
-    format!("{:x}", Sha256::digest(bytes))
+    base16ct::lower::encode_string(&Sha256::digest(bytes))
 }
 
 // Sorted keys at every level keep hashes independent of how a native format ordered its fields
