@@ -50,7 +50,12 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          git ls-files '*.nix' | xargs alejandra --check
+
+      - name: Check flake
+        run: nix flake check
 
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

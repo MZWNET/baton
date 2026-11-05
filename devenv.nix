@@ -9,6 +9,7 @@
   };
 
   git-hooks.hooks = {
+    alejandra.enable = true;
     rustfmt.enable = true;
     clippy.enable = true;
   };
@@ -23,6 +24,7 @@
     cargo --version
     which cargo-pretty
     crate2nix --version
+    alejandra --version
     rustfmt --version
     clippy-driver --version
     rust-analyzer --version
