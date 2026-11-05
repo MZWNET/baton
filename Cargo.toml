@@ -10,7 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 baton-adapters = { path = "crates/baton-adapters" }
 baton-core = { path = "crates/baton-core" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
