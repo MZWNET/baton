@@ -95,16 +95,7 @@ impl<'a> RolloutParser<'a> {
                 }
                 bodies
             }
-            "function_call" => {
-                let input = match item["arguments"].as_str() {
-                    Some(arguments) => serde_json::from_str(arguments)
-                        .ok()
-                        .filter(Value::is_object)
-                        .unwrap_or_else(|| json!({"input": arguments})),
-                    None => normalize::tool_input(item["arguments"].clone()),
-                };
-                call(name, input)
-            }
+            "function_call" => call(name, normalize::arguments(&item["arguments"])),
             "custom_tool_call" => call(name, json!({"input": item["input"]})),
             "local_shell_call" => {
                 call("local_shell", normalize::tool_input(item["action"].clone()))

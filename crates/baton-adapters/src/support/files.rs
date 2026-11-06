@@ -20,6 +20,45 @@ pub(crate) fn env_dir(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+// Agents following the XDG layout use it on every platform, Windows and macOS included
+pub(crate) fn xdg_data_home() -> Result<PathBuf> {
+    match env_dir("XDG_DATA_HOME") {
+        Some(dir) => Ok(dir),
+        None => Ok(home()?.join(".local").join("share")),
+    }
+}
+
+// Where VS Code based editors keep their user data
+pub(crate) fn editor_data(name: &str) -> Result<PathBuf> {
+    let base = if cfg!(target_os = "macos") {
+        home()?.join("Library").join("Application Support")
+    } else if cfg!(windows) {
+        roaming_app_data()?
+    } else {
+        match env_dir("XDG_CONFIG_HOME") {
+            Some(dir) => dir,
+            None => home()?.join(".config"),
+        }
+    };
+    Ok(base.join(name))
+}
+
+pub(crate) fn roaming_app_data() -> Result<PathBuf> {
+    windows_dir("APPDATA", "Roaming")
+}
+
+pub(crate) fn local_app_data() -> Result<PathBuf> {
+    windows_dir("LOCALAPPDATA", "Local")
+}
+
+// Node and Python agents read the environment before falling back to the folder in the profile
+fn windows_dir(variable: &str, folder: &str) -> Result<PathBuf> {
+    match env_dir(variable) {
+        Some(dir) => Ok(dir),
+        None => Ok(home()?.join("AppData").join(folder)),
+    }
+}
+
 // Sorted entries, or none when the directory does not exist yet
 pub(crate) fn read_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(dir) {
@@ -33,6 +72,18 @@ pub(crate) fn read_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+// A path with every character other than an ASCII letter or digit turned into a dash, per UTF-16 unit as JavaScript agents count them
+pub(crate) fn dashed(path: &str) -> String {
+    let mut dashed = String::with_capacity(path.len());
+    for unit in path.encode_utf16() {
+        dashed.push(match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
+            _ => '-',
+        });
+    }
+    dashed
 }
 
 pub(crate) fn create_new(path: &Path, bytes: &[u8]) -> Result<()> {

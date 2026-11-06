@@ -53,3 +53,14 @@ pub(crate) fn tool_input(value: Value) -> Value {
         other => json!({ "input": other }),
     }
 }
+
+// Arguments that OpenAI-shaped formats keep as JSON encoded in a string
+pub(crate) fn arguments(value: &Value) -> Value {
+    match value.as_str() {
+        Some(text) => serde_json::from_str(text)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({ "input": text })),
+        None => tool_input(value.clone()),
+    }
+}

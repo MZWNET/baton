@@ -1,15 +1,10 @@
-// Claude Code names a project directory after its path with every character other than an ASCII letter or digit turned into a dash, per UTF-16 unit, and shortens long names with a hash
+use crate::support::files;
+
+// Claude Code names a project directory after its dashed path, and shortens long names with a hash
 pub(super) fn from_cwd(cwd: &str) -> String {
-    let units: Vec<u16> = cwd.encode_utf16().collect();
-    let mut key = String::with_capacity(units.len());
-    for &unit in &units {
-        key.push(match u8::try_from(unit) {
-            Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
-            _ => '-',
-        });
-    }
+    let mut key = files::dashed(cwd);
     if key.len() > 200 {
-        let hash = units.iter().fold(0i32, |hash, &unit| {
+        let hash = cwd.encode_utf16().fold(0i32, |hash, unit| {
             hash.wrapping_mul(31).wrapping_add(i32::from(unit))
         });
         key.truncate(200);

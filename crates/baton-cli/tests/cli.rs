@@ -28,21 +28,45 @@ impl Home {
         self.path("project")
     }
 
-    // Agents keep their stores under HOME on Unix and USERPROFILE on Windows
+    // Agents keep their stores under HOME on Unix and USERPROFILE on Windows, unless these variables move them
+    const STORE_VARIABLES: [&str; 22] = [
+        "PI_CODING_AGENT_DIR",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "HERMES_HOME",
+        "MASTRA_DB_PATH",
+        "MASTRA_APP_DATA_DIR",
+        "MASTRA_RESOURCE_ID",
+        "DEVIN_SESSIONS_DIR",
+        "COPILOT_HOME",
+        "GROK_HOME",
+        "OPENHANDS_CONVERSATIONS_DIR",
+        "OPENHANDS_PERSISTENCE_DIR",
+        "VIBE_HOME",
+        "VIBE_SESSION_LOGGING__SAVE_DIR",
+        "QWEN_HOME",
+        "QWEN_RUNTIME_DIR",
+        "KIMI_CODE_HOME",
+        "CURSOR_CONFIG_DIR",
+    ];
+
     fn baton(&self, args: &[&str]) -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_baton"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_baton"));
+        command
             .args(args)
             .current_dir(self.project())
             .env("HOME", self.dir.path())
             .env("USERPROFILE", self.dir.path())
             .env("BATON_HOME", self.path("baton"))
-            .env("BATON_CACHE_DIR", self.path("cache"))
-            .env_remove("PI_CODING_AGENT_DIR")
-            .env_remove("CLAUDE_CONFIG_DIR")
-            .env_remove("CODEX_HOME")
-            .env_remove("XDG_DATA_HOME")
-            .output()
-            .unwrap();
+            .env("BATON_CACHE_DIR", self.path("cache"));
+        for variable in Home::STORE_VARIABLES {
+            command.env_remove(variable);
+        }
+        let output = command.output().unwrap();
         assert!(
             output.status.success(),
             "baton {args:?} failed: {}",

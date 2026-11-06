@@ -45,7 +45,7 @@ pub struct NativeSession {
 }
 
 /// How far an import got through a native session file.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Progress {
     /// Byte offset just past the last complete line that was read.
     pub offset: u64,
@@ -105,11 +105,9 @@ pub struct Export<'a> {
     pub events: &'a [&'a Event],
 }
 
-/// Reads and writes the sessions of one agent.
-///
-/// Reading has to preserve whatever writing produced: reading a written session must give back the written events, as compared by [`replay::digest`](crate::replay::digest), so that a session continued in an agent can flow back into the unified session it was exported from.
-pub trait Adapter {
-    /// The agent this adapter handles.
+/// Reads the sessions of one agent.
+pub trait Source {
+    /// The agent this source handles.
     fn agent(&self) -> Agent;
 
     /// Lists the sessions under the agent's default location, or under `path` when it is given: either an agent home directory or a single session file.
@@ -122,7 +120,12 @@ pub trait Adapter {
         cursor: Option<&Cursor>,
         blobs: &Blobs,
     ) -> Result<NativeRead>;
+}
 
+/// Reads and writes the sessions of one agent.
+///
+/// Reading has to preserve whatever writing produced: reading a written session must give back the written events, as compared by [`replay::digest`](crate::replay::digest), so that a session continued in an agent can flow back into the unified session it was exported from.
+pub trait Adapter: Source {
     /// Writes the events as a new native session without overwriting anything; images are read from `blobs`.
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession>;
 

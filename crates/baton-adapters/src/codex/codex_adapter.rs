@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{Result, bail};
 use baton_core::{
-    Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Stamp, journal, time,
+    Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp, journal, time,
 };
 use chrono::Local;
 use serde_json::{Value, json};
@@ -119,7 +119,7 @@ fn walk(dir: &Path, found: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-impl Adapter for CodexAdapter {
+impl Source for CodexAdapter {
     fn agent(&self) -> Agent {
         Agent::Codex
     }
@@ -164,7 +164,9 @@ impl Adapter for CodexAdapter {
             RolloutParser::new(blobs, leaf)
         })
     }
+}
 
+impl Adapter for CodexAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         use std::io::Write;
 

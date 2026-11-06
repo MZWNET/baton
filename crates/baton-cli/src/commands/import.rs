@@ -19,8 +19,8 @@ pub(crate) fn run(baton: &mut Baton, agent: Option<Agent>, path: Option<&Path>) 
     };
     let mut tally = Tally::default();
     for agent in agents {
-        let adapter = baton_adapters::adapter(agent)?;
-        let sessions = match adapter.discover(path) {
+        let source = baton_adapters::source(agent)?;
+        let sessions = match source.discover(path) {
             Ok(sessions) => sessions,
             Err(error) => {
                 eprintln!("baton: {agent}: {error:#}");
@@ -28,15 +28,15 @@ pub(crate) fn run(baton: &mut Baton, agent: Option<Agent>, path: Option<&Path>) 
             }
         };
         for native in sessions {
-            let source = format!("{agent}:{}", native.id);
-            match baton.import(adapter.as_ref(), &native) {
+            let reference = format!("{agent}:{}", native.id);
+            match baton.import(&*source, &native) {
                 Ok(ImportOutcome::Created { session }) => {
                     tally.created += 1;
-                    println!("new     {session}  {source}");
+                    println!("new     {session}  {reference}");
                 }
                 Ok(ImportOutcome::Appended { session, events }) => {
                     tally.updated += 1;
-                    println!("update  {session}  +{events}  {source}");
+                    println!("update  {session}  +{events}  {reference}");
                 }
                 Ok(ImportOutcome::Forked {
                     session,
@@ -44,10 +44,10 @@ pub(crate) fn run(baton: &mut Baton, agent: Option<Agent>, path: Option<&Path>) 
                     events,
                 }) => {
                     tally.forked += 1;
-                    println!("fork    {session}  from {from}  +{events}  {source}");
+                    println!("fork    {session}  from {from}  +{events}  {reference}");
                 }
                 Ok(ImportOutcome::Unchanged) => tally.unchanged += 1,
-                Err(error) => eprintln!("baton: {source}: {error:#}"),
+                Err(error) => eprintln!("baton: {reference}: {error:#}"),
             }
         }
     }

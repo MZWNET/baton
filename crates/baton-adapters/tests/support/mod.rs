@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use baton_core::{Assistant, Body, Compaction, Draft, Image, Thinking, ToolCall, ToolResult, User};
+use rusqlite::Connection;
 use serde_json::Value;
 
 pub fn jsonl(records: &[Value]) -> String {
@@ -13,6 +14,14 @@ pub fn jsonl(records: &[Value]) -> String {
 pub fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
+}
+
+// A database at `path` holding `sql`, such as the schema an agent creates
+pub fn database(path: &Path, sql: &str) -> Connection {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let connection = Connection::open(path).unwrap();
+    connection.execute_batch(sql).unwrap();
+    connection
 }
 
 pub fn draft(body: Body) -> Draft {

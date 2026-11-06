@@ -3,7 +3,7 @@ use baton_core::{Blobs, Body, Event, Image};
 use serde_json::{Value, json};
 
 use crate::support::unit::{self, Unit};
-use crate::support::{identifiers, images};
+use crate::support::{identifiers, images, json};
 
 // The Claude Code version written into records; newer versions read transcripts of older ones
 const VERSION: &str = "2.1.209";
@@ -80,7 +80,7 @@ impl<'a> TranscriptWriter<'a> {
     pub(super) fn push_title(&mut self, title: &str) {
         let record =
             json!({"type": "custom-title", "customTitle": title, "sessionId": self.session});
-        self.push_line(&record);
+        json::push_line(&mut self.out, &record);
     }
 
     pub(super) fn finish(self) -> String {
@@ -141,11 +141,6 @@ impl<'a> TranscriptWriter<'a> {
         Ok(json!(blocks))
     }
 
-    fn push_line(&mut self, value: &Value) {
-        self.out.push_str(&value.to_string());
-        self.out.push('\n');
-    }
-
     fn push_record(&mut self, timestamp: &str, kind: &str, fields: Value) {
         let uuid = identifiers::uuid_v4();
         let mut record = json!({
@@ -163,7 +158,7 @@ impl<'a> TranscriptWriter<'a> {
         for (key, value) in fields.as_object().expect("record fields are objects") {
             record[key] = value.clone();
         }
-        self.push_line(&record);
+        json::push_line(&mut self.out, &record);
         self.parent = Some(uuid);
     }
 }

@@ -2,7 +2,7 @@
 
 Keep the conversations of your coding agents in one append-only history, back it up or sync it anywhere, and continue any of them in another agent.
 
-baton reads and writes sessions of [pi](https://github.com/earendil-works/pi), [Oh My Pi](https://github.com/can1357/oh-my-pi) (`omp`), [Claude Code](https://github.com/anthropics/claude-code) (`claude`), [Codex](https://github.com/openai/codex) and [OpenCode](https://github.com/anomalyco/opencode), on Linux, macOS and Windows.
+baton reads and writes sessions of [pi](https://github.com/earendil-works/pi), [Oh My Pi](https://github.com/can1357/oh-my-pi) (`omp`), [Claude Code](https://github.com/anthropics/claude-code) (`claude`), [Codex](https://github.com/openai/codex), [OpenCode](https://github.com/anomalyco/opencode), [Kilo Code](https://github.com/Kilo-Org/kilocode) (`kilo`), [Hermes Agent](https://github.com/NousResearch/hermes-agent) (`hermes`), [MastraCode](https://github.com/mastra-ai/mastra/tree/main/mastracode), [Devin CLI](https://docs.devin.ai/cli) (`devin`), [GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`), [Grok Build](https://github.com/xai-org/grok-build) (`grok`), [OpenHands CLI](https://github.com/OpenHands/OpenHands-CLI) (`openhands`), [Mistral Vibe](https://github.com/mistralai/mistral-vibe) (`vibe`), [Qwen Code](https://github.com/QwenLM/qwen-code) (`qwen`), [Kimi Code](https://github.com/MoonshotAI/kimi-code) (`kimi`), [Muse Code](https://dev.meta.ai/docs/muse-code/) (`muse`), [Antigravity CLI](https://antigravity.google/docs/cli/) (`antigravity`) and [Cursor Agent](https://cursor.com/cli) (`cursor`). It also reads, but cannot write, the [Antigravity](https://antigravity.google/) desktop app and IDE (`antigravity-desktop`, `antigravity-ide`) and the [Cursor](https://cursor.com/) editor (`cursor-ide`). It runs on Linux, macOS and Windows.
 
 ## Usage
 
@@ -37,8 +37,8 @@ Imports are incremental and idempotent. A session exported to another agent and 
 
 - Agent sessions are only read during import. Exports create new sessions and never overwrite existing ones.
 - Thinking is stored but never written back to an agent, tool calls are written as history and never run again, and auth, hooks and MCP settings are never touched.
-- Each agent's own location variables are honored: `PI_CODING_AGENT_DIR`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME`.
-- OpenCode sessions go through the `opencode` command, so it has to be on `PATH`.
+- Each agent's own location variables are honored, such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME` and `XDG_CONFIG_HOME`.
+- OpenCode and Kilo Code sessions go through their `opencode` and `kilo` commands, so those have to be on `PATH`.
 
 ## Credits
 

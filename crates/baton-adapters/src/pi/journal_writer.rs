@@ -6,7 +6,7 @@ use baton_core::{Blobs, Body, Event, Image, time};
 use serde_json::{Value, json};
 
 use crate::support::unit::{self, Unit};
-use crate::support::{files, identifiers, images};
+use crate::support::{files, identifiers, images, json};
 
 const TITLE_SLOT: usize = 256;
 
@@ -38,8 +38,7 @@ impl<'a> JournalWriter<'a> {
     }
 
     pub(super) fn push_line(&mut self, value: &Value) {
-        self.out.push_str(&value.to_string());
-        self.out.push('\n');
+        json::push_line(&mut self.out, value);
     }
 
     pub(super) fn push_events(&mut self, events: &[&Event]) -> Result<()> {

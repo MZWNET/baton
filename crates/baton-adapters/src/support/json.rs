@@ -1,5 +1,11 @@
+use std::fmt::Write;
+
 use baton_core::time;
 use serde_json::Value;
+
+pub(crate) fn push_line(out: &mut String, value: &Value) {
+    writeln!(out, "{value}").expect("writing to a string cannot fail");
+}
 
 // A non-empty string field
 pub(crate) fn string(value: &Value) -> Option<String> {
@@ -21,6 +27,15 @@ pub(crate) fn texts(blocks: &[Value], kinds: &[&str]) -> String {
         }
     }
     texts.join("\n")
+}
+
+// A string as it is and any other value as compact JSON, the way tool results reach the model
+pub(crate) fn to_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 pub(crate) fn timestamp(value: &Value, fallback: &str) -> String {

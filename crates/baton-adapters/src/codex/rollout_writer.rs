@@ -4,7 +4,7 @@ use anyhow::Result;
 use baton_core::{Blobs, Body, Event};
 use serde_json::{Value, json};
 
-use crate::support::images;
+use crate::support::{images, json};
 
 // The Codex version written into session_meta; newer versions resume rollouts of older ones
 const CLI_VERSION: &str = "0.144.4";
@@ -113,7 +113,6 @@ impl<'a> RolloutWriter<'a> {
 
     fn push_record(&mut self, timestamp: &str, kind: &str, payload: Value) {
         let record = json!({"timestamp": timestamp, "type": kind, "payload": payload});
-        self.out.push_str(&record.to_string());
-        self.out.push('\n');
+        json::push_line(&mut self.out, &record);
     }
 }

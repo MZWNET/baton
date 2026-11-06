@@ -10,7 +10,7 @@ use crate::cache::Cursors;
 use crate::sync::step::{self, Step};
 use crate::{
     Adapter, Agent, Cursor, Direction, Draft, Event, Export, ForkPoint, Index, Info, Link,
-    NativeRead, NativeSession, Progress, Session, SessionMeta, Store, replay,
+    NativeRead, NativeSession, Progress, Session, SessionMeta, Source, Store, replay,
 };
 
 /// The data directory with its caches, locked for the lifetime of the value.
@@ -113,10 +113,10 @@ impl Baton {
     /// Unchanged sessions are skipped and grown files are read incrementally. A native session the unified session was imported from is matched by event ids; one it was exported to is matched by [`replay::digest`] over the exported events. When the unified session moved on since the native session last matched it, the native continuation becomes a fork.
     pub fn import(
         &mut self,
-        adapter: &(impl Adapter + ?Sized),
+        source: &(impl Source + ?Sized),
         native: &NativeSession,
     ) -> Result<ImportOutcome> {
-        let agent = adapter.agent();
+        let agent = source.agent();
         let linked = self.index.linked_session(agent, &native.id)?;
         let cursor = self
             .cursors
@@ -140,7 +140,7 @@ impl Baton {
             drafts,
             continued,
             progress,
-        } = adapter.read(native, cursor.as_ref(), &self.store.blobs())?;
+        } = source.read(native, cursor.as_ref(), &self.store.blobs())?;
         let incoming = Incoming {
             agent,
             native,

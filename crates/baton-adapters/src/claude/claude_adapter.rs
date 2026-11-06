@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::Result;
 use baton_core::{
-    Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Stamp, journal,
+    Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp, journal,
 };
 use uuid::Uuid;
 
@@ -52,7 +52,7 @@ impl ClaudeAdapter {
     }
 }
 
-impl Adapter for ClaudeAdapter {
+impl Source for ClaudeAdapter {
     fn agent(&self) -> Agent {
         Agent::Claude
     }
@@ -81,7 +81,9 @@ impl Adapter for ClaudeAdapter {
     ) -> Result<NativeRead> {
         journal::read(&session.path, cursor, |_| TranscriptParser::new(blobs))
     }
+}
 
+impl Adapter for ClaudeAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         let id = identifiers::uuid_v4();
         let cwd = export.cwd.to_string_lossy();

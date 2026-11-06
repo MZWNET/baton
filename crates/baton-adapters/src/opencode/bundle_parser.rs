@@ -6,6 +6,7 @@ use baton_core::{
 use serde_json::Value;
 
 use crate::opencode::bundle_writer::UNNAMED;
+use crate::opencode::tool_order;
 use crate::support::normalize::{self, Content};
 use crate::support::{images, json};
 
@@ -78,7 +79,9 @@ pub(super) fn parse_bundle(bundle: &Value, blobs: &Blobs) -> Result<NativeRead> 
                             }
                         }
                         "tool" => {
-                            drafts.push(draft(tool_call(part), &part["id"]));
+                            if tool_order::synthetic_call_id(&part["state"]).is_none() {
+                                drafts.push(draft(tool_call(part), &part["id"]));
+                            }
                             if let Some(result) = tool_result(blobs, part)? {
                                 results.push(draft(result, &part["id"]));
                             }
@@ -137,11 +140,22 @@ fn tool_result(blobs: &Blobs, part: &Value) -> Result<Option<Body>> {
             }
             (state["output"].as_str(), attached, false)
         }
-        "error" => (state["error"].as_str(), Vec::new(), true),
+        "error" => {
+            let mut attached = Vec::new();
+            if let Some(urls) = state["metadata"]["baton"]["images"].as_array() {
+                for url in urls {
+                    if let Some(url) = url.as_str() {
+                        attached.extend(images::from_data_url(blobs, url)?);
+                    }
+                }
+            }
+            (state["error"].as_str(), attached, true)
+        }
         _ => return Ok(None),
     };
     Ok(Some(Body::ToolResult(ToolResult {
-        call_id: normalize::call_id(&part["callID"]),
+        call_id: tool_order::synthetic_call_id(state)
+            .map_or_else(|| normalize::call_id(&part["callID"]), str::to_owned),
         text: text.unwrap_or_default().to_owned(),
         images: attached,
         is_error,

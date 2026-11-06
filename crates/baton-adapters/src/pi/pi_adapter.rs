@@ -4,7 +4,7 @@ use std::process::Command;
 
 use anyhow::{Result, bail};
 use baton_core::{
-    Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Stamp, journal, time,
+    Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp, journal, time,
 };
 use serde_json::json;
 
@@ -82,7 +82,7 @@ impl PiAdapter {
     }
 }
 
-impl Adapter for PiAdapter {
+impl Source for PiAdapter {
     fn agent(&self) -> Agent {
         self.agent
     }
@@ -124,7 +124,9 @@ impl Adapter for PiAdapter {
             JournalParser::new(blobs, blob_dir.clone(), leaf)
         })
     }
+}
 
+impl Adapter for PiAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         let id = identifiers::uuid_v7();
         let created = export.created;

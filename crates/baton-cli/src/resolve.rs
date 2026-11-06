@@ -25,9 +25,9 @@ pub(crate) fn session_id(baton: &mut Baton, query: &str) -> Result<String> {
     if let Some(session) = baton.index.linked_session_by_prefix(agent, prefix)? {
         return Ok(session);
     }
-    let adapter = baton_adapters::adapter(agent)?;
+    let source = baton_adapters::source(agent)?;
     let mut matches: Vec<NativeSession> = Vec::new();
-    for native in adapter.discover(None)? {
+    for native in source.discover(None)? {
         if native.id.starts_with(prefix) {
             matches.push(native);
         }
@@ -35,7 +35,7 @@ pub(crate) fn session_id(baton: &mut Baton, query: &str) -> Result<String> {
     let [native] = matches.as_slice() else {
         bail!("{} {agent} sessions match `{prefix}`", matches.len());
     };
-    match baton.import(adapter.as_ref(), native)? {
+    match baton.import(&*source, native)? {
         ImportOutcome::Created { session }
         | ImportOutcome::Appended { session, .. }
         | ImportOutcome::Forked { session, .. } => Ok(session),

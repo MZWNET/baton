@@ -1,17 +1,16 @@
-use std::collections::HashMap;
-
 use anyhow::Result;
 use baton_core::{Blobs, Body, Event, Export, Image, ToolResult, time};
 use serde_json::{Value, json};
 
 use crate::opencode::ascending_ids::AscendingIds;
+use crate::opencode::tool_order::{self, Placement, ToolOrder};
 use crate::support::images;
 use crate::support::unit::{self, Unit};
 
 // OpenCode's placeholder title, which it replaces with a generated one after the next message
 pub(super) const UNNAMED: &str = "New session - ";
 
-// OpenCode keeps a tool result inside the part of its call, so a result whose call is missing is left out
+// Detached results get a marked tool part at their original position
 pub(super) fn write_bundle(
     export: &Export,
     session_id: &str,
@@ -25,7 +24,7 @@ pub(super) fn write_bundle(
         cwd: &cwd,
         ids: AscendingIds::default(),
         messages: Vec::new(),
-        calls: HashMap::new(),
+        calls: ToolOrder::default(),
         last_user: None,
     };
     writer.push_events(export.events)?;
@@ -59,27 +58,22 @@ enum Reply {
     CompactionSummary,
 }
 
-// Where a tool call's part sits, so its result can be stored into it
-struct CallPart {
-    message: usize,
-    part: usize,
-}
-
 struct BundleWriter<'a> {
     blobs: &'a Blobs,
     session: &'a str,
     cwd: &'a str,
     ids: AscendingIds,
     messages: Vec<Value>,
-    calls: HashMap<String, CallPart>,
+    calls: ToolOrder<'a>,
     last_user: Option<String>,
 }
 
-impl BundleWriter<'_> {
-    fn push_events(&mut self, events: &[&Event]) -> Result<()> {
+impl<'a> BundleWriter<'a> {
+    fn push_events(&mut self, events: &[&'a Event]) -> Result<()> {
         for unit in unit::units(events) {
             match unit {
                 Unit::User(event, user) => {
+                    self.calls.clear();
                     let millis = time::unix_millis(&event.timestamp);
                     let id = self.ids.next("msg", millis);
                     let mut parts = Vec::new();
@@ -100,17 +94,13 @@ impl BundleWriter<'_> {
                     let millis = time::unix_millis(&events[0].timestamp);
                     let id = self.ids.next("msg", millis);
                     let mut parts = Vec::new();
-                    for event in &events {
+                    for &event in &events {
                         let fields = match &event.body {
                             Body::Assistant(assistant) => {
                                 json!({"type": "text", "text": assistant.text})
                             }
                             Body::ToolCall(call) => {
-                                let position = CallPart {
-                                    message: self.messages.len(),
-                                    part: parts.len(),
-                                };
-                                self.calls.insert(call.call_id.clone(), position);
+                                self.calls.insert(call, self.messages.len(), parts.len());
                                 json!({"type": "tool", "callID": call.call_id, "tool": call.name,
                                        "state": {"status": "pending", "input": call.input, "raw": ""}})
                             }
@@ -120,9 +110,11 @@ impl BundleWriter<'_> {
                     }
                     let parent = self.last_user.clone().unwrap_or_else(|| id.clone());
                     self.push_assistant(&id, &parent, millis, parts, Reply::Turn);
+                    self.calls.assistant(&events);
                 }
                 Unit::ToolResult(event, result) => self.store_result(event, result)?,
                 Unit::Compaction(event, summary) => {
+                    self.calls.clear();
                     let millis = time::unix_millis(&event.timestamp);
                     let request = self.ids.next("msg", millis);
                     let marker = self.part(
@@ -147,18 +139,51 @@ impl BundleWriter<'_> {
     }
 
     fn store_result(&mut self, event: &Event, result: &ToolResult) -> Result<()> {
-        let Some(position) = self.calls.get(&result.call_id) else {
-            return Ok(());
-        };
-        let (message, index) = (position.message, position.part);
+        match self.calls.result(result) {
+            Placement::InPlace { message, part } => {
+                self.settle_result(message, part, event, result, None)
+            }
+            Placement::Synthetic(call) => {
+                let synthetic = tool_order::synthetic(result, call);
+                let millis = time::unix_millis(&event.timestamp);
+                let id = self.ids.next("msg", millis);
+                let part = self.part(
+                    &id,
+                    millis,
+                    json!({"type": "tool", "callID": synthetic.id, "tool": synthetic.name,
+                    "state": {"status": "pending", "input": synthetic.input, "raw": ""}}),
+                );
+                let parent = self.last_user.clone().unwrap_or_else(|| id.clone());
+                let message = self.messages.len();
+                self.push_assistant(&id, &parent, millis, vec![part], Reply::Turn);
+                self.settle_result(message, 0, event, result, Some(synthetic.marker))
+            }
+        }
+    }
+
+    fn settle_result(
+        &mut self,
+        message: usize,
+        index: usize,
+        event: &Event,
+        result: &ToolResult,
+        mut marker: Option<Value>,
+    ) -> Result<()> {
         let info = &self.messages[message]["info"];
-        let start = info["time"]["created"].as_i64().unwrap_or_default();
-        let message_id = info["id"].as_str().unwrap_or_default().to_owned();
+        let start = info["time"]["created"].as_i64().expect("message has a creation time");
+        let message_id = info["id"].as_str().expect("message has an id").to_owned();
         let end = time::unix_millis(&event.timestamp).max(start);
         let call = &self.messages[message]["parts"][index];
         let tool = call["tool"].clone();
         let input = call["state"]["input"].clone();
-        let state = if result.is_error {
+        let mut state = if result.is_error {
+            if !result.images.is_empty() {
+                let mut attached = Vec::new();
+                for image in &result.images {
+                    attached.push(images::data_url(self.blobs, image)?);
+                }
+                marker.get_or_insert_with(|| json!({}))["images"] = json!(attached);
+            }
             json!({"status": "error", "input": input, "error": result.text, "time": {"start": start, "end": end}})
         } else {
             let mut state = json!({"status": "completed", "input": input, "output": result.text, "title": tool,
@@ -173,6 +198,7 @@ impl BundleWriter<'_> {
             }
             state
         };
+        tool_order::set_marker(&mut state, marker);
         self.messages[message]["parts"][index]["state"] = state;
         Ok(())
     }
