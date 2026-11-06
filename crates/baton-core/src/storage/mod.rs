@@ -3,4 +3,4 @@ mod store;
 
 pub use blobs::Blobs;
 pub use store::Store;
-pub(crate) use store::write_atomic;
+pub(crate) use store::{record_order, write_atomic};

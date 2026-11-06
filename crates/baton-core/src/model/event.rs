@@ -5,9 +5,9 @@ use crate::{Agent, Body, hash};
 
 const FORMAT_VERSION: u32 = 1;
 
-/// One line of `events.jsonl`.
+/// One event in a compressed session segment.
 ///
-/// Events form a tree through `parent`, and the active branch of a session ends at its last event. An id hashes the body together with the parent id, so equal content with equal history always gets the same id, whichever agent it was imported from.
+/// Events form a tree through `parent`, and the active branch ends at the newest leaf. An id hashes the body together with the parent id, so equal content with equal history always gets the same id, whichever agent it was imported from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     /// The version of the event format.

@@ -62,7 +62,14 @@ impl Home {
             .env("HOME", self.dir.path())
             .env("USERPROFILE", self.dir.path())
             .env("BATON_HOME", self.path("baton"))
-            .env("BATON_CACHE_DIR", self.path("cache"));
+            .env("BATON_CACHE_DIR", self.path("cache"))
+            .env(
+                "BATON_HOST",
+                format!(
+                    "test-{}",
+                    self.dir.path().file_name().unwrap().to_string_lossy()
+                ),
+            );
         for variable in Home::STORE_VARIABLES {
             command.env_remove(variable);
         }
@@ -83,10 +90,13 @@ impl Home {
     }
 
     fn event_count(&self, session: &str) -> usize {
-        fs::read_to_string(self.path(&format!("baton/sessions/{session}/events.jsonl")))
-            .unwrap()
+        self.baton(&["list"])
             .lines()
-            .count()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next()? == session).then(|| fields.nth(2).unwrap().parse().unwrap())
+            })
+            .unwrap()
     }
 
     fn pi_file(&self) -> PathBuf {
@@ -147,6 +157,282 @@ fn answer(id: &str, parent: &str, second: u32, text: &str) -> Value {
 fn write_pi(home: &Home, records: &[Value]) {
     fs::create_dir_all(home.pi_file().parent().unwrap()).unwrap();
     fs::write(home.pi_file(), jsonl(records)).unwrap();
+}
+
+fn copy_session_files(from: &Home, to: &Home, session: &str) {
+    for kind in ["events", "records"] {
+        let source = from.path(&format!("baton/sessions/{session}/{kind}"));
+        let destination = to.path(&format!("baton/sessions/{session}/{kind}"));
+        fs::create_dir_all(&destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if !target.exists() {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn independently_imported_native_sessions_deduplicate_after_file_union() {
+    let first = Home::new();
+    let second = Home::new();
+    let records = [
+        header("/work"),
+        ask("a1", None, 1, "shared question"),
+        answer("a2", "a1", 2, "shared answer"),
+    ];
+    write_pi(&first, &records);
+    write_pi(&second, &records);
+    first.baton(&["import", "--agent", "pi"]);
+    second.baton(&["import", "--agent", "pi"]);
+    let id = first.sessions().remove(0);
+    assert_eq!(second.sessions(), vec![id.clone()]);
+
+    copy_session_files(&second, &first, &id);
+    assert_eq!(first.sessions(), vec![id.clone()]);
+    assert_eq!(first.event_count(&id), 2);
+    let shown = first.baton(&["show", &id]);
+    assert_eq!(shown.matches("shared question").count(), 1);
+    assert_eq!(shown.matches("shared answer").count(), 1);
+    assert!(
+        shown.contains("created  2026-01-01T00:00:00.000Z"),
+        "{shown}"
+    );
+    assert_eq!(shown.matches("link     from pi:pi-1").count(), 2);
+    for home in [&first, &second] {
+        let host = format!(
+            "@test-{}",
+            home.dir.path().file_name().unwrap().to_string_lossy()
+        );
+        assert!(shown.contains(&host), "{shown}");
+    }
+    assert!(!shown.contains("branch  "));
+    let later_record = first.path(&format!(
+        "baton/sessions/{id}/records/test-ffffffff-ffff-7fff-bfff-ffffffffffff.json"
+    ));
+    fs::write(later_record, r#"{"created":"2025-12-31T23:59:59.000Z"}"#).unwrap();
+    let shown = first.baton(&["show", &id]);
+    assert!(
+        shown.contains("created  2025-12-31T23:59:59.000Z"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn independent_continuations_form_active_and_alternate_branches() {
+    let first = Home::new();
+    let second = Home::new();
+    let records = [header("/work"), ask("a1", None, 1, "shared root")];
+    write_pi(&first, &records);
+    write_pi(&second, &records);
+    first.baton(&["import", "--agent", "pi"]);
+    second.baton(&["import", "--agent", "pi"]);
+    let id = first.sessions().remove(0);
+    assert_eq!(second.sessions(), vec![id.clone()]);
+    append(
+        &first.pi_file(),
+        &[ask("a2", Some("a1"), 2, "earlier continuation")],
+    );
+    append(
+        &second.pi_file(),
+        &[ask("b2", Some("a1"), 3, "later continuation")],
+    );
+    first.baton(&["import", "--agent", "pi"]);
+    second.baton(&["import", "--agent", "pi"]);
+
+    copy_session_files(&second, &first, &id);
+    assert_eq!(first.event_count(&id), 3);
+    let shown = first.baton(&["show", &id]);
+    let alternate = shown
+        .lines()
+        .find(|line| line.starts_with("branch   "))
+        .unwrap();
+    assert!(
+        alternate.contains("2026-01-01T00:00:02.000Z")
+            && alternate.contains("earlier continuation"),
+        "{shown}"
+    );
+    let prefix = alternate.split_whitespace().nth(1).unwrap();
+    assert_eq!(prefix.len(), 8);
+    assert!(shown.contains("user: later continuation"), "{shown}");
+    assert!(!shown.contains("user: earlier continuation"), "{shown}");
+    assert!(first.baton(&["list"]).contains(" *"));
+    copy_session_files(&first, &second, &id);
+    assert_eq!(second.event_count(&id), 3);
+    let shown_elsewhere = second.baton(&["show", &id]);
+    assert!(
+        shown_elsewhere
+            .lines()
+            .any(|line| line.starts_with("branch   ") && line.contains("earlier continuation")),
+        "{shown_elsewhere}"
+    );
+    assert!(
+        shown_elsewhere.contains("user: later continuation"),
+        "{shown_elsewhere}"
+    );
+}
+
+#[test]
+fn index_refreshes_when_external_segments_appear_and_disappear() {
+    let source = Home::new();
+    let target = Home::new();
+    let mut session_header = header("/work");
+    session_header["timestamp"] = Value::Null;
+    let records = [session_header, ask("a1", None, 1, "initial content")];
+    write_pi(&source, &records);
+    write_pi(&target, &records);
+    source.baton(&["import", "--agent", "pi"]);
+    target.baton(&["import", "--agent", "pi"]);
+    let id = target.sessions().remove(0);
+    assert_eq!(source.sessions(), vec![id.clone()]);
+    assert_eq!(target.event_count(&id), 1);
+    assert!(
+        target
+            .baton(&["show", &id])
+            .contains("created  2026-01-01T00:00:01.000Z")
+    );
+
+    let source_events = source.path(&format!("baton/sessions/{id}/events"));
+    let existing: Vec<_> = fs::read_dir(&source_events)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    append(
+        &source.pi_file(),
+        &[ask("a2", Some("a1"), 2, "externally added content")],
+    );
+    source.baton(&["import", "--agent", "pi"]);
+    let added = fs::read_dir(&source_events)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| !existing.contains(&entry.file_name()))
+        .unwrap();
+    let copied = target
+        .path(&format!("baton/sessions/{id}/events"))
+        .join(added.file_name());
+    fs::copy(added.path(), &copied).unwrap();
+    assert_eq!(target.event_count(&id), 2);
+    assert!(target.baton(&["search", "externally added"]).contains(&id));
+
+    fs::remove_file(copied).unwrap();
+    assert_eq!(target.event_count(&id), 1);
+    assert!(target.baton(&["search", "externally added"]).is_empty());
+    assert!(target.baton(&["search", "initial content"]).contains(&id));
+}
+
+#[test]
+fn migration_remaps_fork_parents_and_is_idempotent() {
+    use baton_core::{Agent, Body, Draft, Event, User};
+
+    let home = Home::new();
+    let root_id = "018f0000-0000-7000-8000-000000000001";
+    let fork_id = "018f0000-0000-7000-8000-000000000002";
+    let draft = |text: &str, second: u32| Draft {
+        timestamp: format!("2026-01-01T00:00:{second:02}.000Z"),
+        native_entry_id: None,
+        body: Body::User(User {
+            text: text.into(),
+            images: vec![],
+        }),
+    };
+    let root_events = Event::chain([draft("original root", 1)], None, Agent::Pi, "root-native");
+    let fork_event = Event::chain(
+        [draft("fork continuation", 2)],
+        Some(root_events[0].id.clone()),
+        Agent::Pi,
+        "fork-native",
+    );
+    let mut fork_events = root_events.clone();
+    fork_events.extend(fork_event);
+    for (id, native_id, title, parent, events) in [
+        (
+            root_id,
+            "root-native",
+            "original session",
+            Value::Null,
+            &root_events,
+        ),
+        (
+            fork_id,
+            "fork-native",
+            "forked session",
+            json!({"session": root_id, "event": root_events[0].id}),
+            &fork_events,
+        ),
+    ] {
+        let directory = home.path(&format!("baton/sessions/{id}"));
+        fs::create_dir_all(&directory).unwrap();
+        let meta = json!({
+            "id": id, "title": title, "cwd": "/work", "created": "2026-01-01T00:00:00.000Z", "updated": events.last().unwrap().timestamp,
+            "parent": parent,
+            "links": [{"agent": "pi", "native_id": native_id, "path": "/old/native.jsonl", "exported_events": events.len(), "direction": "import"}]
+        });
+        fs::write(
+            directory.join("meta.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+        let values: Vec<Value> = events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect();
+        fs::write(directory.join("events.jsonl"), jsonl(&values)).unwrap();
+    }
+
+    assert!(home.baton(&["migrate"]).contains("2 sessions migrated"));
+    let ids = home.sessions();
+    assert_eq!(ids.len(), 2);
+    let root = ids
+        .iter()
+        .find(|id| {
+            home.baton(&["show", id])
+                .contains("title    original session")
+        })
+        .unwrap();
+    let fork = ids
+        .iter()
+        .find(|id| {
+            home.baton(&["show", id])
+                .contains("title    forked session")
+        })
+        .unwrap();
+    assert_ne!(root.as_str(), root_id);
+    assert_ne!(fork.as_str(), fork_id);
+    let shown = home.baton(&["show", fork]);
+    assert!(
+        shown.contains("created  2026-01-01T00:00:00.000Z"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("forked   from {root} at {}", root_events[0].id)),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("original root") && shown.contains("fork continuation"),
+        "{shown}"
+    );
+    let files = |id: &str| {
+        ["events", "records"]
+            .into_iter()
+            .map(|kind| {
+                let directory = home.path(&format!("baton/sessions/{id}/{kind}"));
+                let mut names: Vec<_> = fs::read_dir(directory)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = (files(root), files(fork));
+    assert!(home.baton(&["migrate"]).contains("0 sessions migrated"));
+    assert_eq!(home.sessions().len(), 2);
+    assert_eq!((files(root), files(fork)), before);
+    assert_eq!(home.event_count(root), 1);
+    assert_eq!(home.event_count(fork), 2);
 }
 
 #[test]

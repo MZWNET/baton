@@ -17,6 +17,7 @@ baton search <terms>
 baton show <id>
 baton export <id> --to claude      # write a new Claude Code session and print its id
 baton resume <id> --in codex       # export, then open it in Codex
+baton migrate                      # convert a data directory from the old events.jsonl and meta.json layout
 ```
 
 `<id>` is a baton session id, a unique prefix of it, or `agent:native_id` such as `omp:01a1a978`.
@@ -26,12 +27,12 @@ Imports are incremental and idempotent. A session exported to another agent and 
 ## Storage
 
 ```
-<data>/sessions/<id>/events.jsonl   append-only events
-<data>/sessions/<id>/meta.json      title, cwd, times and links to native sessions
-<data>/blobs/<sha256>               images
+<data>/sessions/<id>/events/<host>-<uuid>.jsonl.zst   zstd-compressed events
+<data>/sessions/<id>/records/<host>-<uuid>.json       title, cwd, fork point or a link to a native session
+<data>/blobs/<sha256>                                 images
 ```
 
-`<data>` is `BATON_HOME`, or the platform data directory (`~/.local/share/baton` on Linux, `~/Library/Application Support/baton` on macOS, `%APPDATA%\baton\data` on Windows). Apart from `meta.json`, files are only ever added or appended to, so the directory suits incremental sync tools. Import cursors and the search index live in `BATON_CACHE_DIR` or the platform cache directory, and are rebuilt when missing.
+`<data>` is `BATON_HOME`, or the platform data directory (`~/.local/share/baton` on Linux, `~/Library/Application Support/baton` on macOS, `%APPDATA%\baton\data` on Windows). `<host>` is `BATON_HOST`, or the machine's host name. Files are only ever added, never changed, and session ids derive from the native session they came from, so data directories of several machines can be merged by copying files between them, for example through a git repository. A session continued on two machines keeps both branches; the newest is active and `baton show` lists the others. Import cursors and the search index live in `BATON_CACHE_DIR` or the platform cache directory, and are rebuilt when missing.
 
 ## Worth knowing
 

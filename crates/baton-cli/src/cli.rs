@@ -4,7 +4,7 @@ use anyhow::Result;
 use baton_core::{Agent, Baton};
 use clap::{Parser, Subcommand};
 
-use crate::commands::{export, import, list, resume, search, show};
+use crate::commands::{export, import, list, migrate, resume, search, show};
 use crate::resolve;
 
 #[derive(Parser)]
@@ -68,10 +68,16 @@ enum Command {
         #[arg(long, value_parser = resolve::directory)]
         cwd: Option<PathBuf>,
     },
+    /// Convert a data directory written by an older baton to the current layout.
+    Migrate,
 }
 
 impl Cli {
     pub(crate) fn run(self) -> Result<()> {
+        // Opening fails on the old layout that migrating converts
+        if matches!(self.command, Command::Migrate) {
+            return migrate::run();
+        }
         let mut baton = Baton::open()?;
         match self.command {
             Command::Import { agent, path } => import::run(&mut baton, agent, path.as_deref()),
@@ -80,6 +86,7 @@ impl Cli {
             Command::Show { id } => show::run(&mut baton, &id),
             Command::Export { id, to, cwd } => export::run(&mut baton, &id, to, cwd.as_deref()),
             Command::Resume { id, agent, cwd } => resume::run(baton, &id, agent, cwd.as_deref()),
+            Command::Migrate => unreachable!("migrate runs without opening"),
         }
     }
 }

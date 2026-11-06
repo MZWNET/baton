@@ -9,8 +9,9 @@ pub(crate) fn run(baton: &Baton, cwd: Option<&Path>, agent: Option<Agent>) -> Re
     let cwd = cwd.map(Path::to_string_lossy);
     for summary in baton.index.list(cwd.as_deref(), agent)? {
         let label = summary.title.or(summary.cwd).unwrap_or_else(|| "-".into());
+        let branches = if summary.alternate_branches { " *" } else { "" };
         println!(
-            "{}  {}  {:>5}  {:<14}  {label}",
+            "{}  {}  {:>5}  {:<14}  {label}{branches}",
             summary.id,
             render::minute(&summary.updated),
             summary.events,

@@ -1,13 +1,15 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
-use uuid::Uuid;
 
 use crate::cache::Cursors;
+use crate::model::Record;
 use crate::sync::step::{self, Step};
+use crate::sync::{migration, session_id};
 use crate::{
     Adapter, Agent, Cursor, Direction, Draft, Event, Export, ForkPoint, Index, Info, Link,
     NativeRead, NativeSession, Progress, Session, SessionMeta, Source, Store, replay,
@@ -84,20 +86,14 @@ struct Fork<'a> {
 impl Baton {
     /// Opens the data directory, `BATON_HOME` or else the platform data directory, and brings the index in the cache directory, `BATON_CACHE_DIR` or else the platform cache directory, up to date.
     ///
-    /// Blocks while another baton process uses the same cache directory.
+    /// Files are written under the host name `BATON_HOST`, or else the machine's host name. Fails on a data directory in the old layout, which [`Baton::migrate`] converts. Blocks while another baton process uses the same cache directory.
     pub fn open() -> Result<Baton> {
-        let data = env_dir_or("BATON_HOME", ProjectDirs::data_dir)?;
-        let cache = env_dir_or("BATON_CACHE_DIR", ProjectDirs::cache_dir)?;
-        fs::create_dir_all(&data).with_context(|| format!("creating {}", data.display()))?;
-        fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(cache.join("lock"))?;
-        lock.lock()?;
-        let store = Store::new(data.clone());
-        let mut index = Index::open(&cache, &data)?;
+        let (data, cache, lock) = locked_dirs()?;
+        if !migration::old_sessions(&data)?.is_empty() {
+            bail!("{} uses an old layout; run `baton migrate`", data.display());
+        }
+        let store = Store::new(data.clone(), host()?);
+        let mut index = Index::open(&cache, &data, store.host())?;
         index.refresh(&store)?;
         let cursors = Cursors::open(&cache, &data)?;
         Ok(Baton {
@@ -106,6 +102,25 @@ impl Baton {
             cursors,
             _lock: lock,
         })
+    }
+
+    /// Converts the sessions of a data directory in the old layout, `events.jsonl` and `meta.json`, to the current one in place, and returns how many it converted.
+    ///
+    /// Each old session is removed only once its new session is fully written, so an interrupted migration picks up where it stopped when run again. The index is cleared and rebuilt by the next [`Baton::open`].
+    pub fn migrate() -> Result<usize> {
+        let (data, cache, _lock) = locked_dirs()?;
+        let store = Store::new(data.clone(), host()?);
+        let migrated = migration::run(&data, &store)?;
+        for name in ["index.db", "index.db-wal", "index.db-shm"] {
+            let path = cache.join(name);
+            match fs::remove_file(&path) {
+                Err(error) if error.kind() != ErrorKind::NotFound => {
+                    return Err(error).with_context(|| format!("removing {}", path.display()));
+                }
+                _ => {}
+            }
+        }
+        Ok(migrated)
     }
 
     /// Brings a native session into its linked unified session, or into a new one when it has no link yet.
@@ -129,9 +144,11 @@ impl Baton {
             if let Some(title) = &native.title
                 && self.index.title(&cursor.session)?.as_ref() != Some(title)
             {
-                let mut meta = self.store.meta(&cursor.session)?;
-                meta.title = Some(title.clone());
-                self.store.save_meta(&meta)?;
+                let record = Record {
+                    title: Some(title.clone()),
+                    ..Record::default()
+                };
+                self.store.record(&cursor.session, &record)?;
             }
             return Ok(ImportOutcome::Unchanged);
         }
@@ -156,11 +173,12 @@ impl Baton {
             return Ok(ImportOutcome::Created { session });
         };
         let session = self.store.load(&session_id)?;
+        let host = self.store.host();
         let link = session
             .meta
             .links
             .iter()
-            .find(|link| link.is_for(agent, &native.id))
+            .find(|link| link.is_for(host, agent, &native.id))
             .cloned()
             .with_context(|| {
                 format!("session {session_id} no longer links {agent}:{}", native.id)
@@ -175,7 +193,7 @@ impl Baton {
         };
         match step {
             Step::Synced(event) => {
-                self.mark_synced(session, &incoming, event)?;
+                self.mark_synced(&session, &incoming, event)?;
                 Ok(ImportOutcome::Unchanged)
             }
             Step::Append { base, drafts } => self.append(session, &incoming, base, drafts),
@@ -194,7 +212,7 @@ impl Baton {
         adapter: &(impl Adapter + ?Sized),
         cwd: Option<&Path>,
     ) -> Result<Exported> {
-        let mut session = self.store.load(session_id)?;
+        let session = self.store.load(session_id)?;
         let cwd = match cwd {
             Some(cwd) => cwd.to_path_buf(),
             None => match session.meta.cwd.as_deref().map(PathBuf::from) {
@@ -216,14 +234,18 @@ impl Baton {
             };
             (adapter.write(&export, &self.store.blobs())?, events.len())
         };
-        session.meta.links.push(Link {
-            agent: adapter.agent(),
-            native_id: native.id.clone(),
-            path: native.path.to_string_lossy().into_owned(),
-            exported_events: exported,
-            direction: Direction::Export,
-        });
-        self.store.save_meta(&session.meta)?;
+        let record = Record {
+            link: Some(Link {
+                host: self.store.host().to_owned(),
+                agent: adapter.agent(),
+                native_id: native.id.clone(),
+                path: native.path.to_string_lossy().into_owned(),
+                exported_events: exported,
+                direction: Direction::Export,
+            }),
+            ..Record::default()
+        };
+        self.store.record(session_id, &record)?;
         Ok(Exported { native, cwd })
     }
 
@@ -235,6 +257,8 @@ impl Baton {
         drafts: Vec<Draft>,
     ) -> Result<ImportOutcome> {
         let chained = Event::chain(drafts, base, incoming.agent, &incoming.native.id);
+        // The native session's own last event, which need not be the newest leaf of the unified session
+        let reached = chained.last().map(|event| event.id.clone());
         let added: Vec<Event> = chained
             .into_iter()
             .filter(|event| !session.contains(&event.id))
@@ -242,19 +266,17 @@ impl Baton {
         let events = added.len();
         self.store.append(&session.meta.id, &added)?;
         session.extend(added);
-        let leaf = session.leaf().map(String::from);
-        let id = session.meta.id.clone();
-        self.mark_synced(session, incoming, leaf)?;
+        self.mark_synced(&session, incoming, reached)?;
         if events == 0 {
             return Ok(ImportOutcome::Unchanged);
         }
         Ok(ImportOutcome::Appended {
-            session: id,
+            session: session.meta.id,
             events,
         })
     }
 
-    // Continues the drafts in a new session holding the history up to `base`, and moves the link there
+    // Continues the drafts in a new session holding the history up to `base`; its link record is newer, so the link moves there
     fn fork(
         &mut self,
         session: Session,
@@ -281,18 +303,14 @@ impl Baton {
             base,
         };
         let forked = self.publish(incoming, events, direction, Some(fork))?;
-        let mut from = session.meta;
-        from.links
-            .retain(|link| !link.is_for(incoming.agent, &incoming.native.id));
-        self.store.save_meta(&from)?;
         Ok(ImportOutcome::Forked {
             session: forked,
-            from: from.id,
+            from: session.meta.id,
             events: count,
         })
     }
 
-    // Stores a new linear session that links only the native session it came from
+    // Stores a linear session that links the native session it came from, under an id every host derives alike
     fn publish(
         &mut self,
         incoming: &Incoming,
@@ -302,12 +320,21 @@ impl Baton {
     ) -> Result<String> {
         let path: Vec<&Event> = events.iter().collect();
         let from = fork.as_ref().map(|fork| fork.from);
+        let id = match &fork {
+            Some(fork) => session_id::forked(
+                &fork.from.id,
+                fork.base.as_deref(),
+                incoming.agent,
+                &incoming.native.id,
+            ),
+            None => session_id::imported(incoming.agent, &incoming.native.id),
+        };
         let parent = fork.map(|fork| ForkPoint {
             session: fork.from.id.clone(),
             event: fork.base,
         });
         let meta = SessionMeta {
-            id: Uuid::now_v7().to_string(),
+            id,
             title: incoming
                 .title()
                 .or_else(|| from.and_then(|from| from.title.clone())),
@@ -316,19 +343,11 @@ impl Baton {
                 .cwd
                 .clone()
                 .or_else(|| from.and_then(|from| from.cwd.clone())),
-            created: incoming
-                .info
-                .created
-                .clone()
-                .unwrap_or_else(|| events[0].timestamp.clone()),
-            updated: events
-                .iter()
-                .map(|event| &event.timestamp)
-                .max()
-                .cloned()
-                .unwrap_or_default(),
+            created: String::new(),
+            updated: String::new(),
             parent,
             links: vec![Link {
+                host: self.store.host().to_owned(),
                 agent: incoming.agent,
                 native_id: incoming.native.id.clone(),
                 path: incoming.native.path.to_string_lossy().into_owned(),
@@ -336,7 +355,8 @@ impl Baton {
                 direction,
             }],
         };
-        self.store.create(&meta, &events)?;
+        self.store
+            .create(&meta, &events, incoming.info.created.as_deref())?;
         let leaf = events.last().map(|event| event.id.clone());
         self.save_cursor(incoming, leaf, &meta.id)?;
         Ok(meta.id)
@@ -344,7 +364,7 @@ impl Baton {
 
     fn mark_synced(
         &mut self,
-        mut session: Session,
+        session: &Session,
         incoming: &Incoming,
         event: Option<String>,
     ) -> Result<()> {
@@ -352,25 +372,27 @@ impl Baton {
             Some(event) => replay::events(&session.path_to(event)).len(),
             None => 0,
         };
-        let before = session.meta.clone();
-        if let Some(title) = incoming.title() {
-            session.meta.title = Some(title);
-        }
-        if let Some(last) = session.last()
-            && last.timestamp > session.meta.updated
-        {
-            session.meta.updated = last.timestamp.clone();
-        }
-        let link = session
+        let host = self.store.host();
+        let mut link = session
             .meta
             .links
-            .iter_mut()
-            .find(|link| link.is_for(incoming.agent, &incoming.native.id))
+            .iter()
+            .find(|link| link.is_for(host, incoming.agent, &incoming.native.id))
+            .cloned()
             .expect("imports only sync sessions that link the native session");
         link.path = incoming.native.path.to_string_lossy().into_owned();
         link.exported_events = exported;
-        if session.meta != before {
-            self.store.save_meta(&session.meta)?;
+        let title = incoming
+            .title()
+            .filter(|title| session.meta.title.as_ref() != Some(title));
+        let link = (!session.meta.links.contains(&link)).then_some(link);
+        if title.is_some() || link.is_some() {
+            let record = Record {
+                title,
+                link,
+                ..Record::default()
+            };
+            self.store.record(&session.meta.id, &record)?;
         }
         self.save_cursor(incoming, event, &session.meta.id)
     }
@@ -395,4 +417,32 @@ fn env_dir_or(name: &str, platform_dir: fn(&ProjectDirs) -> &Path) -> Result<Pat
     }
     let dirs = ProjectDirs::from("", "", "baton").context("cannot locate the home directory")?;
     Ok(platform_dir(&dirs).to_path_buf())
+}
+
+// The data and cache directories, created when missing, and the lock on the cache directory
+fn locked_dirs() -> Result<(PathBuf, PathBuf, File)> {
+    let data = env_dir_or("BATON_HOME", ProjectDirs::data_dir)?;
+    let cache = env_dir_or("BATON_CACHE_DIR", ProjectDirs::cache_dir)?;
+    fs::create_dir_all(&data).with_context(|| format!("creating {}", data.display()))?;
+    fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(cache.join("lock"))?;
+    lock.lock()?;
+    Ok((data, cache, lock))
+}
+
+// The host name that starts the names of the files this machine writes
+fn host() -> Result<String> {
+    let host = match env::var_os("BATON_HOST") {
+        Some(host) => host.into_string(),
+        None => hostname::get()?.into_string(),
+    }
+    .map_err(|host| anyhow!("host name {} is not valid Unicode", host.display()))?;
+    if host.is_empty() || host.contains('/') {
+        bail!("host name {host:?} cannot start a file name; set BATON_HOST");
+    }
+    Ok(host)
 }

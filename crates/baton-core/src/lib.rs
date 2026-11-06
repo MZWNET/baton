@@ -1,6 +1,6 @@
-//! The unified session format of baton, its append-only store, and the logic that keeps unified sessions in sync with the native sessions of coding agents.
+//! The unified session format of baton, its write-once store, and the logic that keeps unified sessions in sync with the native sessions of coding agents.
 //!
-//! A unified session is a tree of [`Event`]s appended to `sessions/<id>/events.jsonl`, described by a [`SessionMeta`] in `meta.json`, with images kept as [`Blobs`]. Everything specific to one agent lives behind the [`Source`] and [`Adapter`] traits, which the `baton-adapters` crate implements; [`Baton`] imports native sessions through sources and exports unified sessions back through adapters.
+//! A unified session is a tree of [`Event`]s in compressed segments, described by immutable records and loaded as [`SessionMeta`], with images kept as [`Blobs`]. Everything specific to one agent lives behind the [`Source`] and [`Adapter`] traits, which the `baton-adapters` crate implements; [`Baton`] imports native sessions through sources and exports unified sessions back through adapters.
 
 mod adapter;
 mod agent;

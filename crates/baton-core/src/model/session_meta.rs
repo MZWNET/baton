@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::Agent;
 
-/// The contents of `meta.json`, the only file of a session that is rewritten instead of appended to.
+/// The derived facts and links of a session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
-    /// The session id, a UUIDv7 that is also the session directory name.
+    /// The session id, also used as the session directory name.
     pub id: String,
     /// The session title.
     pub title: Option<String>,
@@ -35,6 +35,9 @@ pub struct ForkPoint {
 /// A native session that is kept in sync with a unified session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Link {
+    /// The machine where the native session is available.
+    #[serde(default)]
+    pub host: String,
     /// The agent of the native session.
     pub agent: Agent,
     /// The agent's id for the native session.
@@ -58,7 +61,21 @@ pub enum Direction {
 }
 
 impl Link {
-    pub(crate) fn is_for(&self, agent: Agent, native_id: &str) -> bool {
-        self.agent == agent && self.native_id == native_id
+    pub(crate) fn is_for(&self, host: &str, agent: Agent, native_id: &str) -> bool {
+        self.host == host && self.agent == agent && self.native_id == native_id
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Record {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ForkPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Link>,
 }

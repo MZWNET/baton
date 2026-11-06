@@ -26,13 +26,28 @@ pub(crate) fn run(baton: &mut Baton, query: &str) -> Result<()> {
             Direction::Export => "to",
         };
         println!(
-            "link     {direction} {}:{}  {} events  {}",
-            link.agent, link.native_id, link.exported_events, link.path
+            "link     {direction} {}:{}  @{}  {} events  {}",
+            link.agent, link.native_id, link.host, link.exported_events, link.path
         );
     }
     for event in session.path() {
         println!();
         println!("{}", render::event(event));
+    }
+    for branch in session.branches() {
+        let leaf = branch.last().unwrap();
+        let text = branch
+            .iter()
+            .rev()
+            .map(|event| event.body.text())
+            .find(|text| !text.trim().is_empty())
+            .unwrap_or_default();
+        let prefix: String = leaf.id.chars().take(8).collect();
+        println!(
+            "branch   {prefix}  {}  {}",
+            leaf.timestamp,
+            render::snippet(&text, "")
+        );
     }
     Ok(())
 }
