@@ -48,6 +48,9 @@ impl Store {
         let mut ids = Vec::new();
         for entry in entries {
             let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
             let id = entry.file_name().to_string_lossy().into_owned();
             if !self.files(&id, "records")?.is_empty() {
                 ids.push(id);
