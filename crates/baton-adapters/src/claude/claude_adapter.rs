@@ -106,6 +106,10 @@ impl Adapter for ClaudeAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        files::remove_file(&session.path)
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("claude");
         command.arg("--resume").arg(&session.id).current_dir(cwd);

@@ -117,6 +117,16 @@ impl Adapter for MuseAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        files::remove_file(&session.path)?;
+        files::remove_empty_dir(
+            session
+                .path
+                .parent()
+                .expect("session files have a directory"),
+        )
+    }
+
     // Muse refuses to resume a session in another workspace than its own
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("muse");

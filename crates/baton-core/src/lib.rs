@@ -8,6 +8,7 @@ mod cache;
 mod hash;
 pub mod journal;
 mod model;
+pub mod project;
 pub mod replay;
 mod storage;
 mod sync;
@@ -22,5 +23,6 @@ pub use model::{
     Assistant, Body, Compaction, Direction, Draft, Event, ForkPoint, Image, Link, Origin, Session,
     SessionMeta, Thinking, ToolCall, ToolResult, User,
 };
+pub use project::Project;
 pub use storage::{Blobs, Store};
-pub use sync::{Baton, Exported, ImportOutcome};
+pub use sync::{Baton, Exported, ImportOutcome, Materialized};

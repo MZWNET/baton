@@ -271,6 +271,26 @@ impl Adapter for HermesAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let mut connection = sqlite::open_read_write(&session.path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_children: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sessions WHERE parent_session_id = ?1)",
+            [&session.id],
+            |row| row.get(0),
+        )?;
+        if has_children {
+            bail!(
+                "cannot remove Hermes session {} with child sessions",
+                session.id
+            );
+        }
+        transaction.execute("DELETE FROM messages WHERE session_id = ?1", [&session.id])?;
+        transaction.execute("DELETE FROM sessions WHERE id = ?1", [&session.id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("hermes");
         command.arg("--resume").arg(&session.id).current_dir(cwd);

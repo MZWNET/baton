@@ -233,6 +233,16 @@ impl Adapter for CursorAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let dir = session
+            .path
+            .parent()
+            .expect("session files have a directory");
+        files::remove_file(&dir.join("meta.json"))?;
+        files::remove_file(&session.path)?;
+        files::remove_empty_dir(dir)
+    }
+
     // Cursor Agent only looks among the chats of the directory it runs in
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("cursor-agent");

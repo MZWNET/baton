@@ -197,6 +197,18 @@ impl Adapter for MastracodeAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let mut connection = sqlite::open_read_write(&session.path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM mastra_messages WHERE thread_id = ?1",
+            [&session.id],
+        )?;
+        transaction.execute("DELETE FROM mastra_threads WHERE id = ?1", [&session.id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("mastracode");
         command.arg("resume").arg(&session.id).current_dir(cwd);

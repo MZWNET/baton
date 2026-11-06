@@ -141,6 +141,16 @@ impl Adapter for CopilotAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let dir = session
+            .path
+            .parent()
+            .expect("session files have a directory");
+        files::remove_file(&dir.join("workspace.yaml"))?;
+        files::remove_file(&session.path)?;
+        files::remove_empty_dir(dir)
+    }
+
     // A UUID Copilot does not know starts a new empty session under it instead of failing
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("copilot");

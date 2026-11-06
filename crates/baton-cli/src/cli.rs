@@ -4,7 +4,7 @@ use anyhow::Result;
 use baton_core::{Agent, Baton};
 use clap::{Parser, Subcommand};
 
-use crate::commands::{export, import, list, migrate, resume, search, show};
+use crate::commands::{export, import, list, materialize, migrate, resume, search, show};
 use crate::resolve;
 
 #[derive(Parser)]
@@ -68,6 +68,12 @@ enum Command {
         #[arg(long, value_parser = resolve::directory)]
         cwd: Option<PathBuf>,
     },
+    /// Copy all sessions into the selected agents' native stores.
+    Materialize {
+        /// Agent to materialize into; may be repeated.
+        #[arg(long = "in", value_name = "AGENT", required = true)]
+        agents: Vec<Agent>,
+    },
     /// Convert a data directory written by an older baton to the current layout.
     Migrate,
 }
@@ -86,6 +92,7 @@ impl Cli {
             Command::Show { id } => show::run(&mut baton, &id),
             Command::Export { id, to, cwd } => export::run(&mut baton, &id, to, cwd.as_deref()),
             Command::Resume { id, agent, cwd } => resume::run(baton, &id, agent, cwd.as_deref()),
+            Command::Materialize { agents } => materialize::run(&mut baton, &agents),
             Command::Migrate => unreachable!("migrate runs without opening"),
         }
     }

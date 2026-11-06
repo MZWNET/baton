@@ -99,6 +99,29 @@ pub(crate) fn create_new(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn remove_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+pub(crate) fn remove_empty_dir(path: &Path) -> Result<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
 // The first JSON lines of a session, decompressing on the fly and without reading the rest of the file
 pub(crate) fn head(path: &Path, count: usize) -> Result<Vec<Value>> {
     use std::io::{BufRead, BufReader, Read};

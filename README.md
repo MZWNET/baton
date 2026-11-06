@@ -11,18 +11,23 @@ Tagged versions are published on [Releases](https://github.com/MZWNET/baton/rele
 ```sh
 cargo install --path crates/baton-cli
 
-baton import                       # read new and changed sessions of every agent
+baton import                             # read new and changed sessions of every agent
 baton list [--cwd] [--agent omp]
 baton search <terms>
 baton show <id>
-baton export <id> --to claude      # write a new Claude Code session and print its id
-baton resume <id> --in codex       # export, then open it in Codex
-baton migrate                      # convert a data directory from the old events.jsonl and meta.json layout
+baton export <id> --to claude            # write a new Claude Code session and print its id
+baton resume <id> --in codex             # export, then open it in Codex
+baton materialize --in omp --in claude   # write every session into each agent, in the matching local project
+baton migrate                            # convert a data directory from the old events.jsonl and meta.json layout
 ```
 
 `<id>` is a baton session id, a unique prefix of it, or `agent:native_id` such as `omp:01a1a978`.
 
 Imports are incremental and idempotent. A session exported to another agent and continued there flows back into the same baton session on the next import; when the baton session has moved on meanwhile, the continuation becomes a fork that records where it branched.
+
+`baton materialize --in <agent>` (repeatable) first imports that agent, then writes every baton session the agent does not have yet on this machine as a native session, so the agent's own resume list shows them. Running it again writes nothing new. When a session moved on since its copy was written (for example after merging another machine's data), it writes a fresh copy and deletes the old one only if baton wrote it and it was never continued; original sessions and continued copies are kept. A few agents can't delete copies safely (Codex copies listed in `session_index.jsonl`, OpenHands); there the old copy stays and a warning is printed.
+
+Sessions find their project on this machine by git identity: the origin remote (or else the root commit) plus the directory inside the repository. `BATON_PROJECTS` lists directories (separated like `PATH`) whose git checkouts are searched, up to three levels deep. `BATON_PATH_MAP` holds `from=to` path prefix pairs (separated like `PATH`) used when no checkout matches, for example `/root/repos=/Users/me/repos`. Otherwise the recorded directory is used. This applies to `export`, `resume`, `materialize` and `list --cwd`; `list --cwd` also matches sessions recorded under another machine's path of the same repository. OpenCode and Kilo need the project directory to exist to receive a session.
 
 ## Storage
 

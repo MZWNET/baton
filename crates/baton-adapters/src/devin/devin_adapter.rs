@@ -189,6 +189,18 @@ impl Adapter for DevinAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let mut connection = sqlite::open_read_write(&session.path)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM message_nodes WHERE session_id = ?1",
+            [&session.id],
+        )?;
+        transaction.execute("DELETE FROM sessions WHERE id = ?1", [&session.id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("devin");
         command.arg("--resume").arg(&session.id).current_dir(cwd);

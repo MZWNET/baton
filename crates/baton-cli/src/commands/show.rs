@@ -14,6 +14,14 @@ pub(crate) fn run(baton: &mut Baton, query: &str) -> Result<()> {
     if let Some(cwd) = &meta.cwd {
         println!("cwd      {cwd}");
     }
+    if let Some(project) = &meta.project {
+        println!(
+            "project  {}  {}  {}",
+            project.remote.as_deref().unwrap_or("-"),
+            project.root.as_deref().unwrap_or("-"),
+            project.path
+        );
+    }
     println!("created  {}", meta.created);
     println!("updated  {}", meta.updated);
     if let Some(parent) = &meta.parent {

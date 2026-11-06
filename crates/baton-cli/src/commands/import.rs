@@ -51,6 +51,7 @@ pub(crate) fn run(baton: &mut Baton, agent: Option<Agent>, path: Option<&Path>) 
             }
         }
     }
+    baton.backfill_projects()?;
     println!(
         "{} new, {} updated, {} forked, {} unchanged",
         tally.created, tally.updated, tally.forked, tally.unchanged

@@ -129,6 +129,9 @@ pub trait Adapter: Source {
     /// Writes the events as a new native session without overwriting anything; images are read from `blobs`.
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession>;
 
+    /// Removes a native session previously written by this adapter.
+    fn remove(&self, session: &NativeSession) -> Result<()>;
+
     /// The command that opens a session in the agent, running in `cwd`.
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command;
 }

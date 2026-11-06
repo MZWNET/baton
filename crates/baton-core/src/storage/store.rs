@@ -156,6 +156,7 @@ impl Store {
             id: id.to_owned(),
             title: None,
             cwd: None,
+            project: None,
             created: events
                 .iter()
                 .map(|event| event.timestamp.as_str())
@@ -179,6 +180,9 @@ impl Store {
             if record.cwd.is_some() {
                 meta.cwd = record.cwd;
             }
+            if record.project.is_some() {
+                meta.project = record.project;
+            }
             if let Some(created) = record.created {
                 meta.created = created;
             }
@@ -192,7 +196,7 @@ impl Store {
                 );
             }
         }
-        meta.links = links.into_values().collect();
+        meta.links = links.into_values().filter(|link| !link.removed).collect();
         meta.links.sort_by(|a, b| {
             (&a.host, a.agent.name(), &a.native_id).cmp(&(&b.host, b.agent.name(), &b.native_id))
         });
@@ -212,6 +216,7 @@ impl Store {
             &Record {
                 title: meta.title.clone(),
                 cwd: meta.cwd.clone(),
+                project: meta.project.clone(),
                 created: created.map(str::to_owned),
                 parent: meta.parent.clone(),
                 link: links.next().cloned(),

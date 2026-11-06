@@ -55,6 +55,10 @@ impl Home {
     ];
 
     fn baton(&self, args: &[&str]) -> String {
+        self.baton_with_env(args, &[])
+    }
+
+    fn baton_with_env(&self, args: &[&str], variables: &[(&str, &std::ffi::OsStr)]) -> String {
         let mut command = Command::new(env!("CARGO_BIN_EXE_baton"));
         command
             .args(args)
@@ -73,6 +77,9 @@ impl Home {
         for variable in Home::STORE_VARIABLES {
             command.env_remove(variable);
         }
+        command.env_remove("BATON_PATH_MAP");
+        command.env_remove("BATON_PROJECTS");
+        command.envs(variables.iter().copied());
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
@@ -119,6 +126,24 @@ impl Home {
             .unwrap()
             .path();
         project.join(format!("{id}.jsonl"))
+    }
+
+    fn claude_transcripts(&self) -> Vec<PathBuf> {
+        let projects = self.path(".claude/projects");
+        if !projects.exists() {
+            return Vec::new();
+        }
+        let mut paths: Vec<_> = fs::read_dir(projects)
+            .unwrap()
+            .flat_map(|entry| fs::read_dir(entry.unwrap().path()).unwrap())
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .collect();
+        paths.sort();
+        paths
     }
 }
 
@@ -172,6 +197,31 @@ fn copy_session_files(from: &Home, to: &Home, session: &str) {
             }
         }
     }
+}
+
+fn git_project(path: &Path, remote: &str) {
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["remote", "add", "origin", remote])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+fn transcript_cwd(path: &Path) -> String {
+    let text = fs::read_to_string(path).unwrap();
+    let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    first["cwd"].as_str().unwrap().to_owned()
 }
 
 #[test]
@@ -590,6 +640,203 @@ fn exports_record_the_absolute_project_directory() {
     assert!(
         Path::new(cwd).is_absolute() && cwd.ends_with("project"),
         "`--cwd .` reaches the agent as the project directory: {cwd}"
+    );
+}
+
+#[test]
+fn materialize_writes_once_and_reexports_after_native_store_is_wiped() {
+    let home = Home::new();
+    write_pi(
+        &home,
+        &[header("/work"), ask("a1", None, 1, "materialized question")],
+    );
+    home.baton(&["import", "--agent", "pi"]);
+
+    home.baton(&["materialize", "--in", "claude"]);
+    let first = home.claude_transcripts();
+    assert_eq!(first.len(), 1);
+    let contents = fs::read(&first[0]).unwrap();
+    assert!(String::from_utf8_lossy(&contents).contains("materialized question"));
+    home.baton(&["materialize", "--in", "claude"]);
+    assert_eq!(home.claude_transcripts(), first);
+    assert_eq!(fs::read(&first[0]).unwrap(), contents);
+
+    fs::remove_dir_all(home.path(".claude")).unwrap();
+    home.baton(&["materialize", "--in", "claude"]);
+    let recreated = home.claude_transcripts();
+    assert_eq!(recreated.len(), 1);
+    assert!(
+        fs::read_to_string(&recreated[0])
+            .unwrap()
+            .contains("materialized question")
+    );
+    home.baton(&["materialize", "--in", "claude"]);
+    assert_eq!(home.claude_transcripts(), recreated);
+}
+
+#[test]
+fn materialize_refreshes_untouched_export_after_cross_host_union() {
+    let first = Home::new();
+    let second = Home::new();
+    let records = [header("/work"), ask("a1", None, 1, "initial question")];
+    write_pi(&first, &records);
+    write_pi(&second, &records);
+    first.baton(&["import", "--agent", "pi"]);
+    second.baton(&["import", "--agent", "pi"]);
+    let session = first.sessions().remove(0);
+    first.baton(&["materialize", "--in", "claude"]);
+    let stale = first.claude_transcripts().remove(0);
+
+    append(
+        &second.pi_file(),
+        &[answer("a2", "a1", 2, "remote continuation")],
+    );
+    second.baton(&["import", "--agent", "pi"]);
+    copy_session_files(&second, &first, &session);
+    first.baton(&["materialize", "--in", "claude"]);
+
+    let current = first.claude_transcripts();
+    assert_eq!(current.len(), 1);
+    assert!(!stale.exists());
+    assert!(
+        fs::read_to_string(&current[0])
+            .unwrap()
+            .contains("remote continuation")
+    );
+    first.baton(&["materialize", "--in", "claude"]);
+    assert_eq!(first.claude_transcripts(), current);
+}
+
+#[test]
+fn materialize_preserves_continued_exports_and_imported_originals() {
+    let first = Home::new();
+    let second = Home::new();
+    let native_id = "11111111-1111-4111-8111-111111111111";
+    let record = |uuid: &str, parent: Option<&str>, text: &str| {
+        json!({"type": "user", "uuid": uuid, "parentUuid": parent, "sessionId": native_id, "isSidechain": false,
+               "cwd": "/work", "timestamp": "2026-01-01T00:00:00.000Z", "message": {"role": "user", "content": text}})
+    };
+    for home in [&first, &second] {
+        let path = home.path(&format!(".claude/projects/-work/{native_id}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, jsonl(&[record("a1", None, "original question")])).unwrap();
+        home.baton(&["import", "--agent", "claude"]);
+    }
+    let session = first.sessions().remove(0);
+    let original = first.path(&format!(".claude/projects/-work/{native_id}.jsonl"));
+    let exported_id = first.export(&session, "claude");
+    let continued = first
+        .claude_transcripts()
+        .into_iter()
+        .find(|path| path.file_stem().unwrap() == exported_id.as_str())
+        .unwrap();
+    let contents = fs::read_to_string(&continued).unwrap();
+    let last = contents
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()?
+                .get("uuid")?
+                .as_str()
+                .map(String::from)
+        })
+        .next_back()
+        .unwrap();
+    append(
+        &continued,
+        &[
+            json!({"type": "user", "uuid": "local-continuation", "parentUuid": last, "sessionId": exported_id,
+                               "isSidechain": false, "cwd": first.project(), "timestamp": "2026-01-02T00:00:00.000Z",
+                               "message": {"role": "user", "content": "local continuation"}}),
+        ],
+    );
+    let continued_contents = fs::read(&continued).unwrap();
+    let original_contents = fs::read(&original).unwrap();
+
+    let remote = second.path(&format!(".claude/projects/-work/{native_id}.jsonl"));
+    append(&remote, &[record("a2", Some("a1"), "remote continuation")]);
+    second.baton(&["import", "--agent", "claude"]);
+    copy_session_files(&second, &first, &session);
+    first.baton(&["materialize", "--in", "claude"]);
+
+    assert_eq!(fs::read(&original).unwrap(), original_contents);
+    assert_eq!(fs::read(&continued).unwrap(), continued_contents);
+    let transcripts = first.claude_transcripts();
+    assert_eq!(transcripts.len(), 3);
+    assert!(transcripts.iter().any(|path| {
+        path != &original
+            && path != &continued
+            && fs::read_to_string(path)
+                .unwrap()
+                .contains("remote continuation")
+    }));
+    first.baton(&["materialize", "--in", "claude"]);
+    assert_eq!(first.claude_transcripts(), transcripts);
+}
+
+#[test]
+fn project_identity_and_path_mapping_choose_materialization_directory() {
+    let source = Home::new();
+    let matching = Home::new();
+    let mapped = Home::new();
+    let recorded = Home::new();
+    let remote = "https://example.com/team/project.git";
+    git_project(&source.project(), remote);
+    git_project(&matching.project(), remote);
+    let source_cwd = fs::canonicalize(source.project()).unwrap();
+    let matching_cwd = fs::canonicalize(matching.project()).unwrap();
+    let mapped_cwd = mapped.path("mapped-project");
+    fs::create_dir_all(&mapped_cwd).unwrap();
+    let mapped_cwd = fs::canonicalize(mapped_cwd).unwrap();
+    write_pi(
+        &source,
+        &[
+            header(source_cwd.to_str().unwrap()),
+            ask("a1", None, 1, "repository question"),
+        ],
+    );
+    source.baton(&["import", "--agent", "pi"]);
+    let session = source.sessions().remove(0);
+    for destination in [&matching, &mapped, &recorded] {
+        copy_session_files(&source, destination, &session);
+    }
+
+    assert!(
+        matching
+            .baton_with_env(
+                &["list", "--cwd"],
+                &[("BATON_PROJECTS", matching_cwd.as_os_str())]
+            )
+            .contains(&session)
+    );
+    let matching_map =
+        std::env::join_paths([format!("{}={}", source_cwd.display(), mapped_cwd.display())])
+            .unwrap();
+    matching.baton_with_env(
+        &["materialize", "--in", "claude"],
+        &[
+            ("BATON_PATH_MAP", matching_map.as_os_str()),
+            ("BATON_PROJECTS", matching_cwd.as_os_str()),
+        ],
+    );
+    assert_eq!(
+        transcript_cwd(&matching.claude_transcripts()[0]),
+        matching_cwd.to_str().unwrap()
+    );
+
+    mapped.baton_with_env(
+        &["materialize", "--in", "claude"],
+        &[("BATON_PATH_MAP", matching_map.as_os_str())],
+    );
+    assert_eq!(
+        transcript_cwd(&mapped.claude_transcripts()[0]),
+        mapped_cwd.to_str().unwrap()
+    );
+
+    recorded.baton(&["materialize", "--in", "claude"]);
+    assert_eq!(
+        transcript_cwd(&recorded.claude_transcripts()[0]),
+        source_cwd.to_str().unwrap()
     );
 }
 

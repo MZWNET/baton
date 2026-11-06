@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use baton_core::{
     Adapter, Agent, Blobs, Cursor, Export, Info, NativeRead, NativeSession, Progress, Source,
     Stamp, time,
@@ -164,6 +164,10 @@ impl Adapter for OpenhandsAdapter {
             files::create_new(&path, format!("{event}\n").as_bytes())?;
         }
         Ok(OpenhandsAdapter::probe(&dir)?.expect("a written conversation is a conversation"))
+    }
+
+    fn remove(&self, _session: &NativeSession) -> Result<()> {
+        bail!("OpenHands cannot safely identify which event files were created by an export")
     }
 
     // The workspace is wherever OpenHands runs, so it resumes in the session's directory

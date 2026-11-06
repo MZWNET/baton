@@ -5,17 +5,24 @@ use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::cache::database;
-use crate::{Agent, Store};
+use crate::project::{identify, matches};
+use crate::storage::record_order;
+use crate::{Agent, Direction, Project, Store};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     title TEXT,
     cwd TEXT,
+    project_remote TEXT,
+    project_root TEXT,
+    project_path TEXT,
     created TEXT NOT NULL,
     updated TEXT NOT NULL,
     events INTEGER NOT NULL,
-    alternate_branches INTEGER NOT NULL
+    alternate_branches INTEGER NOT NULL,
+    leaf TEXT,
+    replayable INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS links (
     session TEXT NOT NULL,
@@ -24,6 +31,8 @@ CREATE TABLE IF NOT EXISTS links (
     host TEXT NOT NULL,
     agent TEXT NOT NULL,
     native_id TEXT NOT NULL,
+    removed INTEGER NOT NULL,
+    removable INTEGER NOT NULL,
     PRIMARY KEY (session, name)
 );
 CREATE INDEX IF NOT EXISTS links_lookup ON links (host, agent, native_id, version, name);
@@ -40,6 +49,8 @@ CREATE TABLE IF NOT EXISTS events (
     name TEXT NOT NULL,
     parent TEXT,
     ts TEXT NOT NULL,
+    replayable INTEGER NOT NULL,
+    reset INTEGER NOT NULL,
     PRIMARY KEY (session, id)
 );
 CREATE INDEX IF NOT EXISTS events_parent ON events (session, parent);
@@ -93,13 +104,30 @@ pub struct SearchHit {
     pub body: String,
 }
 
+/// What materializing needs to know about a session, read without loading it.
+pub(crate) struct MaterializationSession {
+    pub id: String,
+    /// The newest leaf by timestamp and id, which ends the active branch.
+    pub leaf: Option<String>,
+    /// Whether the active branch holds replayable events after its last reset.
+    pub replayable: bool,
+}
+
+/// A native session whose newest link on this host belongs to `session`.
+pub(crate) struct MaterializationLink {
+    pub session: String,
+    pub native_id: String,
+    /// Whether the link is an untouched export with a recorded digest, so the native session may be removed once obsolete.
+    pub removable: bool,
+}
+
 impl Index {
     pub(crate) fn open(cache: &Path, data: &Path, host: &str) -> Result<Index> {
         let path = cache.join("index.db");
         let db = Connection::open(&path)?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 1 {
-            db.execute_batch("BEGIN; DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS texts; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS events; PRAGMA user_version = 1; COMMIT;")?;
+        if version != 4 {
+            db.execute_batch("BEGIN; DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS texts; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS events; PRAGMA user_version = 4; COMMIT;")?;
         }
         drop(db);
         let db = database::open(
@@ -165,7 +193,7 @@ impl Index {
                 continue;
             }
             if new_session {
-                transaction.execute("INSERT INTO sessions (id, created, updated, events, alternate_branches) VALUES (?1, '', '', 0, 0)", [id])?;
+                transaction.execute("INSERT INTO sessions (id, created, updated, events, alternate_branches, replayable) VALUES (?1, '', '', 0, 0, 0)", [id])?;
             }
             let added = current.difference(previous).collect::<Vec<_>>();
             let mut new_events = added
@@ -173,11 +201,10 @@ impl Index {
                 .filter(|(kind, _)| kind == "events")
                 .map(|(_, name)| name)
                 .collect::<Vec<_>>();
-            new_events.sort_by(|a, b| {
-                crate::storage::record_order(a).cmp(&crate::storage::record_order(b))
-            });
+            let events_changed = new_session || !new_events.is_empty();
+            new_events.sort_by(|a, b| record_order(a).cmp(&record_order(b)));
             for name in new_events {
-                let (version, _) = crate::storage::record_order(name);
+                let (version, _) = record_order(name);
                 for event in store.segment(id, name)? {
                     let previous: Option<(String, String)> = transaction
                         .query_row(
@@ -198,8 +225,8 @@ impl Index {
                         )?;
                     }
                     transaction.execute(
-                        "INSERT OR REPLACE INTO events (session, id, version, name, parent, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![id, event.id, version, name, event.parent, event.timestamp],
+                        "INSERT OR REPLACE INTO events (session, id, version, name, parent, ts, replayable, reset) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![id, event.id, version, name, event.parent, event.timestamp, event.body.replayable(), event.body.is_reset()],
                     )?;
                     if event.body.replayable() {
                         transaction.execute(
@@ -212,27 +239,42 @@ impl Index {
             if new_session || added.iter().any(|(kind, _)| kind == "records") {
                 let meta = store.record_meta(id)?;
                 transaction.execute(
-                    "UPDATE sessions SET title = ?2, cwd = ?3 WHERE id = ?1",
-                    params![id, meta.title, meta.cwd],
+                    "UPDATE sessions SET title = ?2, cwd = ?3, project_remote = ?4, project_root = ?5, project_path = ?6 WHERE id = ?1",
+                    params![id, meta.title, meta.cwd, meta.project.as_ref().and_then(|project| project.remote.as_deref()), meta.project.as_ref().and_then(|project| project.root.as_deref()), meta.project.as_ref().map(|project| project.path.as_str())],
                 )?;
                 transaction.execute("DELETE FROM links WHERE session = ?1", [id])?;
                 for (name, link) in store.link_versions(id)? {
-                    let (version, _) = crate::storage::record_order(&name);
+                    let (version, _) = record_order(&name);
+                    let removable = link.direction == Direction::Export
+                        && !link.continued
+                        && link.exported_digest.is_some();
                     transaction.execute(
-                        "INSERT INTO links (session, name, version, host, agent, native_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![id, name, version, link.host, link.agent.name(), link.native_id],
+                        "INSERT INTO links (session, name, version, host, agent, native_id, removed, removable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![id, name, version, link.host, link.agent.name(), link.native_id, link.removed, removable],
                     )?;
                 }
             }
-            transaction.execute(
-                "UPDATE sessions SET
+            if events_changed {
+                transaction.execute(
+                    "UPDATE sessions SET
                     created = COALESCE((SELECT MIN(ts) FROM events WHERE session = ?1), ''),
                     updated = COALESCE((SELECT MAX(ts) FROM events WHERE session = ?1), ''),
                     events = (SELECT COUNT(*) FROM events WHERE session = ?1),
-                    alternate_branches = (SELECT COUNT(*) > 1 FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id))
+                    alternate_branches = (SELECT COUNT(*) > 1 FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id)),
+                    leaf = (SELECT e.id FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id) ORDER BY e.ts DESC, e.id DESC LIMIT 1)
                  WHERE id = ?1",
-                [id],
-            )?;
+                    [id],
+                )?;
+                transaction.execute(
+                    "WITH RECURSIVE branch(id, parent, reset, replayable) AS (
+                     SELECT e.id, e.parent, e.reset, e.replayable FROM events e JOIN sessions s ON s.id = e.session AND s.leaf = e.id WHERE e.session = ?1
+                     UNION
+                     SELECT e.id, e.parent, e.reset, e.replayable FROM branch b JOIN events e ON e.session = ?1 AND e.id = b.parent WHERE NOT b.reset
+                 )
+                 UPDATE sessions SET replayable = EXISTS (SELECT 1 FROM branch WHERE replayable) WHERE id = ?1",
+                    [id],
+                )?;
+            }
             for (kind, name) in added {
                 transaction.execute(
                     "INSERT INTO files (session, kind, name) VALUES (?1, ?2, ?3)",
@@ -249,7 +291,7 @@ impl Index {
         let session = self
             .db
             .query_row(
-                "SELECT session FROM links WHERE host = ?1 AND agent = ?2 AND native_id = ?3 ORDER BY version DESC, name DESC, session DESC LIMIT 1",
+                "SELECT session FROM (SELECT session, removed FROM links WHERE host = ?1 AND agent = ?2 AND native_id = ?3 ORDER BY version DESC, name DESC, session DESC LIMIT 1) WHERE NOT removed",
                 params![self.host, agent.name(), native_id],
                 |row| row.get(0),
             )
@@ -257,10 +299,48 @@ impl Index {
         Ok(session)
     }
 
+    pub(crate) fn materialization_sessions(&self) -> Result<Vec<MaterializationSession>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT id, leaf, replayable FROM sessions ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok(MaterializationSession {
+                id: row.get(0)?,
+                leaf: row.get(1)?,
+                replayable: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn materialization_links(&self, agent: Agent) -> Result<Vec<MaterializationLink>> {
+        let mut statement = self.db.prepare(
+            "SELECT l.session, l.native_id, l.removable FROM links l WHERE l.host = ?1 AND l.agent = ?2 AND NOT l.removed
+             AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))
+             ORDER BY l.session, l.native_id",
+        )?;
+        let rows = statement.query_map(params![self.host, agent.name()], |row| {
+            Ok(MaterializationLink {
+                session: row.get(0)?,
+                native_id: row.get(1)?,
+                removable: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn sessions_without_project(&self) -> Result<Vec<(String, Option<String>)>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT id, cwd FROM sessions WHERE project_path IS NULL ORDER BY id")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// The session linked to the native session of `agent` whose id starts with `prefix`; fails when several sessions match.
     pub fn linked_session_by_prefix(&self, agent: Agent, prefix: &str) -> Result<Option<String>> {
         let mut statement = self.db.prepare(
-            "SELECT DISTINCT l.session FROM links l WHERE l.agent = ?1 AND substr(l.native_id, 1, length(?2)) = ?2
+            "SELECT DISTINCT l.session FROM links l WHERE l.agent = ?1 AND substr(l.native_id, 1, length(?2)) = ?2 AND NOT l.removed
              AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))",
         )?;
         let rows = statement.query_map(params![agent.name(), prefix], |row| row.get(0))?;
@@ -298,30 +378,52 @@ impl Index {
         let mut statement = self.db.prepare(
             "WITH active_links AS (
                  SELECT l.session, l.agent FROM links l
-                 WHERE NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))
+                 WHERE NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))
              )
              SELECT id, title, cwd, updated, events, alternate_branches,
-                    (SELECT group_concat(DISTINCT agent) FROM active_links WHERE active_links.session = sessions.id)
+                    (SELECT group_concat(DISTINCT agent) FROM active_links WHERE active_links.session = sessions.id),
+                    project_remote, project_root, project_path
              FROM sessions
-             WHERE (?1 IS NULL OR cwd = ?1)
-               AND (?2 IS NULL OR id IN (SELECT session FROM active_links WHERE agent = ?2))
+             WHERE (?1 IS NULL OR id IN (SELECT session FROM active_links WHERE agent = ?1))
              ORDER BY updated DESC",
         )?;
-        let rows = statement.query_map(params![cwd, agent.map(Agent::name)], |row| {
+        let rows = statement.query_map(params![agent.map(Agent::name)], |row| {
             let agents: Option<String> = row.get(6)?;
-            Ok(SessionSummary {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                cwd: row.get(2)?,
-                updated: row.get(3)?,
-                events: row.get(4)?,
-                alternate_branches: row.get(5)?,
-                agents: agents.map_or_else(Vec::new, |agents| {
-                    agents.split(',').map(String::from).collect()
-                }),
-            })
+            let path: Option<String> = row.get(9)?;
+            let remote = row.get(7)?;
+            let root = row.get(8)?;
+            let project = path.map(|path| Project { remote, root, path });
+            Ok((
+                SessionSummary {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    cwd: row.get(2)?,
+                    updated: row.get(3)?,
+                    events: row.get(4)?,
+                    alternate_branches: row.get(5)?,
+                    agents: agents.map_or_else(Vec::new, |agents| {
+                        agents.split(',').map(String::from).collect()
+                    }),
+                },
+                project,
+            ))
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<SessionSummary>>>()?)
+        let identity = cwd.and_then(|cwd| identify(Path::new(cwd)));
+        let mut sessions = Vec::new();
+        for row in rows {
+            let (summary, project) = row?;
+            if cwd.is_none_or(|cwd| {
+                matches(
+                    Path::new(cwd),
+                    identity.as_ref(),
+                    summary.cwd.as_deref(),
+                    project.as_ref(),
+                )
+            }) {
+                sessions.push(summary);
+            }
+        }
+        Ok(sessions)
     }
 
     /// The newest replayable events containing every one of `terms`, compared case-insensitively, at most `limit` of them.

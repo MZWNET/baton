@@ -50,8 +50,13 @@ pub(super) fn reimport(session: &Session, cursor: Option<&Cursor>, drafts: Vec<D
 }
 
 // The native session was exported from here, so its prefix only matches after replay normalization
-pub(super) fn backflow(session: &Session, exported: usize, drafts: Vec<Draft>) -> Step {
-    let path = session.path();
+pub(super) fn backflow(
+    session: &Session,
+    exported: usize,
+    reached: Option<&str>,
+    drafts: Vec<Draft>,
+) -> Step {
+    let path = reached.map_or_else(|| session.path(), |event| session.path_to(event));
     let ours = replay::events(&path);
     let Some(start) = align(&drafts, &ours, exported) else {
         // An emptied native session has nothing left to copy
@@ -61,16 +66,17 @@ pub(super) fn backflow(session: &Session, exported: usize, drafts: Vec<Draft>) -
         return Step::Fork { base: None, drafts };
     };
     let drafts: Vec<Draft> = drafts.into_iter().skip(start).collect();
-    let advanced = ours.len() > exported;
-    let base = if advanced {
+    let base = if let Some(reached) = reached {
+        Some(reached.to_owned())
+    } else if ours.len() > exported {
         exported.checked_sub(1).map(|index| ours[index].id.clone())
     } else {
         session.leaf().map(String::from)
     };
-    match (drafts.is_empty(), advanced) {
+    match (drafts.is_empty(), session.leaf() == base.as_deref()) {
         (true, _) => Step::Synced(base),
-        (false, false) => Step::Append { base, drafts },
-        (false, true) => Step::Fork { base, drafts },
+        (false, true) => Step::Append { base, drafts },
+        (false, false) => Step::Fork { base, drafts },
     }
 }
 

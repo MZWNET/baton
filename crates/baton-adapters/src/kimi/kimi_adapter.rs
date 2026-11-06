@@ -192,6 +192,20 @@ impl Adapter for KimiAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let main = session
+            .path
+            .parent()
+            .expect("session files have a directory");
+        let agents = main.parent().expect("agent directories have a parent");
+        let dir = agents.parent().expect("agent directories have a session");
+        files::remove_file(&dir.join("state.json"))?;
+        files::remove_file(&session.path)?;
+        files::remove_empty_dir(main)?;
+        files::remove_empty_dir(agents)?;
+        files::remove_empty_dir(dir)
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("kimi");
         command.arg("--session").arg(&session.id).current_dir(cwd);

@@ -249,6 +249,34 @@ impl Adapter for AntigravityAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let root = session
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .expect("conversation databases have a root");
+        let summaries = root.join("conversation_summaries.db");
+        let exists = match fs::metadata(&summaries) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if exists {
+            let mut connection = sqlite::open_read_write(&summaries)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
+                [&session.id],
+            )?;
+            files::remove_file(&session.path)?;
+            transaction.commit()?;
+        } else {
+            files::remove_file(&session.path)?;
+        }
+        Ok(())
+    }
+
     // agy lists the conversations of the directory it runs in
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("agy");

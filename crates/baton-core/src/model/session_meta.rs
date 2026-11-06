@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::Agent;
+use crate::{Agent, Project};
 
 /// The derived facts and links of a session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -11,6 +11,9 @@ pub struct SessionMeta {
     pub title: Option<String>,
     /// The project directory the session ran in.
     pub cwd: Option<String>,
+    /// The identity and relative directory of the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Project>,
     /// When the conversation started, as an RFC 3339 timestamp.
     pub created: String,
     /// The timestamp of the newest event.
@@ -48,6 +51,18 @@ pub struct Link {
     pub exported_events: usize,
     /// Whether the unified session was imported from the native session or exported to it.
     pub direction: Direction,
+    /// The digest of the native session immediately after export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_digest: Option<String>,
+    /// The unified event at the end of the exported branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_leaf: Option<String>,
+    /// Whether the exported native session has been continued.
+    #[serde(default)]
+    pub continued: bool,
+    /// Whether the native session has been removed.
+    #[serde(default)]
+    pub removed: bool,
 }
 
 /// Which way a link was created, which decides how the native session is matched against the unified one when it is read again.
@@ -72,6 +87,8 @@ pub(crate) struct Record {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Project>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

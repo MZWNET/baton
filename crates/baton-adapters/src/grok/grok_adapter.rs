@@ -173,6 +173,16 @@ impl Adapter for GrokAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let dir = session
+            .path
+            .parent()
+            .expect("session files have a directory");
+        files::remove_file(&dir.join("summary.json"))?;
+        files::remove_file(&session.path)?;
+        files::remove_empty_dir(dir)
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("grok");
         command.arg("--resume").arg(&session.id).current_dir(cwd);

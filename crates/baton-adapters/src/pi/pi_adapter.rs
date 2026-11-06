@@ -169,6 +169,10 @@ impl Adapter for PiAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        files::remove_file(&session.path)
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command(self.agent.name());
         let flag = if self.is_omp() {

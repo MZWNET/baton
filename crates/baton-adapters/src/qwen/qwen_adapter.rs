@@ -122,6 +122,10 @@ impl Adapter for QwenAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        files::remove_file(&session.path)
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("qwen");
         command.arg("--resume").arg(&session.id).current_dir(cwd);

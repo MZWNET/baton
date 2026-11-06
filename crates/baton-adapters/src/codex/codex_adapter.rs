@@ -207,6 +207,28 @@ impl Adapter for CodexAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let index = self.root.join("session_index.jsonl");
+        let bytes = match fs::read(&index) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        for line in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let row: Value = serde_json::from_slice(line)?;
+            if row["id"].as_str() == Some(session.id.as_str()) {
+                bail!(
+                    "cannot safely remove Codex session {} from the shared title index",
+                    session.id
+                );
+            }
+        }
+        files::remove_file(&session.path)
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command("codex");
         command.arg("resume").arg(&session.id).current_dir(cwd);

@@ -190,6 +190,27 @@ impl Adapter for OpencodeAdapter {
         })
     }
 
+    fn remove(&self, session: &NativeSession) -> Result<()> {
+        let v2 = self.is_v2()?;
+        let connection = sqlite::open_read_only(&session.path)?;
+        let table = if v2 { "session_v2" } else { "session" };
+        let has_children: bool = connection.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE parent_id = ?1)"),
+            [&session.id],
+            |row| row.get(0),
+        )?;
+        if has_children {
+            bail!(
+                "cannot remove {} session {} with child sessions",
+                self.agent.name(),
+                session.id
+            );
+        }
+        let flag = if v2 { "--standalone" } else { "--pure" };
+        self.run(&[flag, "session", "delete", &session.id], None)?;
+        Ok(())
+    }
+
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
         let mut command = program::command(self.agent.name());
         command.arg("--session").arg(&session.id).current_dir(cwd);
