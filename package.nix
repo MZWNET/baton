@@ -1,4 +1,5 @@
 {
+  git,
   lib,
   rustPlatform,
 }:
@@ -16,6 +17,8 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = ./Cargo.lock;
+
+  nativeCheckInputs = [git];
 
   meta = {
     description = "Keep the conversations of your coding agents in one append-only history and continue any of them in another agent";
