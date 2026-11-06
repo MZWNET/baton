@@ -229,7 +229,9 @@ fn mastracode_round_trips_exactly_into_a_database_it_creates() {
             row.get(0)
         })
         .unwrap();
-    if let Some(override_id) = std::env::var_os("MASTRA_RESOURCE_ID").filter(|value| !value.is_empty()) {
+    if let Some(override_id) =
+        std::env::var_os("MASTRA_RESOURCE_ID").filter(|value| !value.is_empty())
+    {
         assert_eq!(resource, override_id.to_string_lossy());
     } else {
         assert!(

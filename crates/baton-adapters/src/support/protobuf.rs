@@ -72,10 +72,12 @@ impl<'a> Message<'a> {
     }
 
     pub(crate) fn repeated(&self, number: u32) -> impl Iterator<Item = &'a [u8]> + '_ {
-        self.fields.iter().filter_map(move |(field, value)| match value {
-            Value::Bytes(bytes) if *field == number => Some(*bytes),
-            _ => None,
-        })
+        self.fields
+            .iter()
+            .filter_map(move |(field, value)| match value {
+                Value::Bytes(bytes) if *field == number => Some(*bytes),
+                _ => None,
+            })
     }
 }
 

@@ -29,7 +29,10 @@ impl<'a> WireWriter<'a> {
             context: 0,
             last_prompt: None,
         };
-        json::push_line(&mut writer.out, &json!({"type": "metadata", "protocol_version": PROTOCOL_VERSION, "created_at": created}));
+        json::push_line(
+            &mut writer.out,
+            &json!({"type": "metadata", "protocol_version": PROTOCOL_VERSION, "created_at": created}),
+        );
         writer
     }
 

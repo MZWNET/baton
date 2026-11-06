@@ -14,7 +14,7 @@ const NO_RESPONSE: &str =
     "<user_cancellation>Tool execution interrupted - no response available</user_cancellation>";
 
 // Each line is written the way Vibe dumps it again, every default included, so its fingerprint stays valid
-pub(super) fn messages<'a>(events: &[&'a Event], blobs: &Blobs) -> Result<Vec<Value>> {
+pub(super) fn messages(events: &[&Event], blobs: &Blobs) -> Result<Vec<Value>> {
     let mut writer = MessageWriter {
         calls: unit::calls_by_id(events),
         lines: Vec::new(),

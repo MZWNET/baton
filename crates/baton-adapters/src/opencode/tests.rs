@@ -194,7 +194,9 @@ fn written_bundles_read_back_unchanged() {
     }
     let late = parts
         .iter()
-        .find(|part| part["state"]["input"] == json!({"id": "late_b"}) && part["state"]["error"] == "failed")
+        .find(|part| {
+            part["state"]["input"] == json!({"id": "late_b"}) && part["state"]["error"] == "failed"
+        })
         .unwrap();
     assert_eq!(late["tool"], "bash");
     let ids: Vec<&str> = bundle["messages"]
@@ -325,7 +327,10 @@ fn written_v2_transfers_read_back_unchanged() {
     }
     let late = blocks
         .iter()
-        .find(|block| block["state"]["input"] == json!({"id": "late_b"}) && block["state"]["error"]["message"] == "failed")
+        .find(|block| {
+            block["state"]["input"] == json!({"id": "late_b"})
+                && block["state"]["error"]["message"] == "failed"
+        })
         .unwrap();
     assert_eq!(late["name"], "bash");
     let ids: Vec<&str> = data["messages"]

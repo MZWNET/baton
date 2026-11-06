@@ -12,7 +12,10 @@ use crate::support::normalize::{self, Content};
 use crate::support::protobuf::Message;
 use crate::support::{files, images, uri};
 
-pub(super) fn databases<'a>(root: &'a Path, path: Option<&'a Path>) -> Result<(&'a Path, Vec<(PathBuf, String)>)> {
+pub(super) fn databases<'a>(
+    root: &'a Path,
+    path: Option<&'a Path>,
+) -> Result<(&'a Path, Vec<(PathBuf, String)>)> {
     let (root, dbs) = match path {
         Some(db) if db.is_file() => (
             db.parent().and_then(Path::parent).unwrap_or(db),
@@ -23,12 +26,16 @@ pub(super) fn databases<'a>(root: &'a Path, path: Option<&'a Path>) -> Result<(&
             (root, files::read_dir(&root.join("conversations"))?)
         }
     };
-    let dbs = dbs.into_iter().filter_map(|db| {
-        let stem = db.file_stem()?.to_str()?;
-        let named = db.extension().is_some_and(|extension| extension == "db") && Uuid::parse_str(stem).is_ok();
-        let id = named.then(|| stem.to_owned())?;
-        Some((db, id))
-    }).collect();
+    let dbs = dbs
+        .into_iter()
+        .filter_map(|db| {
+            let stem = db.file_stem()?.to_str()?;
+            let named = db.extension().is_some_and(|extension| extension == "db")
+                && Uuid::parse_str(stem).is_ok();
+            let id = named.then(|| stem.to_owned())?;
+            Some((db, id))
+        })
+        .collect();
     Ok((root, dbs))
 }
 

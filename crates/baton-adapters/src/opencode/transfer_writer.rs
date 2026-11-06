@@ -132,7 +132,9 @@ fn settle(
         json!({"status": "completed", "input": input, "content": content})
     };
     tool_order::set_marker(&mut tool["state"], marker);
-    let created = tool["time"]["created"].as_i64().expect("tool has a creation time");
+    let created = tool["time"]["created"]
+        .as_i64()
+        .expect("tool has a creation time");
     tool["time"]["completed"] = json!(time::unix_millis(&event.timestamp).max(created));
     Ok(())
 }

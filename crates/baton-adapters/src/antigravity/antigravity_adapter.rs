@@ -111,7 +111,12 @@ impl AntigravityAdapter {
             Body::User(user) => Some(user.text.chars().take(16_384).collect::<String>()),
             _ => None,
         });
-        let (last_input, last_input_time) = match steps.iter().enumerate().rev().find(|(_, step)| step.kind == USER_INPUT) {
+        let (last_input, last_input_time) = match steps
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, step)| step.kind == USER_INPUT)
+        {
             Some((index, step)) => (index as i64, go_time(step.millis)),
             None => (-1, "0001-01-01 00:00:00+00:00".to_owned()),
         };

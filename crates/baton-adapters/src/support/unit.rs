@@ -6,10 +6,13 @@ use serde_json::{Value, json};
 use crate::support::normalize;
 
 pub(crate) fn calls_by_id<'a>(events: &[&'a Event]) -> HashMap<&'a str, &'a ToolCall> {
-    events.iter().filter_map(|event| match &event.body {
-        Body::ToolCall(call) => Some((call.call_id.as_str(), call)),
-        _ => None,
-    }).collect()
+    events
+        .iter()
+        .filter_map(|event| match &event.body {
+            Body::ToolCall(call) => Some((call.call_id.as_str(), call)),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn decode_function_call(call: &Value, id: &Value) -> ToolCall {

@@ -170,7 +170,9 @@ impl<'a> BundleWriter<'a> {
         mut marker: Option<Value>,
     ) -> Result<()> {
         let info = &self.messages[message]["info"];
-        let start = info["time"]["created"].as_i64().expect("message has a creation time");
+        let start = info["time"]["created"]
+            .as_i64()
+            .expect("message has a creation time");
         let message_id = info["id"].as_str().expect("message has an id").to_owned();
         let end = time::unix_millis(&event.timestamp).max(start);
         let call = &self.messages[message]["parts"][index];

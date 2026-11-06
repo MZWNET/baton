@@ -93,7 +93,10 @@ impl<'a> MessageParser<'a> {
                     .map(Vec::as_slice)
                     .unwrap_or_default();
                 for call in calls {
-                    bodies.push(Body::ToolCall(unit::decode_function_call(call, &call["id"])));
+                    bodies.push(Body::ToolCall(unit::decode_function_call(
+                        call,
+                        &call["id"],
+                    )));
                 }
                 bodies
             }

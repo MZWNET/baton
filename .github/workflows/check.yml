@@ -68,7 +68,7 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-  # Nix and devenv do not run on Windows, so this job installs stable Rust itself and leaves formatting and docs to the job above
+  # Nix and devenv do not run on Windows, so this job installs nightly Rust itself and leaves formatting and docs to the job above
   windows:
     name: Check Codebase (windows-latest)
     runs-on: windows-latest
@@ -82,7 +82,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy
 

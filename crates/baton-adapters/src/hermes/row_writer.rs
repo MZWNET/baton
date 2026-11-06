@@ -54,7 +54,9 @@ pub(super) fn rows(events: &[&Event], blobs: &Blobs) -> Result<Vec<Row>> {
                 let content = content(&result.text, &result.images, blobs)?;
                 let mut row = Row::new("tool", content, event);
                 row.tool_call_id = Some(result.call_id.clone());
-                let name = calls.get(result.call_id.as_str()).map(|call| call.name.as_str());
+                let name = calls
+                    .get(result.call_id.as_str())
+                    .map(|call| call.name.as_str());
                 row.tool_name = Some(name.unwrap_or("unknown_tool").to_owned());
                 rows.push(row);
             }
