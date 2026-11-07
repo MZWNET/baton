@@ -192,7 +192,13 @@ impl Adapter for CodexAdapter {
         writer.push_meta(&id, created, export.cwd, &self.provider()?);
         writer.push_events(export.events)?;
         files::create_new(&path, writer.finish().as_bytes())?;
-        if let Some(title) = export.title {
+        // A seeded export recreated after losing only its rollout is already indexed
+        if let Some(title) = export.title
+            && CodexAdapter::titles(&self.root)?
+                .get(&id)
+                .map(String::as_str)
+                != Some(title)
+        {
             let row = json!({"id": id, "thread_name": title, "updated_at": time::now()});
             let mut index = OpenOptions::new()
                 .create(true)

@@ -241,6 +241,30 @@ fn codex_round_trips_everything_but_tool_error_flags() {
 }
 
 #[test]
+fn codex_recreates_a_lost_seeded_rollout_without_reindexing_its_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let events = sample(&blobs);
+    let path: Vec<&Event> = events.iter().collect();
+    let replayed = replay::events(&path);
+    let export = Export {
+        title: Some("Round trip"),
+        cwd: Path::new("/work/demo"),
+        created: CREATED,
+        events: &replayed,
+        seed: Some(uuid::Uuid::parse_str("12345678-1234-5678-9234-567812345678").unwrap()),
+    };
+    let root = dir.path().join("codex");
+    let adapter = CodexAdapter::new(root.clone());
+    let first = adapter.write(&export, &blobs).unwrap();
+    fs::remove_file(&first.path).unwrap();
+    let second = adapter.write(&export, &blobs).unwrap();
+    assert_eq!(second.id, first.id);
+    let index = fs::read_to_string(root.join("session_index.jsonl")).unwrap();
+    assert_eq!(index.lines().count(), 1);
+}
+
+#[test]
 fn hermes_round_trips_everything_but_tool_error_flags_and_replays_from_the_last_summary() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
