@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use baton_core::{Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp};
+use baton_core::{
+    Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp, time,
+};
 use chrono::Utc;
 use serde_json::{Deserializer, Value};
 use tempfile::Builder;
@@ -155,7 +157,7 @@ impl Adapter for OpencodeAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         use std::io::Write;
 
-        let id = ascending_ids::session_id();
+        let id = ascending_ids::session_id(export.seed, time::unix_millis(export.created));
         let v2 = self.is_v2()?;
         let data = if v2 {
             transfer_writer::write_transfer(export, &id, blobs)?

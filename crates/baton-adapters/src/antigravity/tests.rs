@@ -28,6 +28,7 @@ fn export_one(root: &Path, blobs: &Blobs, text: &str) -> String {
         cwd: Path::new("/work/demo"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        seed: None,
     };
     AntigravityAdapter::new(root.into())
         .write(&export, blobs)

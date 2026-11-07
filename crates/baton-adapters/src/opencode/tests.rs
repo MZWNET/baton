@@ -171,6 +171,7 @@ fn written_bundles_read_back_unchanged() {
         cwd: Path::new("/work/demo"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        seed: None,
     };
     let bundle = bundle_writer::write_bundle(&export, "ses_fixture", "1.19.5", &blobs).unwrap();
     let parts: Vec<&Value> = bundle["messages"]
@@ -306,6 +307,7 @@ fn written_v2_transfers_read_back_unchanged() {
         cwd: Path::new("/work/demo"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        seed: None,
     };
     let data = transfer_writer::write_transfer(&export, "ses_fixture", &blobs).unwrap();
     let blocks: Vec<&Value> = data["messages"]

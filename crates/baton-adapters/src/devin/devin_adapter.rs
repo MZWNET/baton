@@ -144,7 +144,7 @@ impl Adapter for DevinAdapter {
             );
         }
         let nodes = node_writer::nodes(export.events, blobs)?;
-        let id = identifiers::uuid_v4();
+        let id = identifiers::session_v4(export.seed).to_string();
         // The newest session is the one Devin lists first and continues
         let activity = time::unix_millis(&time::now()).div_euclid(1000);
         let mut connection = sqlite::open_read_write(&self.db)?;

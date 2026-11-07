@@ -61,6 +61,7 @@ fn round_trip(adapter: &dyn Adapter, blobs: &Blobs) -> Back {
         cwd: Path::new("/work/demo"),
         created: CREATED,
         events: &replayed,
+        seed: None,
     };
     let written = adapter.write(&export, blobs).unwrap();
     let native = adapter
@@ -76,6 +77,83 @@ fn round_trip(adapter: &dyn Adapter, blobs: &Blobs) -> Back {
         title: read.info.title.or(native.title),
         cwd: read.info.cwd,
         file: native.path,
+    }
+}
+
+#[test]
+fn seeded_exports_have_the_same_native_id_and_path_in_fresh_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let events = sample(&blobs);
+    let path: Vec<&Event> = events.iter().collect();
+    let replayed = replay::events(&path);
+    let export = Export {
+        title: Some("Round trip"),
+        cwd: Path::new("/work/demo"),
+        created: CREATED,
+        events: &replayed,
+        seed: Some(uuid::Uuid::parse_str("12345678-1234-5678-9234-567812345678").unwrap()),
+    };
+    let adapters = |root: &Path| -> Vec<(&str, Box<dyn Adapter>)> {
+        support::database(
+            &root.join("hermes/state.db"),
+            include_str!("fixtures/hermes-state.sql"),
+        );
+        support::database(
+            &root.join("devin/sessions.db"),
+            include_str!("fixtures/devin-sessions.sql"),
+        );
+        vec![
+            ("pi", Box::new(PiAdapter::new(Agent::Pi, root.join("pi")))),
+            (
+                "omp",
+                Box::new(PiAdapter::new(Agent::Omp, root.join("omp"))),
+            ),
+            ("claude", Box::new(ClaudeAdapter::new(root.join("claude")))),
+            ("codex", Box::new(CodexAdapter::new(root.join("codex")))),
+            ("hermes", Box::new(HermesAdapter::new(root.join("hermes")))),
+            (
+                "mastracode",
+                Box::new(MastracodeAdapter::new(root.join("mastracode/mastra.db"))),
+            ),
+            (
+                "devin",
+                Box::new(DevinAdapter::new(root.join("devin/sessions.db"))),
+            ),
+            (
+                "copilot",
+                Box::new(CopilotAdapter::new(root.join("copilot"))),
+            ),
+            ("grok", Box::new(GrokAdapter::new(root.join("grok")))),
+            (
+                "openhands",
+                Box::new(OpenhandsAdapter::new(root.join("openhands"))),
+            ),
+            ("vibe", Box::new(VibeAdapter::new(root.join("vibe")))),
+            ("qwen", Box::new(QwenAdapter::new(root.join("qwen")))),
+            ("kimi", Box::new(KimiAdapter::new(root.join("kimi")))),
+            ("muse", Box::new(MuseAdapter::new(root.join("muse")))),
+            (
+                "antigravity",
+                Box::new(AntigravityAdapter::new(root.join("antigravity"))),
+            ),
+            ("cursor", Box::new(CursorAdapter::new(root.join("cursor")))),
+        ]
+    };
+    let first_root = dir.path().join("first");
+    let second_root = dir.path().join("second");
+    for ((name, first), (_, second)) in adapters(&first_root)
+        .into_iter()
+        .zip(adapters(&second_root))
+    {
+        let first = first.write(&export, &blobs).unwrap();
+        let second = second.write(&export, &blobs).unwrap();
+        assert_eq!(first.id, second.id, "{name}");
+        assert_eq!(
+            first.path.strip_prefix(&first_root).unwrap(),
+            second.path.strip_prefix(&second_root).unwrap(),
+            "{name}"
+        );
     }
 }
 
@@ -364,6 +442,7 @@ fn vibe_answers_calls_whose_results_come_later_with_lines_it_reads_past() {
         cwd: Path::new("/work/demo"),
         created: CREATED,
         events: &replayed,
+        seed: None,
     };
     let adapter = VibeAdapter::new(dir.path().join("vibe"));
     let written = adapter.write(&export, &blobs).unwrap();

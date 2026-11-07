@@ -4,6 +4,7 @@ use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
+use uuid::Uuid;
 
 use crate::{Agent, Blobs, Draft, Event};
 
@@ -103,6 +104,8 @@ pub struct Export<'a> {
     pub created: &'a str,
     /// The events to write, as selected by [`replay::events`](crate::replay::events).
     pub events: &'a [&'a Event],
+    /// Fixes the native session id, so writing the same events again on this host gives the same session; `None` chooses a fresh id.
+    pub seed: Option<Uuid>,
 }
 
 /// Reads the sessions of one agent.

@@ -644,13 +644,14 @@ fn exports_record_the_absolute_project_directory() {
 }
 
 #[test]
-fn materialize_writes_once_and_reexports_after_native_store_is_wiped() {
+fn materialize_recreates_a_wiped_export_without_new_records() {
     let home = Home::new();
     write_pi(
         &home,
         &[header("/work"), ask("a1", None, 1, "materialized question")],
     );
     home.baton(&["import", "--agent", "pi"]);
+    let session = home.sessions().remove(0);
 
     home.baton(&["materialize", "--in", "claude"]);
     let first = home.claude_transcripts();
@@ -660,11 +661,22 @@ fn materialize_writes_once_and_reexports_after_native_store_is_wiped() {
     home.baton(&["materialize", "--in", "claude"]);
     assert_eq!(home.claude_transcripts(), first);
     assert_eq!(fs::read(&first[0]).unwrap(), contents);
+    let records = home.path(&format!("baton/sessions/{session}/records"));
+    let record_files = || {
+        let mut files: Vec<_> = fs::read_dir(&records)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        files.sort();
+        files
+    };
+    let before = record_files();
 
     fs::remove_dir_all(home.path(".claude")).unwrap();
     home.baton(&["materialize", "--in", "claude"]);
     let recreated = home.claude_transcripts();
-    assert_eq!(recreated.len(), 1);
+    assert_eq!(recreated, first);
+    assert_eq!(record_files(), before);
     assert!(
         fs::read_to_string(&recreated[0])
             .unwrap()
@@ -672,6 +684,7 @@ fn materialize_writes_once_and_reexports_after_native_store_is_wiped() {
     );
     home.baton(&["materialize", "--in", "claude"]);
     assert_eq!(home.claude_transcripts(), recreated);
+    assert_eq!(record_files(), before);
 }
 
 #[test]

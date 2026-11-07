@@ -170,11 +170,12 @@ impl Adapter for CodexAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         use std::io::Write;
 
-        let id = identifiers::uuid_v7();
         let created = export.created;
         let Some(started) = time::parse(created) else {
             bail!("session creation time `{created}` is not RFC 3339");
         };
+        let id =
+            identifiers::session_v7(export.seed, started.timestamp_millis() as u64).to_string();
         // Codex names rollouts after local time
         let local = started.with_timezone(&Local);
         let path = self

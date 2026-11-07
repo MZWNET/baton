@@ -214,6 +214,7 @@ fn write(adapter: &CursorAdapter, blobs: &Blobs, bodies: Vec<Body>) -> NativeSes
         cwd: Path::new("/workspace/cli"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        seed: None,
     };
     adapter.write(&export, blobs).unwrap()
 }

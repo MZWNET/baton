@@ -8,6 +8,7 @@ use baton_core::{
     time,
 };
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::support::{files, identifiers, json, program};
 use crate::vibe::fingerprint::fingerprint;
@@ -59,7 +60,7 @@ impl VibeAdapter {
     }
 
     // Vibe resumes the folder whose name ends in the first eight characters of the id, so those have to be unique
-    fn unused_id(&self) -> Result<String> {
+    fn unused_id(&self, seed: Option<Uuid>) -> Result<String> {
         let names: Vec<String> = files::read_dir(&self.sessions)?
             .iter()
             .filter_map(|path| {
@@ -68,10 +69,13 @@ impl VibeAdapter {
             })
             .collect();
         loop {
-            let id = identifiers::uuid_v4();
+            let id = identifiers::session_v4(seed).to_string();
             let short = format!("_{}", &id[..8]);
             if !names.iter().any(|name| name.ends_with(&short)) {
                 return Ok(id);
+            }
+            if seed.is_some() {
+                bail!("Vibe session ID prefix {} already exists", &id[..8]);
             }
         }
     }
@@ -139,7 +143,7 @@ impl Adapter for VibeAdapter {
             bail!("session creation time `{created}` is not RFC 3339");
         };
         let lines = message_writer::messages(export.events, blobs)?;
-        let id = self.unused_id()?;
+        let id = self.unused_id(export.seed)?;
         let dir = self.sessions.join(format!(
             "session_{}_{}",
             started.format("%Y%m%d_%H%M%S"),

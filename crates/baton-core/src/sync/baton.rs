@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::{BaseDirs, ProjectDirs};
+use uuid::Uuid;
 
 use crate::cache::Cursors;
 use crate::model::Record;
@@ -221,7 +222,10 @@ impl Baton {
                     .or_else(|| session.meta.cwd.as_ref().map(PathBuf::from))
                     .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
                     .context("finding the home directory")?;
-                if let Err(error) = self.write_export(&session, adapter, cwd, &events, leaf) {
+                let seed = session_id::exported(&id, self.store.host(), agent, leaf);
+                if let Err(error) =
+                    self.write_export(&session, adapter, cwd, &events, leaf, Some(seed))
+                {
                     result.skipped += 1;
                     result.warnings.push(format!("{id}: {error:#}"));
                     continue;
@@ -414,6 +418,7 @@ impl Baton {
             cwd,
             &events,
             path.last().map(|event| event.id.as_str()),
+            None,
         )
     }
 
@@ -424,32 +429,39 @@ impl Baton {
         cwd: PathBuf,
         events: &[&Event],
         leaf: Option<&str>,
+        seed: Option<Uuid>,
     ) -> Result<Exported> {
         let export = Export {
             title: session.meta.title.as_deref(),
             cwd: &cwd,
             created: &session.meta.created,
             events,
+            seed,
         };
         let native = adapter.write(&export, &self.store.blobs())?;
         let read = adapter.read(&native, None, &self.store.blobs())?;
         let exported_digest = replay::digest(read.drafts.iter().map(|draft| &draft.body));
-        let record = Record {
-            link: Some(Link {
-                host: self.store.host().to_owned(),
-                agent: adapter.agent(),
-                native_id: native.id.clone(),
-                path: native.path.to_string_lossy().into_owned(),
-                exported_events: events.len(),
-                exported_leaf: leaf.map(str::to_owned),
-                exported_digest: Some(exported_digest),
-                continued: false,
-                removed: false,
-                direction: Direction::Export,
-            }),
-            ..Record::default()
+        let link = Link {
+            host: self.store.host().to_owned(),
+            agent: adapter.agent(),
+            native_id: native.id.clone(),
+            path: native.path.to_string_lossy().into_owned(),
+            exported_events: events.len(),
+            exported_leaf: leaf.map(str::to_owned),
+            exported_digest: Some(exported_digest),
+            continued: false,
+            removed: false,
+            direction: Direction::Export,
         };
-        self.store.record(&session.meta.id, &record)?;
+        if !session.meta.links.contains(&link) {
+            self.store.record(
+                &session.meta.id,
+                &Record {
+                    link: Some(link),
+                    ..Record::default()
+                },
+            )?;
+        }
         Ok(Exported { native, cwd })
     }
 

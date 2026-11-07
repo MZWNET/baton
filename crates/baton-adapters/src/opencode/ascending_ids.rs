@@ -19,13 +19,22 @@ impl AscendingIds {
 }
 
 // Session ids count down so that the newest session sorts first
-pub(super) fn session_id() -> String {
-    let value = !(Utc::now().timestamp_millis() as u64).wrapping_mul(0x1000) & TIME_BITS;
-    format!("ses_{value:012x}{}", random(14))
+pub(super) fn session_id(seed: Option<Uuid>, created_millis: i64) -> String {
+    let millis = if seed.is_some() {
+        created_millis
+    } else {
+        Utc::now().timestamp_millis()
+    };
+    let value = !(millis as u64).wrapping_mul(0x1000) & TIME_BITS;
+    let uuid = seed.unwrap_or_else(Uuid::new_v4);
+    format!("ses_{value:012x}{}", encode(&uuid, 14))
 }
 
 fn random(length: usize) -> String {
-    let uuid = Uuid::new_v4();
+    encode(&Uuid::new_v4(), length)
+}
+
+fn encode(uuid: &Uuid, length: usize) -> String {
     let mut text = String::with_capacity(length);
     for byte in &uuid.as_bytes()[..length] {
         text.push(char::from(ALPHABET[usize::from(*byte) % ALPHABET.len()]));
@@ -48,6 +57,6 @@ mod tests {
             "OpenCode orders messages by id, so ids must never go backwards"
         );
         assert_eq!(first.len(), "msg_".len() + 26);
-        assert!(session_id().starts_with("ses_"));
+        assert!(session_id(None, 0).starts_with("ses_"));
     }
 }

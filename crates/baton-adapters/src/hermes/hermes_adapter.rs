@@ -10,6 +10,7 @@ use baton_core::{
 use chrono::Local;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::hermes::row_parser::{self, Row};
 use crate::hermes::row_writer;
@@ -205,7 +206,7 @@ impl Adapter for HermesAdapter {
         let started = started.with_timezone(&Local).format("%Y%m%d_%H%M%S");
         let mut connection = sqlite::open_read_write(&db)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let id = unused_id(&transaction, &started.to_string())?;
+        let id = unused_id(&transaction, &started.to_string(), export.seed)?;
         let title = match export.title {
             Some(title) => free_title(&transaction, title)?,
             None => None,
@@ -339,10 +340,13 @@ fn title(connection: &Connection, lineage: &[String]) -> Result<Option<String>> 
     Ok(None)
 }
 
-// Hermes names sessions after their local start time and a random suffix
-fn unused_id(transaction: &Transaction, started: &str) -> Result<String> {
+// Hermes names sessions after their local start time and a six-character hex suffix
+fn unused_id(transaction: &Transaction, started: &str, seed: Option<Uuid>) -> Result<String> {
     loop {
-        let id = format!("{started}_{}", identifiers::short_hex(6));
+        let id = match seed {
+            Some(seed) => format!("{started}_{}", &seed.simple().to_string()[..6]),
+            None => format!("{started}_{}", identifiers::short_hex(6)),
+        };
         let taken: bool = transaction.query_row(
             "SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?1)",
             [&id],
@@ -350,6 +354,9 @@ fn unused_id(transaction: &Transaction, started: &str) -> Result<String> {
         )?;
         if !taken {
             return Ok(id);
+        }
+        if seed.is_some() {
+            bail!("Hermes session ID {id} already exists");
         }
     }
 }

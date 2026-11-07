@@ -96,7 +96,8 @@ impl Adapter for MuseAdapter {
             bail!("session creation time `{created}` is not RFC 3339");
         };
         // Muse generates time ordered ids and files sessions under their local creation date
-        let id = identifiers::uuid_v7();
+        let id =
+            identifiers::session_v7(export.seed, started.timestamp_millis() as u64).to_string();
         let mut writer = LogWriter::new(&id, created, &export.cwd.to_string_lossy());
         writer.push_events(export.events);
         let local = started.with_timezone(&Local);

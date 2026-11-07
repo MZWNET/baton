@@ -128,12 +128,13 @@ impl Source for PiAdapter {
 
 impl Adapter for PiAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
-        let id = identifiers::uuid_v7();
         let created = export.created;
         let cwd = export.cwd.to_string_lossy();
         let Some(started) = time::parse(created) else {
             bail!("session creation time `{created}` is not RFC 3339");
         };
+        let id =
+            identifiers::session_v7(export.seed, started.timestamp_millis() as u64).to_string();
         let file = format!("{}_{id}.jsonl", started.format("%Y-%m-%dT%H-%M-%S-%3fZ"));
         let path = self
             .root

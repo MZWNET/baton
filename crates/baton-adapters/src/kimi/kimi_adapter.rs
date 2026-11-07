@@ -153,7 +153,7 @@ impl Source for KimiAdapter {
 
 impl Adapter for KimiAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
-        let id = format!("session_{}", identifiers::uuid_v4());
+        let id = format!("session_{}", identifiers::session_v4(export.seed));
         // Kimi spells a Windows working directory with forward slashes, and refuses a session recorded for another directory
         let cwd = export.cwd.to_string_lossy().replace('\\', "/");
         let created = time::unix_millis(export.created);

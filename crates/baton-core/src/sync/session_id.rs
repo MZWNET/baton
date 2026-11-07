@@ -23,6 +23,17 @@ pub(super) fn legacy(old: &str) -> String {
     derive(&format!("legacy:{old}"))
 }
 
+pub(super) fn exported(session: &str, host: &str, agent: Agent, leaf: Option<&str>) -> Uuid {
+    uuid(&format!(
+        "export:{session}:{host}:{agent}:{}",
+        leaf.unwrap_or_default()
+    ))
+}
+
 fn derive(name: &str) -> String {
-    Uuid::new_v5(&NAMESPACE, name.as_bytes()).to_string()
+    uuid(name).to_string()
+}
+
+fn uuid(name: &str) -> Uuid {
+    Uuid::new_v5(&NAMESPACE, name.as_bytes())
 }

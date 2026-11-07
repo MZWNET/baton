@@ -85,7 +85,7 @@ impl Source for ClaudeAdapter {
 
 impl Adapter for ClaudeAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
-        let id = identifiers::uuid_v4();
+        let id = identifiers::session_v4(export.seed).to_string();
         let cwd = export.cwd.to_string_lossy();
         let path = self
             .root

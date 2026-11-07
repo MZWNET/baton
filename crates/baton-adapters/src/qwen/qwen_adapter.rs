@@ -96,7 +96,7 @@ impl Source for QwenAdapter {
 impl Adapter for QwenAdapter {
     // Qwen resumes a chat only in the directory its first record names, and only by a version 4 UUID
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
-        let id = identifiers::uuid_v4();
+        let id = identifiers::session_v4(export.seed).to_string();
         let cwd = export.cwd.to_string_lossy();
         let path = self
             .root

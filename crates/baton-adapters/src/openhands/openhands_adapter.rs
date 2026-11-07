@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::openhands::event_parser;
 use crate::openhands::event_writer::EventWriter;
-use crate::support::{files, json, program};
+use crate::support::{files, identifiers, json, program};
 
 /// Conversations of [OpenHands CLI](https://github.com/OpenHands/OpenHands-CLI): `<conversation uuid hex>/events/event-<index>-<event id>.json` in its conversations directory, one file per event.
 ///
@@ -150,7 +150,7 @@ impl Source for OpenhandsAdapter {
 impl Adapter for OpenhandsAdapter {
     // Without `base_state.json` OpenHands builds a fresh state around the events when it resumes them
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
-        let id = Uuid::new_v4();
+        let id = identifiers::session_v4(export.seed);
         let mut writer = EventWriter::new(blobs);
         writer.push_events(export.created, export.events)?;
         let dir = self.conversations.join(id.simple().to_string());

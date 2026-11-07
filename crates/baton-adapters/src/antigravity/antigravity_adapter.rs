@@ -201,7 +201,7 @@ impl Source for AntigravityAdapter {
 
 impl Adapter for AntigravityAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
-        let id = identifiers::uuid_v4();
+        let id = identifiers::session_v4(export.seed).to_string();
         let link = uri::from_path(&export.cwd.to_string_lossy());
         let steps = step_writer::steps(export.events, blobs)?;
         let created = time::unix_millis(export.created);

@@ -155,7 +155,7 @@ impl Adapter for MastracodeAdapter {
         if let Some(last) = messages.last() {
             updated = updated.max(last.created.clone());
         }
-        let id = identifiers::uuid_v4();
+        let id = identifiers::session_v4(export.seed).to_string();
         let mut connection = sqlite::open_or_create(&self.db)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;

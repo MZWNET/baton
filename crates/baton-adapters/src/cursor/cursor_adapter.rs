@@ -174,7 +174,7 @@ impl Source for CursorAdapter {
 
 impl Adapter for CursorAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
-        let id = identifiers::uuid_v4();
+        let id = identifiers::session_v4(export.seed).to_string();
         let cwd = export.cwd.to_string_lossy();
         let created = time::unix_millis(export.created);
         let graph = graph_writer::write(export.events, &cwd, created, blobs)?;

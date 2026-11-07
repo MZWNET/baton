@@ -124,7 +124,8 @@ impl Source for GrokAdapter {
 
 impl Adapter for GrokAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
-        let id = identifiers::uuid_v7();
+        let id = identifiers::session_v7(export.seed, time::unix_millis(export.created) as u64)
+            .to_string();
         let cwd = export.cwd.to_string_lossy().into_owned();
         let mut writer = UpdateWriter::new(blobs, &id);
         writer.push_events(export.events)?;
