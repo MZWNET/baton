@@ -31,11 +31,13 @@ CREATE TABLE IF NOT EXISTS links (
     host TEXT NOT NULL,
     agent TEXT NOT NULL,
     native_id TEXT NOT NULL,
+    path TEXT NOT NULL,
     removed INTEGER NOT NULL,
     removable INTEGER NOT NULL,
     PRIMARY KEY (session, name)
 );
 CREATE INDEX IF NOT EXISTS links_lookup ON links (host, agent, native_id, version, name);
+CREATE INDEX IF NOT EXISTS links_native_id ON links (native_id, agent, host, version, name);
 CREATE TABLE IF NOT EXISTS files (
     session TEXT NOT NULL,
     kind TEXT NOT NULL,
@@ -126,8 +128,8 @@ impl Index {
         let path = cache.join("index.db");
         let db = Connection::open(&path)?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 4 {
-            db.execute_batch("BEGIN; DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS texts; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS events; PRAGMA user_version = 4; COMMIT;")?;
+        if version != 5 {
+            db.execute_batch("BEGIN; DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS texts; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS events; PRAGMA user_version = 5; COMMIT;")?;
         }
         drop(db);
         let db = database::open(
@@ -249,8 +251,8 @@ impl Index {
                         && !link.continued
                         && link.exported_digest.is_some();
                     transaction.execute(
-                        "INSERT INTO links (session, name, version, host, agent, native_id, removed, removable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        params![id, name, version, link.host, link.agent.name(), link.native_id, link.removed, removable],
+                        "INSERT INTO links (session, name, version, host, agent, native_id, path, removed, removable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![id, name, version, link.host, link.agent.name(), link.native_id, link.path, link.removed, removable],
                     )?;
                 }
             }
@@ -288,15 +290,53 @@ impl Index {
 
     /// The session linked to the native session `native_id` of `agent`.
     pub fn linked_session(&self, agent: Agent, native_id: &str) -> Result<Option<String>> {
-        let session = self
-            .db
-            .query_row(
-                "SELECT session FROM (SELECT session, removed FROM links WHERE host = ?1 AND agent = ?2 AND native_id = ?3 ORDER BY version DESC, name DESC, session DESC LIMIT 1) WHERE NOT removed",
-                params![self.host, agent.name(), native_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(session)
+        self.find_linked_session(Some(agent), native_id, Some(&self.host))
+    }
+
+    /// The newest active link to a native session on any host, optionally filtered by agent.
+    pub fn linked_session_any_host(
+        &self,
+        agent: Option<Agent>,
+        native_id: &str,
+    ) -> Result<Option<String>> {
+        self.find_linked_session(agent, native_id, None)
+    }
+
+    fn find_linked_session(
+        &self,
+        agent: Option<Agent>,
+        native_id: &str,
+        host: Option<&str>,
+    ) -> Result<Option<String>> {
+        Ok(self.db.query_row(
+            "SELECT l.session FROM links l WHERE (?1 IS NULL OR l.agent = ?1) AND l.native_id = ?2 AND (?3 IS NULL OR l.host = ?3) AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC, l.session DESC LIMIT 1",
+            params![agent.map(Agent::name), native_id, host],
+            |row| row.get(0),
+        ).optional()?)
+    }
+
+    /// Finds an active provider link by file path on any host.
+    pub fn linked_file(&self, agent: Agent, path: &Path) -> Result<Option<(String, String)>> {
+        Ok(self.db.query_row(
+            "SELECT l.session, l.native_id FROM links l WHERE l.agent = ?1 AND l.path = ?2 AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC, l.session DESC LIMIT 1",
+            params![agent.name(), path.to_string_lossy()], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?)
+    }
+
+    /// The newest active native link for a session and agent on this host.
+    pub fn latest_native(&self, session: &str, agent: Agent) -> Result<Option<String>> {
+        Ok(self.db.query_row(
+            "SELECT l.native_id FROM links l WHERE l.session = ?1 AND l.host = ?2 AND l.agent = ?3 AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC LIMIT 1",
+            params![session, self.host, agent.name()], |row| row.get(0),
+        ).optional()?)
+    }
+
+    pub(crate) fn registry_links(&self, agent: Agent) -> Result<Vec<(String, String)>> {
+        let mut statement = self.db.prepare(
+            "SELECT l.session, l.name FROM links l WHERE l.agent = ?1 AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC, l.session DESC"
+        )?;
+        let rows = statement.query_map([agent.name()], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub(crate) fn materialization_sessions(&self) -> Result<Vec<MaterializationSession>> {

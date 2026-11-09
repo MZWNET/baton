@@ -53,7 +53,7 @@ pub fn adapter(agent: Agent) -> Result<Box<dyn Adapter>> {
         }
         Agent::Cursor => Box::new(CursorAdapter::new(CursorAdapter::default_root()?)),
         Agent::Dsh => Box::new(DshAdapter::new(DshAdapter::default_home()?)),
-        Agent::AntigravityDesktop | Agent::AntigravityIde | Agent::CursorIde => {
+        Agent::AntigravityDesktop | Agent::AntigravityIde | Agent::CursorIde | Agent::Paseo => {
             bail!("baton can only read {agent} sessions")
         }
     };

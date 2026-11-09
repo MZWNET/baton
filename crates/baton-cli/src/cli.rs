@@ -54,6 +54,9 @@ enum Command {
         id: String,
         #[arg(long)]
         to: Agent,
+        /// Provider to register in Paseo.
+        #[arg(long)]
+        provider: Option<Agent>,
         /// Project directory of the native session, the session's own by default.
         #[arg(long, value_parser = resolve::directory)]
         cwd: Option<PathBuf>,
@@ -64,6 +67,9 @@ enum Command {
         id: String,
         #[arg(long = "in", value_name = "AGENT")]
         agent: Agent,
+        /// Provider to register in Paseo.
+        #[arg(long)]
+        provider: Option<Agent>,
         /// Project directory of the native session, the session's own by default.
         #[arg(long, value_parser = resolve::directory)]
         cwd: Option<PathBuf>,
@@ -90,8 +96,18 @@ impl Cli {
             Command::List { cwd, agent } => list::run(&baton, cwd.as_deref(), agent),
             Command::Search { terms } => search::run(&baton, &terms),
             Command::Show { id } => show::run(&mut baton, &id),
-            Command::Export { id, to, cwd } => export::run(&mut baton, &id, to, cwd.as_deref()),
-            Command::Resume { id, agent, cwd } => resume::run(baton, &id, agent, cwd.as_deref()),
+            Command::Export {
+                id,
+                to,
+                provider,
+                cwd,
+            } => export::run(&mut baton, &id, to, provider, cwd.as_deref()),
+            Command::Resume {
+                id,
+                agent,
+                provider,
+                cwd,
+            } => resume::run(baton, &id, agent, provider, cwd.as_deref()),
             Command::Materialize { agents } => materialize::run(&mut baton, &agents),
             Command::Migrate => unreachable!("migrate runs without opening"),
         }

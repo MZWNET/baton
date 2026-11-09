@@ -29,7 +29,7 @@ impl Home {
     }
 
     // Agents keep their stores under HOME on Unix and USERPROFILE on Windows, unless these variables move them
-    const STORE_VARIABLES: [&str; 23] = [
+    const STORE_VARIABLES: [&str; 24] = [
         "PI_CODING_AGENT_DIR",
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
@@ -53,6 +53,7 @@ impl Home {
         "KIMI_CODE_HOME",
         "CURSOR_CONFIG_DIR",
         "DSH_HOME",
+        "PASEO_HOME",
     ];
 
     fn baton(&self, args: &[&str]) -> String {
@@ -60,6 +61,20 @@ impl Home {
     }
 
     fn baton_with_env(&self, args: &[&str], variables: &[(&str, &std::ffi::OsStr)]) -> String {
+        let output = self.baton_output(args, variables);
+        assert!(
+            output.status.success(),
+            "baton {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn baton_output(
+        &self,
+        args: &[&str],
+        variables: &[(&str, &std::ffi::OsStr)],
+    ) -> std::process::Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_baton"));
         command
             .args(args)
@@ -81,13 +96,7 @@ impl Home {
         command.env_remove("BATON_PATH_MAP");
         command.env_remove("BATON_PROJECTS");
         command.envs(variables.iter().copied());
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "baton {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap()
+        command.output().unwrap()
     }
 
     fn sessions(&self) -> Vec<String> {
@@ -150,6 +159,279 @@ impl Home {
 
 fn jsonl(records: &[Value]) -> String {
     records.iter().map(|record| format!("{record}\n")).collect()
+}
+
+fn paseo_fixture(home: &Home) -> (String, PathBuf) {
+    let native_id = "11111111-1111-4111-8111-111111111111";
+    let native = home.path(&format!(".claude/projects/-work/{native_id}.jsonl"));
+    fs::create_dir_all(native.parent().unwrap()).unwrap();
+    fs::write(&native, jsonl(&[json!({"type": "user", "uuid": "a1", "parentUuid": null, "sessionId": native_id, "cwd": home.project(), "timestamp": "2026-01-01T00:00:00.000Z", "message": {"role": "user", "content": "Paseo question"}})])).unwrap();
+    let record = home.path(".paseo/agents/work/paseo-1.json");
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(record, json!({"id": "paseo-1", "provider": "claude", "cwd": home.project(), "title": "Paseo title", "launchEnv": {"EXAMPLE": "private fixture value"}, "persistence": {"provider": "claude", "sessionId": native_id, "nativeHandle": native_id, "metadata": {"mcpServers": {"example": "private fixture value"}}}}).to_string()).unwrap();
+    (native_id.to_owned(), native)
+}
+
+#[cfg(unix)]
+fn fake_paseo(home: &Home, running: bool) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = home.path("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let executable = bin.join("paseo");
+    let script = if running {
+        r##"#!/bin/sh
+printf '%s\n' "$*" >> "$HOME/paseo.log"
+case "$1" in
+  ls) echo '[]' ;;
+  import)
+    n=1
+    if [ -f "$HOME/paseo.counter" ]; then n=$(cat "$HOME/paseo.counter"); fi
+    echo $((n + 1)) > "$HOME/paseo.counter"
+    id="restored-$n"
+    mkdir -p "$HOME/.paseo/agents/work"
+    printf '{"id":"%s","provider":"%s","cwd":"%s","title":null,"persistence":{"provider":"%s","sessionId":"%s","nativeHandle":"%s"}}' "$id" "$4" "$6" "$4" "$2" "$2" > "$HOME/.paseo/agents/work/$id.json"
+    printf '{"agentId":"%s","status":"created","provider":"%s","cwd":"%s","title":null}\n' "$id" "$4" "$6"
+    ;;
+  delete) rm "$HOME/.paseo/agents/work/$2.json" ;;
+esac
+"##
+    } else {
+        "#!/bin/sh\nexit 1\n"
+    };
+    fs::write(&executable, script).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap();
+    std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap()
+}
+
+#[test]
+fn paseo_import_fills_a_missing_title_and_is_idempotent() {
+    let home = Home::new();
+    paseo_fixture(&home);
+    home.baton(&["import", "--agent", "claude"]);
+    home.baton(&["import", "--agent", "paseo"]);
+    let sessions = home.sessions();
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert!(
+        home.baton(&["list", "--agent", "paseo"])
+            .contains("Paseo title")
+    );
+    assert!(home.baton(&["show", "paseo:paseo-1"]).contains(session));
+    let records = home.path(&format!("baton/sessions/{session}/records"));
+    assert!(fs::read_dir(&records).unwrap().all(|entry| {
+        !fs::read_to_string(entry.unwrap().path())
+            .unwrap()
+            .contains("private fixture value")
+    }));
+    let before = fs::read_dir(&records).unwrap().count();
+    home.baton(&["import", "--agent", "paseo"]);
+    assert_eq!(fs::read_dir(records).unwrap().count(), before);
+}
+
+#[test]
+fn paseo_import_preserves_the_provider_title_and_is_idempotent() {
+    let home = Home::new();
+    let (native_id, native) = paseo_fixture(&home);
+    append(
+        &native,
+        &[json!({"type": "custom-title", "customTitle": "Provider title", "sessionId": native_id})],
+    );
+    home.baton(&["import", "--agent", "claude"]);
+    let session = home.sessions().remove(0);
+    assert!(
+        home.baton(&["show", &session])
+            .contains("title    Provider title")
+    );
+    home.baton(&["import", "--agent", "paseo"]);
+    let shown = home.baton(&["show", "paseo:paseo-1"]);
+    assert!(shown.contains("title    Provider title"));
+    assert!(!shown.contains("title    Paseo title"));
+    let records = home.path(&format!("baton/sessions/{session}/records"));
+    let before = fs::read_dir(&records).unwrap().count();
+    home.baton(&["import", "--agent", "paseo"]);
+    assert_eq!(fs::read_dir(records).unwrap().count(), before);
+    assert!(
+        home.baton(&["show", &session])
+            .contains("title    Provider title")
+    );
+}
+
+#[test]
+fn paseo_import_rescues_a_deleted_provider_session() {
+    let home = Home::new();
+    paseo_fixture(&home);
+    home.baton(&["import", "--agent", "claude"]);
+    let session = home.sessions().remove(0);
+    let target = Home::new();
+    copy_session_files(&home, &target, &session);
+    let (_, native) = paseo_fixture(&target);
+    fs::remove_file(native).unwrap();
+    target.baton(&["import", "--agent", "paseo"]);
+    assert!(target.baton(&["show", "paseo:paseo-1"]).contains(&session));
+    assert!(
+        target
+            .baton(&["list", "--agent", "paseo"])
+            .contains("Paseo title")
+    );
+}
+
+#[test]
+fn paseo_import_rescues_a_deleted_provider_by_another_agents_id() {
+    let home = Home::new();
+    let (native_id, native) = paseo_fixture(&home);
+    fs::remove_file(native).unwrap();
+    let mut session_header = header("/work");
+    session_header["id"] = json!(native_id);
+    write_pi(
+        &home,
+        &[session_header, ask("a1", None, 1, "saved conversation")],
+    );
+    home.baton(&["import", "--agent", "pi"]);
+    let session = home.sessions().remove(0);
+    home.baton(&["import", "--agent", "paseo"]);
+    assert_eq!(home.sessions(), vec![session.clone()]);
+    assert!(home.baton(&["show", "paseo:paseo-1"]).contains(&session));
+    let records = home.path(&format!("baton/sessions/{session}/records"));
+    let links: Vec<Value> = fs::read_dir(records)
+        .unwrap()
+        .filter_map(|entry| {
+            let record: Value =
+                serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
+            (record["link"]["agent"] == "paseo").then(|| record["link"].clone())
+        })
+        .collect();
+    assert_eq!(links.len(), 1);
+    assert_eq!(
+        links[0]["provider"],
+        json!({"agent": "claude", "native_id": native_id})
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn paseo_materialize_registers_once_and_handles_a_missing_daemon() {
+    let source = Home::new();
+    paseo_fixture(&source);
+    source.baton(&["import", "--agent", "paseo"]);
+    let session = source.sessions().remove(0);
+    for running in [true, false] {
+        let target = Home::new();
+        copy_session_files(&source, &target, &session);
+        write_pi(
+            &target,
+            &[header("/other"), ask("a1", None, 1, "unrelated session")],
+        );
+        target.baton(&["import", "--agent", "pi"]);
+        let path = fake_paseo(&target, running);
+        let args = [("PATH", path.as_os_str())];
+        let output = target.baton_output(&["materialize", "--in", "paseo"], &args);
+        assert!(output.status.success());
+        if running {
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let transcripts = target.claude_transcripts();
+        assert_eq!(transcripts.len(), 1);
+        let records = target.path(&format!("baton/sessions/{session}/records"));
+        if running {
+            let log = fs::read_to_string(target.path("paseo.log")).unwrap();
+            let native_id = transcripts[0].file_stem().unwrap().to_str().unwrap();
+            assert!(log.contains(&format!(
+                "import {native_id} --provider claude --cwd {} --json",
+                source.project().display()
+            )));
+            assert!(
+                target
+                    .baton(&["show", "paseo:restored-1"])
+                    .contains(&session)
+            );
+            let before = fs::read_dir(&records).unwrap().count();
+            target.baton_with_env(&["materialize", "--in", "paseo"], &args);
+            assert_eq!(fs::read_dir(&records).unwrap().count(), before);
+            let log = fs::read_to_string(target.path("paseo.log")).unwrap();
+            assert_eq!(
+                log.lines()
+                    .filter(|line| line.starts_with("import "))
+                    .count(),
+                1
+            );
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("paseo daemon is not running")
+            );
+            assert!(!target.baton(&["list", "--agent", "paseo"]).is_empty());
+            let host = format!(
+                "test-{}",
+                target.dir.path().file_name().unwrap().to_string_lossy()
+            );
+            assert!(!fs::read_dir(records).unwrap().any(|entry| {
+                let record: Value =
+                    serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
+                record["link"]["agent"] == "paseo" && record["link"]["host"] == host
+            }));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn paseo_materialize_replaces_stale_untouched_exports() {
+    let source = Home::new();
+    let (native_id, native) = paseo_fixture(&source);
+    source.baton(&["import", "--agent", "paseo"]);
+    let session = source.sessions().remove(0);
+    let target = Home::new();
+    copy_session_files(&source, &target, &session);
+    let path = fake_paseo(&target, true);
+    let variables = [("PATH", path.as_os_str())];
+    target.baton_with_env(&["materialize", "--in", "paseo"], &variables);
+    let old = target.claude_transcripts().remove(0);
+    append(
+        &native,
+        &[
+            json!({"type": "user", "uuid": "a2", "parentUuid": "a1", "sessionId": native_id, "cwd": source.project(), "timestamp": "2026-01-01T00:00:01.000Z", "message": {"role": "user", "content": "new question"}}),
+        ],
+    );
+    source.baton(&["import", "--agent", "claude"]);
+    copy_session_files(&source, &target, &session);
+    target.baton_with_env(&["materialize", "--in", "paseo"], &variables);
+    assert!(!old.exists());
+    assert_eq!(target.claude_transcripts().len(), 1);
+    assert!(
+        fs::read_to_string(target.path("paseo.log"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "delete restored-1")
+    );
+    let shown = target.baton(&["show", &session]);
+    let host = format!(
+        "@test-{}",
+        target.dir.path().file_name().unwrap().to_string_lossy()
+    );
+    let links: Vec<_> = shown
+        .lines()
+        .filter(|line| line.starts_with("link     to paseo:") && line.contains(&host))
+        .collect();
+    assert_eq!(links.len(), 1);
+    assert!(links[0].contains("paseo:restored-2"));
+}
+
+#[test]
+fn paseo_export_requires_a_provider() {
+    let home = Home::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["export", "anything", "--to", "paseo"])
+        .env("BATON_HOME", home.path("baton"))
+        .env("BATON_CACHE_DIR", home.path("cache"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--provider is required"));
 }
 
 fn append(path: &Path, records: &[Value]) {

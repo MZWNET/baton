@@ -45,6 +45,9 @@ pub struct Link {
     pub agent: Agent,
     /// The agent's id for the native session.
     pub native_id: String,
+    /// The provider session registered by a Paseo agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<NativeRef>,
     /// Where the native session was last found.
     pub path: String,
     /// How many replayed events the native session shares with the unified session.
@@ -63,6 +66,15 @@ pub struct Link {
     /// Whether the native session has been removed.
     #[serde(default)]
     pub removed: bool,
+}
+
+/// A provider's native session referenced by a registry link.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRef {
+    /// The provider agent.
+    pub agent: Agent,
+    /// The provider's native session id.
+    pub native_id: String,
 }
 
 /// Which way a link was created, which decides how the native session is matched against the unified one when it is read again.

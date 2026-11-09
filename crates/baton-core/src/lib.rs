@@ -20,9 +20,9 @@ pub use adapter::{
 pub use agent::Agent;
 pub use cache::{Index, SearchHit, SessionSummary};
 pub use model::{
-    Assistant, Body, Compaction, Direction, Draft, Event, ForkPoint, Image, Link, Origin, Session,
-    SessionMeta, Thinking, ToolCall, ToolResult, User,
+    Assistant, Body, Compaction, Direction, Draft, Event, ForkPoint, Image, Link, NativeRef,
+    Origin, Session, SessionMeta, Thinking, ToolCall, ToolResult, User,
 };
 pub use project::Project;
 pub use storage::{Blobs, Store};
-pub use sync::{Baton, Exported, ImportOutcome, Materialized};
+pub use sync::{Baton, Exported, ImportOutcome, Materialized, materialization_cwd};

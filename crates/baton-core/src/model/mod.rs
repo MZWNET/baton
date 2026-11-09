@@ -7,4 +7,4 @@ pub use body::{Assistant, Body, Compaction, Image, Thinking, ToolCall, ToolResul
 pub use event::{Draft, Event, Origin};
 pub use session::Session;
 pub(crate) use session_meta::Record;
-pub use session_meta::{Direction, ForkPoint, Link, SessionMeta};
+pub use session_meta::{Direction, ForkPoint, Link, NativeRef, SessionMeta};

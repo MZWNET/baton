@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
@@ -148,6 +148,48 @@ impl Baton {
         self.index.refresh(&self.store)
     }
 
+    /// The host name used for this machine's links.
+    pub fn host(&self) -> &str {
+        self.store.host()
+    }
+
+    /// Records a changed registry link and supplies a title only when the session has none.
+    pub fn record_link(&self, session_id: &str, link: Link, title: Option<String>) -> Result<()> {
+        let session = self.store.load(session_id)?;
+        let changed = !session.meta.links.contains(&link);
+        let title = title.filter(|_| session.meta.title.is_none());
+        if changed || title.is_some() {
+            self.store.record(
+                session_id,
+                &Record {
+                    title,
+                    link: changed.then_some(link),
+                    ..Record::default()
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Returns sessions with their latest active registry link.
+    pub fn registry_sessions(&self, agent: Agent) -> Result<Vec<(String, Link)>> {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for (id, name) in self.index.registry_links(agent)? {
+            if seen.insert(id.clone()) {
+                let link = self
+                    .store
+                    .link_versions(&id)?
+                    .into_iter()
+                    .find_map(|(candidate, link)| (candidate == name).then_some(link))
+                    .expect("indexed link exists");
+                result.push((id, link));
+            }
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(result)
+    }
+
     /// Adds project identities to older sessions whose recorded directories exist here.
     pub fn backfill_projects(&mut self) -> Result<()> {
         for (id, cwd) in self.index.sessions_without_project()? {
@@ -164,11 +206,12 @@ impl Baton {
         Ok(())
     }
 
-    /// Writes each session's active branch to an agent and removes obsolete untouched exports when possible.
+    /// Writes each selected session's active branch to an agent and removes obsolete untouched exports when possible.
     pub fn materialize(
         &mut self,
         adapter: &(impl Adapter + ?Sized),
         natives: &[NativeSession],
+        sessions: Option<&HashSet<String>>,
     ) -> Result<Materialized> {
         let mut result = Materialized::default();
         let natives: HashMap<&str, &NativeSession> = natives
@@ -188,6 +231,9 @@ impl Baton {
         }
         for indexed in self.index.materialization_sessions()? {
             let id = indexed.id;
+            if sessions.is_some_and(|sessions| !sessions.contains(&id)) {
+                continue;
+            }
             if !indexed.replayable {
                 result.skipped += 1;
                 result.warnings.push(format!("{id}: nothing to replay"));
@@ -195,13 +241,15 @@ impl Baton {
             }
             let mut linked = Vec::new();
             for (link, native) in links.remove(id.as_str()).unwrap_or_default() {
-                let cursor = self.cursors.get(agent, &link.native_id)?;
-                let current = cursor.as_ref().is_some_and(|cursor| {
-                    cursor.session == id
-                        && cursor.path == native.path
-                        && cursor.stamp == native.stamp
-                        && cursor.event == indexed.leaf
-                });
+                let current = self
+                    .cursors
+                    .get(agent, &link.native_id)?
+                    .is_some_and(|cursor| {
+                        cursor.session == id
+                            && cursor.path == native.path
+                            && cursor.stamp == native.stamp
+                            && cursor.event == indexed.leaf
+                    });
                 linked.push((link, native, current));
             }
             let up_to_date = linked.iter().any(|(_, _, current)| *current);
@@ -214,18 +262,19 @@ impl Baton {
                 continue;
             }
             let session = self.store.load(&id)?;
-            let path = session.path();
-            let leaf = path.last().map(|event| event.id.as_str());
-            let events = replay::events(&path);
             if !up_to_date {
-                let cwd = resolve(session.meta.project.as_ref(), session.meta.cwd.as_deref())
-                    .or_else(|| session.meta.cwd.as_ref().map(PathBuf::from))
-                    .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
-                    .context("finding the home directory")?;
+                let path = session.path();
+                let leaf = path.last().map(|event| event.id.as_str());
+                let events = replay::events(&path);
                 let seed = session_id::exported(&id, self.store.host(), agent, leaf);
-                if let Err(error) =
-                    self.write_export(&session, adapter, cwd, &events, leaf, Some(seed))
-                {
+                if let Err(error) = self.write_export(
+                    &session,
+                    adapter,
+                    materialization_cwd(&session)?,
+                    &events,
+                    leaf,
+                    Some(seed),
+                ) {
                     result.skipped += 1;
                     result.warnings.push(format!("{id}: {error:#}"));
                     continue;
@@ -445,6 +494,7 @@ impl Baton {
             host: self.store.host().to_owned(),
             agent: adapter.agent(),
             native_id: native.id.clone(),
+            provider: None,
             path: native.path.to_string_lossy().into_owned(),
             exported_events: events.len(),
             exported_leaf: leaf.map(str::to_owned),
@@ -572,6 +622,7 @@ impl Baton {
                 host: self.store.host().to_owned(),
                 agent: incoming.agent,
                 native_id: incoming.native.id.clone(),
+                provider: None,
                 path: incoming.native.path.to_string_lossy().into_owned(),
                 exported_events: replay::events(&path).len(),
                 exported_leaf: None,
@@ -634,6 +685,14 @@ impl Baton {
         self.cursors
             .save(incoming.agent, &incoming.native.id, &cursor)
     }
+}
+
+/// Resolves the directory used when materializing a session on this host.
+pub fn materialization_cwd(session: &Session) -> Result<PathBuf> {
+    resolve(session.meta.project.as_ref(), session.meta.cwd.as_deref())
+        .or_else(|| session.meta.cwd.as_ref().map(PathBuf::from))
+        .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
+        .context("finding the home directory")
 }
 
 // An override skips the platform lookup, which fails on Windows when `USERPROFILE` names a profile without `AppData`

@@ -3,4 +3,4 @@ mod migration;
 mod session_id;
 mod step;
 
-pub use baton::{Baton, Exported, ImportOutcome, Materialized};
+pub use baton::{Baton, Exported, ImportOutcome, Materialized, materialization_cwd};

@@ -50,11 +50,13 @@ pub enum Agent {
     Dsh,
     /// The [Cursor](https://cursor.com/) editor, which keeps chats in its global state database; read only.
     CursorIde,
+    /// [Paseo](https://github.com/getpaseo/paseo), which registers sessions from other agents.
+    Paseo,
 }
 
 impl Agent {
     /// Every supported agent, in the order imports visit them.
-    pub const ALL: [Agent; 22] = [
+    pub const ALL: [Agent; 23] = [
         Agent::Pi,
         Agent::Omp,
         Agent::Claude,
@@ -77,6 +79,7 @@ impl Agent {
         Agent::Cursor,
         Agent::Dsh,
         Agent::CursorIde,
+        Agent::Paseo,
     ];
 
     /// The name used on the command line, in `agent:native_id` references and in stored events.
@@ -104,6 +107,7 @@ impl Agent {
             Agent::Cursor => "cursor",
             Agent::Dsh => "dsh",
             Agent::CursorIde => "cursor-ide",
+            Agent::Paseo => "paseo",
         }
     }
 }

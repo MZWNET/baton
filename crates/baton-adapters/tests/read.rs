@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use baton_adapters::{
     ClaudeAdapter, CodexAdapter, CopilotAdapter, DevinAdapter, DshAdapter, GrokAdapter,
-    HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpenhandsAdapter, PiAdapter,
+    HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpenhandsAdapter, Paseo, PiAdapter,
     QwenAdapter, VibeAdapter,
 };
 use baton_core::{Agent, Blobs, Body, Draft, Image, NativeRead, NativeSession, Source};
@@ -15,6 +15,35 @@ use serde_json::{Value, json};
 
 // SHA-256 of the image bytes `pixels`, the name blobs store them under
 const PIXELS_SHA256: &str = "6ec9c2b0eb14010746c8bce8939303b382344b296206612eb8a907a37b2b2f37";
+
+#[test]
+fn paseo_reads_supported_active_records_and_path_handles() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join("agents/project");
+    fs::create_dir_all(&directory).unwrap();
+    for (id, provider, handle, internal, archived) in [
+        ("claude", "claude", "native-id", false, false),
+        ("pi", "pi", "/home/me/session.jsonl", false, false),
+        ("internal", "claude", "internal-id", true, false),
+        ("archived", "claude", "archived-id", false, true),
+        ("unsupported", "copilot", "other-id", false, false),
+    ] {
+        let record = json!({"id": id, "provider": provider, "cwd": "/work", "title": "name", "internal": internal, "archivedAt": if archived { Some("2026-01-01") } else { None }, "persistence": {"provider": provider, "sessionId": handle, "nativeHandle": handle, "metadata": {"mcpServers": {"secret": "never copied"}}}});
+        fs::write(directory.join(format!("{id}.json")), record.to_string()).unwrap();
+    }
+    let agents = Paseo::new(home.path().to_path_buf()).discover().unwrap();
+    assert_eq!(agents.len(), 2);
+    assert!(
+        agents
+            .iter()
+            .any(|agent| agent.provider == Agent::Claude && agent.handle == "native-id")
+    );
+    assert!(
+        agents
+            .iter()
+            .any(|agent| agent.provider == Agent::Pi && agent.handle == "/home/me/session.jsonl")
+    );
+}
 
 fn kinds(drafts: &[Draft]) -> Vec<(String, String)> {
     drafts

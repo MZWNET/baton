@@ -28,6 +28,7 @@ Keep the conversations of your coding agents in one append-only history, back it
 | [Antigravity](https://antigravity.google/) desktop app | `antigravity-desktop` | Read only |
 | [Antigravity](https://antigravity.google/) IDE | `antigravity-ide` | Read only |
 | [Cursor](https://cursor.com/) editor | `cursor-ide` | Read only |
+| [Paseo](https://github.com/getpaseo/paseo) | `paseo` | Read / Write |
 
 ## Install
 
@@ -39,14 +40,15 @@ Keep the conversations of your coding agents in one append-only history, back it
 ## Usage
 
 ```sh
-baton import [--agent omp] [--path <path>]   # read new and changed sessions
+baton import [--agent omp] [--path <path>]      # read new and changed sessions
 baton list [--cwd [<dir>]] [--agent omp]
 baton search <terms>
 baton show <id>
-baton export <id> --to claude [--cwd <dir>]  # write a new Claude Code session and print its id
-baton resume <id> --in codex [--cwd <dir>]   # export, then open it in Codex
-baton materialize --in omp --in claude       # write every session into each agent, in the matching local project
-baton migrate                                # convert a data directory from the old events.jsonl and meta.json layout
+baton export <id> --to claude [--cwd <dir>]     # write a new Claude Code session and print its id
+baton export <id> --to paseo --provider claude  # write it for Claude Code, then register it in Paseo
+baton resume <id> --in codex [--cwd <dir>]      # export, then open it in Codex
+baton materialize --in omp --in claude          # write every session into each agent, in the matching local project
+baton migrate                                   # convert a data directory from the old events.jsonl and meta.json layout
 ```
 
 `<id>` is a baton session id, a unique prefix of it, or `agent:native_id` such as `omp:01a1a978`.
@@ -91,8 +93,10 @@ baton migrate                                # convert a data directory from the
 
 - Agent sessions are only read during import. Exports create new sessions and never overwrite existing ones.
 - Thinking is stored but never written back to an agent, tool calls are written as history and never run again, and auth, hooks, and MCP settings are untouched.
-- Each agent's location variables are honored, such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
+- Each agent's location variables are honored, such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PASEO_HOME`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
 - OpenCode and Kilo Code sessions go through the `opencode` and `kilo` commands on `PATH`.
+- Paseo keeps no conversations of its own: baton imports a Paseo agent through its provider's session (Claude Code, Codex, OpenCode, Pi, Oh My Pi), so the chat stays one baton session and remembers the Paseo agent with its title; archived and internal Paseo agents are skipped.
+- `--to paseo` and `--in paseo` take `--provider` for `export` and `resume`; `materialize --in paseo` restores every session that was a Paseo agent somewhere under its original provider through `paseo` and a running Paseo daemon, and skips registration with a warning when the daemon is not running.
 - DeepSeek Harness cannot open a session by id, so `baton resume --in dsh` starts `dsh web`, where the session is listed under its workspace or Ungrouped.
 
 ## Credits
