@@ -146,12 +146,17 @@ fn ide_pairs_results_with_calls_in_order_and_titles_from_the_editor_state() {
             "tool_result: b body",
         ]
     );
-    let Body::ToolResult(second) = &read.drafts[6].body else {
-        panic!("expected a result");
-    };
-    assert_eq!(
-        second.call_id, "step1_1",
-        "results answer calls in the order they were made"
-    );
+    for (call, result) in [(3, 5), (4, 6)] {
+        let Body::ToolCall(call) = &read.drafts[call].body else {
+            panic!("expected a call");
+        };
+        let Body::ToolResult(result) = &read.drafts[result].body else {
+            panic!("expected a result");
+        };
+        assert_eq!(
+            result.call_id, call.call_id,
+            "results answer calls in order"
+        );
+    }
     assert_eq!(read.info.cwd.as_deref(), Some("/workspace/ide"));
 }

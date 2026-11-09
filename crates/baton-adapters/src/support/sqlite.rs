@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -8,6 +8,30 @@ use rusqlite::{Connection, OpenFlags};
 
 // Agents keep their databases open while they run, so baton waits out their short write locks
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn resolve_path(path: Option<&Path>, default_db: &Path, name: &str) -> PathBuf {
+    match path {
+        Some(path) if path.is_file() => path.to_path_buf(),
+        Some(dir) => dir.join(name),
+        None => default_db.to_path_buf(),
+    }
+}
+
+// Build the database aside and link it in whole so the agent never sees half of it
+pub(crate) fn publish_new(
+    path: &Path,
+    fill: impl FnOnce(&mut Connection) -> Result<()>,
+) -> Result<()> {
+    let dir = path.parent().expect("database paths have a directory");
+    fs::create_dir_all(dir)?;
+    let scratch = tempfile::NamedTempFile::new_in(dir)?;
+    let mut connection = Connection::open(scratch.path())?;
+    fill(&mut connection)?;
+    connection.close().map_err(|(_, error)| error)?;
+    fs::hard_link(scratch.path(), path).with_context(|| format!("creating {}", path.display()))?;
+    scratch.close()?;
+    Ok(())
+}
 
 pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {
     open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)

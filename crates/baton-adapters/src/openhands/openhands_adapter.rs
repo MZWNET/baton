@@ -112,22 +112,20 @@ impl Source for OpenhandsAdapter {
         _cursor: Option<&Cursor>,
         blobs: &Blobs,
     ) -> Result<NativeRead> {
-        let mut events = Vec::new();
+        let mut created = None;
+        let mut fallback = None;
+        let mut drafts = Vec::new();
         for path in event_files(&session.path)? {
             let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            events.push(
-                serde_json::from_slice::<Value>(&bytes)
-                    .with_context(|| format!("parsing {}", path.display()))?,
-            );
-        }
-        let created = events
-            .first()
-            .and_then(|event| event["timestamp"].as_str())
-            .and_then(event_parser::timestamp);
-        let fallback = created.clone().unwrap_or_else(time::now);
-        let mut drafts = Vec::new();
-        for event in &events {
-            drafts.extend(event_parser::drafts(event, &fallback, blobs)?);
+            let event: Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            let fallback = fallback.get_or_insert_with(|| {
+                created = event["timestamp"]
+                    .as_str()
+                    .and_then(event_parser::timestamp);
+                created.clone().unwrap_or_else(time::now)
+            });
+            drafts.extend(event_parser::drafts(&event, fallback, blobs)?);
         }
         // The workspace is recorded only once OpenHands has run the conversation, and moves to wherever it resumes
         let state = fs::read(session.path.join("base_state.json"))

@@ -48,7 +48,7 @@ fn paseo_reads_supported_active_records_and_path_handles() {
 fn kinds(drafts: &[Draft]) -> Vec<(String, String)> {
     drafts
         .iter()
-        .map(|draft| (draft.body.kind().to_owned(), draft.body.text()))
+        .map(|draft| (draft.body.kind().to_owned(), draft.body.text().into_owned()))
         .collect()
 }
 

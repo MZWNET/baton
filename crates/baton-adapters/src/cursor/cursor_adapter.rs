@@ -151,9 +151,8 @@ impl Source for CursorAdapter {
         let meta = meta(&transaction)?.context("the Cursor store has no session row")?;
         let load = |id: &str| -> Result<Vec<u8>> {
             transaction
-                .query_row("SELECT data FROM blobs WHERE id = ?1", [id], |row| {
-                    row.get(0)
-                })
+                .prepare_cached("SELECT data FROM blobs WHERE id = ?1")?
+                .query_row([id], |row| row.get(0))
                 .with_context(|| format!("loading Cursor blob {id}"))
         };
         let root = load(meta["latestRootBlobId"].as_str().unwrap_or_default())?;
@@ -193,27 +192,25 @@ impl Adapter for CursorAdapter {
             "isRunEverything": false,
             "blobEncryptionKey": key,
         });
-        // The store is built aside and published whole, so Cursor never sees half of it
-        let scratch = tempfile::NamedTempFile::new()?;
-        {
-            let mut connection = Connection::open(scratch.path())?;
+        let dir = self.root.join("chats").join(bucket(&cwd)).join(&id);
+        let store = dir.join("store.db");
+        sqlite::publish_new(&store, |connection| {
             connection.execute_batch(SCHEMA)?;
             let transaction = connection.transaction()?;
-            for (blob, data) in &graph.blobs {
-                transaction.execute(
-                    "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
-                    params![blob, data],
-                )?;
+            {
+                let mut insert =
+                    transaction.prepare("INSERT INTO blobs (id, data) VALUES (?1, ?2)")?;
+                for (blob, data) in &graph.blobs {
+                    insert.execute(params![blob, data])?;
+                }
             }
             transaction.execute(
                 "INSERT INTO meta (key, value) VALUES ('0', ?1)",
                 [base16ct::lower::encode_string(meta.to_string().as_bytes())],
             )?;
             transaction.commit()?;
-        }
-        let dir = self.root.join("chats").join(bucket(&cwd)).join(&id);
-        let store = dir.join("store.db");
-        files::create_new(&store, &fs::read(scratch.path())?)?;
+            Ok(())
+        })?;
         let mut sidecar = json!({
             "schemaVersion": 1,
             "createdAtMs": created,

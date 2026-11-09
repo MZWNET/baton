@@ -4,7 +4,7 @@ use anyhow::Result;
 use baton_core::{Agent, Baton};
 use clap::{Parser, Subcommand};
 
-use crate::commands::{export, import, list, materialize, migrate, resume, search, show};
+use crate::commands::{export, import, list, materialize, migrate, resume, show};
 use crate::resolve;
 
 #[derive(Parser)]
@@ -37,11 +37,6 @@ enum Command {
         /// Only sessions linked to this agent.
         #[arg(long)]
         agent: Option<Agent>,
-    },
-    /// Search message, tool and summary text.
-    Search {
-        #[arg(required = true)]
-        terms: Vec<String>,
     },
     /// Print the active history of a session.
     Show {
@@ -94,7 +89,6 @@ impl Cli {
         match self.command {
             Command::Import { agent, path } => import::run(&mut baton, agent, path.as_deref()),
             Command::List { cwd, agent } => list::run(&baton, cwd.as_deref(), agent),
-            Command::Search { terms } => search::run(&baton, &terms),
             Command::Show { id } => show::run(&mut baton, &id),
             Command::Export {
                 id,

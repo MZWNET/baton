@@ -42,7 +42,6 @@ Keep the conversations of your coding agents in one append-only history, back it
 ```sh
 baton import [--agent omp] [--path <path>]      # read new and changed sessions
 baton list [--cwd [<dir>]] [--agent omp]
-baton search <terms>
 baton show <id>
 baton export <id> --to claude [--cwd <dir>]     # write a new Claude Code session and print its id
 baton export <id> --to paseo --provider claude  # write it for Claude Code, then register it in Paseo
@@ -84,7 +83,7 @@ baton migrate                                   # convert a data directory from 
 | --- | --- |
 | `BATON_HOME` (`<data>`) | `~/.local/share/baton` (Linux), `~/Library/Application Support/baton` (macOS), `%APPDATA%\baton\data` (Windows) |
 | `BATON_HOST` (`<host>`) | Machine host name |
-| `BATON_CACHE_DIR` | Platform cache directory; holds import cursors and the search index (rebuilt when missing) |
+| `BATON_CACHE_DIR` | Platform cache directory; holds import cursors and the session index (rebuilt when missing) |
 
 - Files are only added, never changed, and session ids derive from the native session they came from, so machines can sync by copying files between data directories (for example through a git repository).
 - A session continued on two machines keeps both branches; the newest is active and `baton show` lists the others.

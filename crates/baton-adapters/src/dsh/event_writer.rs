@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::event_parser::{BATON_PROVIDER, SYNTHETIC_PREFIX};
 use crate::support::unit::{self, Unit};
-use crate::support::{identifiers, images, json};
+use crate::support::{identifiers, json};
 
 const CHECKPOINT_PREAMBLE: &str = "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>";
 const INTERRUPTED: &str = "The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.";
@@ -277,7 +277,7 @@ impl<'a> EventWriter<'a> {
                     return Err(error).with_context(|| format!("creating {}", path.display()));
                 }
             }
-            let (width, height) = images::dimensions(&bytes).unwrap_or((0, 0));
+            let (width, height) = dimensions(&bytes).unwrap_or((0, 0));
             content.push(json!({"type": "image", "attachment": {"attachmentId": format!("sha256:{}", image.blob), "mediaType": image.mime, "bytes": bytes.len(), "width": width, "height": height}}));
         }
         Ok(content)
@@ -322,4 +322,70 @@ impl<'a> EventWriter<'a> {
 
 fn call_block(call: &ToolCall) -> Value {
     json!({"type": "tool-call", "id": call.call_id, "name": call.name, "arguments": call.input.to_string()})
+}
+
+fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be_u16 =
+        |offset| Some(u16::from_be_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as u32);
+    let le_u16 =
+        |offset| Some(u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as u32);
+
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.get(12..16) == Some(b"IHDR") {
+        let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+        let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+
+        Some((width, height))
+    } else if bytes.starts_with(b"GIF8") {
+        Some((le_u16(6)?, le_u16(8)?))
+    } else if bytes.starts_with(b"\xff\xd8") {
+        let mut offset = 2;
+        loop {
+            if *bytes.get(offset)? != 0xff {
+                return None;
+            }
+            while *bytes.get(offset)? == 0xff {
+                offset += 1;
+            }
+            let marker = *bytes.get(offset)?;
+            offset += 1;
+            match marker {
+                0xd9 | 0xda => return None,
+                0x01 | 0xd0..=0xd8 => continue,
+                _ => {}
+            }
+            let length = be_u16(offset)? as usize;
+            if length < 2 || bytes.get(offset..offset + length).is_none() {
+                return None;
+            }
+            if matches!(marker, 0xc0..=0xcf) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+                if length < 7 {
+                    return None;
+                }
+
+                return Some((be_u16(offset + 5)?, be_u16(offset + 3)?));
+            }
+            offset += length;
+        }
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        match bytes.get(12..16)? {
+            b"VP8 " => Some((le_u16(26)? & 0x3fff, le_u16(28)? & 0x3fff)),
+            b"VP8L" if *bytes.get(20)? == 0x2f => {
+                let bits = u32::from_le_bytes(bytes.get(21..25)?.try_into().ok()?);
+
+                Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+            }
+            b"VP8X" => {
+                let width = bytes.get(24..27)?;
+                let height = bytes.get(27..30)?;
+
+                Some((
+                    u32::from_le_bytes([width[0], width[1], width[2], 0]) + 1,
+                    u32::from_le_bytes([height[0], height[1], height[2], 0]) + 1,
+                ))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
 }

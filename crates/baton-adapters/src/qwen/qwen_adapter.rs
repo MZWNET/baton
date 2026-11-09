@@ -5,7 +5,6 @@ use anyhow::Result;
 use baton_core::{
     Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp, journal,
 };
-use uuid::Uuid;
 
 use crate::qwen::record_parser::RecordParser;
 use crate::qwen::record_writer::RecordWriter;
@@ -34,24 +33,6 @@ impl QwenAdapter {
         Ok(files::home()?.join(".qwen"))
     }
 
-    // Chats are named after their UUID; ledgers and other sidecars next to them are not
-    fn probe(file: &Path) -> Result<Option<NativeSession>> {
-        let Some(id) = file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_suffix(".jsonl"))
-            .filter(|id| Uuid::parse_str(id).is_ok())
-        else {
-            return Ok(None);
-        };
-        Ok(Some(NativeSession {
-            id: id.to_owned(),
-            path: file.to_path_buf(),
-            stamp: Stamp::of(file)?,
-            title: None,
-        }))
-    }
-
     // Qwen names a project directory after its dashed path, lowercased on Windows
     fn bucket(cwd: &str) -> String {
         if cfg!(windows) {
@@ -70,12 +51,12 @@ impl Source for QwenAdapter {
     fn discover(&self, path: Option<&Path>) -> Result<Vec<NativeSession>> {
         let root = path.unwrap_or(&self.root);
         if root.is_file() {
-            return Ok(QwenAdapter::probe(root)?.into_iter().collect());
+            return Ok(files::uuid_jsonl_session(root)?.into_iter().collect());
         }
         let mut sessions = Vec::new();
         for project in files::read_dir(&root.join("projects"))? {
             for file in files::read_dir(&project.join("chats"))? {
-                if let Some(session) = QwenAdapter::probe(&file)? {
+                if let Some(session) = files::uuid_jsonl_session(&file)? {
                     sessions.push(session);
                 }
             }

@@ -1,4 +1,4 @@
-//! End-to-end runs of the `baton` binary against isolated agent stores: incremental imports, backflow, forks and search.
+//! End-to-end runs of the `baton` binary against isolated agent stores: incremental imports, backflow, forks and materialization
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -647,12 +647,9 @@ fn index_refreshes_when_external_segments_appear_and_disappear() {
         .join(added.file_name());
     fs::copy(added.path(), &copied).unwrap();
     assert_eq!(target.event_count(&id), 2);
-    assert!(target.baton(&["search", "externally added"]).contains(&id));
 
     fs::remove_file(copied).unwrap();
     assert_eq!(target.event_count(&id), 1);
-    assert!(target.baton(&["search", "externally added"]).is_empty());
-    assert!(target.baton(&["search", "initial content"]).contains(&id));
 }
 
 #[test]
@@ -781,8 +778,12 @@ fn import_reads_appended_lines_once_and_follows_branches() {
     );
     assert!(home.baton(&["import"]).contains("1 new"));
     assert!(
-        home.path("cache/state.db").is_file(),
-        "cursors live in BATON_CACHE_DIR"
+        fs::read_dir(home.path("baton")).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+
+            name == "sessions" || name == "blobs"
+        }),
+        "machine-local state stays out of BATON_HOME"
     );
     assert!(
         home.baton(&["import"])
@@ -1160,7 +1161,7 @@ fn an_emptied_export_leaves_its_session_alone() {
 }
 
 #[test]
-fn every_file_agent_reads_its_own_export_back_unchanged() {
+fn exports_import_back_unchanged_with_and_without_cursors() {
     let home = Home::new();
     let image = "cGl4ZWxz";
     write_pi(
@@ -1217,10 +1218,16 @@ fn every_file_agent_reads_its_own_export_back_unchanged() {
         listed.contains(&session) && listed.contains("Round trip"),
         "{listed}"
     );
+    fs::remove_dir_all(home.path("cache")).unwrap();
+    let output = home.baton(&["import"]);
+    assert!(
+        output.contains("0 new, 0 updated, 0 forked, 5 unchanged"),
+        "{output}"
+    );
 }
 
 #[test]
-fn sessions_are_searchable_and_resolvable_by_prefix() {
+fn sessions_filter_by_agent_and_resolve_by_prefix_or_native_id() {
     let home = Home::new();
     write_pi(
         &home,
@@ -1232,17 +1239,6 @@ fn sessions_are_searchable_and_resolvable_by_prefix() {
     );
     home.baton(&["import"]);
     let session = home.sessions().remove(0);
-    assert!(home.baton(&["search", "配置文件"]).contains(&session));
-    assert!(home.baton(&["search", "WHERE", "the"]).contains(&session));
-    assert!(
-        home.baton(&["search", "配置", "where"]).contains(&session),
-        "terms shorter than a trigram are still found"
-    );
-    assert!(home.baton(&["search", "nowhere"]).is_empty());
-    assert!(
-        home.baton(&["search", "%"]).is_empty(),
-        "a wildcard character in a term only matches itself"
-    );
     assert!(home.baton(&["list", "--agent", "pi"]).contains(&session));
     assert!(!home.baton(&["list", "--agent", "codex"]).contains(&session));
     assert!(

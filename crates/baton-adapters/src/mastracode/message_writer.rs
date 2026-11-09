@@ -1,3 +1,5 @@
+use std::collections::{HashMap, VecDeque};
+
 use anyhow::Result;
 use baton_core::{Blobs, Body, Event, Image, ToolResult, time};
 use serde_json::{Value, json};
@@ -34,34 +36,41 @@ pub(super) fn messages(events: &[&Event], blobs: &Blobs) -> Result<Vec<Message>>
             }
             Unit::Assistant(run) => {
                 let mut parts = Vec::new();
+                let mut calls: HashMap<&str, VecDeque<usize>> = HashMap::new();
+                let mut first = HashMap::new();
                 for event in run {
                     match &event.body {
                         Body::Assistant(assistant) => {
                             parts.push(json!({"type": "text", "text": assistant.text}));
                         }
-                        Body::ToolCall(call) => parts.push(json!({
-                            "type": "tool-invocation",
-                            "toolInvocation": {"state": "call", "toolCallId": call.call_id, "toolName": call.name, "args": call.input},
-                        })),
+                        Body::ToolCall(call) => {
+                            calls
+                                .entry(&call.call_id)
+                                .or_default()
+                                .push_back(parts.len());
+                            first.entry(call.call_id.as_str()).or_insert(parts.len());
+                            parts.push(json!({
+                                "type": "tool-invocation",
+                                "toolInvocation": {"state": "call", "toolCallId": call.call_id, "toolName": call.name, "args": call.input},
+                            }));
+                        }
                         _ => {}
                     }
                 }
                 let mut folded = Vec::new();
                 while let Some(Unit::ToolResult(_, result)) = units.get(index + 1) {
-                    let open = parts.iter_mut().find(|part| {
-                        let invocation = &part["toolInvocation"];
-                        invocation["state"] == "call"
-                            && invocation["toolCallId"] == result.call_id.as_str()
-                    });
-                    let Some(part) = open else {
+                    let Some(position) = calls
+                        .get_mut(result.call_id.as_str())
+                        .and_then(VecDeque::pop_front)
+                    else {
                         break;
                     };
-                    fold(&mut part["toolInvocation"], result, blobs)?;
+                    fold(&mut parts[position]["toolInvocation"], result, blobs)?;
                     folded.push(result.call_id.as_str());
                     index += 1;
                 }
                 let mut content = json!({"format": 2, "parts": parts});
-                if !in_call_order(&folded, &content["parts"]) {
+                if !folded.iter().map(|id| first.get(id)).is_sorted() {
                     content["metadata"] = json!({"baton": {"resultOrder": folded}});
                 }
                 ("assistant", &run[0].timestamp, content)
@@ -124,21 +133,6 @@ fn fold(invocation: &mut Value, result: &ToolResult, blobs: &Blobs) -> Result<()
         invocation["isError"] = json!(true);
     }
     Ok(())
-}
-
-// Whether results arrived in the order of their calls, which is how the reader lists them otherwise
-fn in_call_order(folded: &[&str], parts: &Value) -> bool {
-    let positions: Vec<Option<usize>> = folded
-        .iter()
-        .map(|id| {
-            parts
-                .as_array()
-                .expect("parts are an array")
-                .iter()
-                .position(|part| part["toolInvocation"]["toolCallId"] == *id)
-        })
-        .collect();
-    positions.is_sorted()
 }
 
 // A user row marked for the reader, with a text part even when empty because MastraCode needs one

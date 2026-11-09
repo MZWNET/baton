@@ -1,11 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use ruzstd::decoding::StreamingDecoder;
-use ruzstd::encoding::{CompressionLevel, compress};
 use uuid::Uuid;
 
 use crate::model::Record;
@@ -16,6 +14,12 @@ use crate::{Event, Link, Session, SessionMeta};
 pub struct Store {
     root: PathBuf,
     host: String,
+}
+
+pub(crate) struct SessionFiles {
+    pub id: String,
+    pub events: Vec<String>,
+    pub records: Vec<String>,
 }
 
 impl Store {
@@ -30,7 +34,8 @@ impl Store {
     /// Loads a session with all of its events.
     pub fn load(&self, id: &str) -> Result<Session> {
         let events = self.events(id)?;
-        let meta = self.metadata(id, &events)?;
+        let records = self.records(id)?;
+        let meta = self.metadata(id, &records, &events);
         Ok(Session::new(meta, events))
     }
 
@@ -38,26 +43,32 @@ impl Store {
         Blobs::new(self.root.join("blobs"))
     }
 
-    pub(crate) fn ids(&self) -> Result<Vec<String>> {
+    pub(crate) fn session_files(&self) -> Result<Vec<SessionFiles>> {
         let dir = self.root.join("sessions");
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
         };
-        let mut ids = Vec::new();
+        let mut sessions = Vec::new();
         for entry in entries {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().into_owned();
-            if !self.files(&id, "records")?.is_empty() {
-                ids.push(id);
+            let records = self.files(&id, "records")?;
+            if !records.is_empty() {
+                let events = self.files(&id, "events")?;
+                sessions.push(SessionFiles {
+                    id,
+                    events,
+                    records,
+                });
             }
         }
-        ids.sort();
-        Ok(ids)
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(sessions)
     }
 
     pub(crate) fn files(&self, id: &str, kind: &str) -> Result<Vec<String>> {
@@ -92,12 +103,9 @@ impl Store {
             .join("events")
             .join(name);
         let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        let mut decoder =
-            StreamingDecoder::new(file).with_context(|| format!("decoding {}", path.display()))?;
-        let mut bytes = Vec::new();
-        decoder
-            .read_to_end(&mut bytes)
+        let bytes = zstd::stream::decode_all(file)
             .with_context(|| format!("decoding {}", path.display()))?;
+
         bytes
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
@@ -108,7 +116,7 @@ impl Store {
     }
 
     pub(crate) fn record_meta(&self, id: &str) -> Result<SessionMeta> {
-        self.metadata(id, &[])
+        Ok(self.metadata(id, &self.records(id)?, &[]))
     }
 
     pub(crate) fn link_versions(&self, id: &str) -> Result<Vec<(String, Link)>> {
@@ -119,21 +127,39 @@ impl Store {
             .collect())
     }
 
-    fn records(&self, id: &str) -> Result<Vec<(String, Record)>> {
-        self.files(id, "records")?
+    pub(crate) fn index_records(
+        &self,
+        id: &str,
+        names: &[String],
+    ) -> Result<(SessionMeta, Vec<(String, Link)>)> {
+        let records = self.read_records(id, names)?;
+        let meta = self.metadata(id, &records, &[]);
+        let links = records
             .into_iter()
+            .filter_map(|(name, record)| record.link.map(|link| (name, link)))
+            .collect();
+        Ok((meta, links))
+    }
+
+    fn records(&self, id: &str) -> Result<Vec<(String, Record)>> {
+        self.read_records(id, &self.files(id, "records")?)
+    }
+
+    fn read_records(&self, id: &str, names: &[String]) -> Result<Vec<(String, Record)>> {
+        names
+            .iter()
             .map(|name| {
                 let path = self
                     .root
                     .join("sessions")
                     .join(id)
                     .join("records")
-                    .join(&name);
+                    .join(name);
                 let bytes =
                     fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
                 let record: Record = serde_json::from_slice(&bytes)
                     .with_context(|| format!("parsing {}", path.display()))?;
-                Ok((name, record))
+                Ok((name.clone(), record))
             })
             .collect()
     }
@@ -151,7 +177,7 @@ impl Store {
         Ok(events)
     }
 
-    fn metadata(&self, id: &str, events: &[Event]) -> Result<SessionMeta> {
+    fn metadata(&self, id: &str, records: &[(String, Record)], events: &[Event]) -> SessionMeta {
         let mut meta = SessionMeta {
             id: id.to_owned(),
             title: None,
@@ -173,26 +199,26 @@ impl Store {
             links: Vec::new(),
         };
         let mut links = HashMap::new();
-        for (_, record) in self.records(id)? {
+        for (_, record) in records {
             if record.title.is_some() {
-                meta.title = record.title;
+                meta.title.clone_from(&record.title);
             }
             if record.cwd.is_some() {
-                meta.cwd = record.cwd;
+                meta.cwd.clone_from(&record.cwd);
             }
             if record.project.is_some() {
-                meta.project = record.project;
+                meta.project.clone_from(&record.project);
             }
-            if let Some(created) = record.created {
-                meta.created = created;
+            if let Some(created) = &record.created {
+                meta.created.clone_from(created);
             }
             if record.parent.is_some() {
-                meta.parent = record.parent;
+                meta.parent.clone_from(&record.parent);
             }
-            if let Some(link) = record.link {
+            if let Some(link) = &record.link {
                 links.insert(
                     (link.host.clone(), link.agent, link.native_id.clone()),
-                    link,
+                    link.clone(),
                 );
             }
         }
@@ -200,7 +226,7 @@ impl Store {
         meta.links.sort_by(|a, b| {
             (&a.host, a.agent.name(), &a.native_id).cmp(&(&b.host, b.agent.name(), &b.native_id))
         });
-        Ok(meta)
+        meta
     }
 
     pub(crate) fn create(
@@ -243,8 +269,8 @@ impl Store {
             serde_json::to_writer(&mut lines, event)?;
             lines.push(b'\n');
         }
-        let mut compressed = Vec::new();
-        compress(lines.as_slice(), &mut compressed, CompressionLevel::Fastest);
+        let compressed = zstd::bulk::compress(&lines, 1)?;
+
         self.write_file(id, "events", "jsonl.zst", &compressed)
     }
 

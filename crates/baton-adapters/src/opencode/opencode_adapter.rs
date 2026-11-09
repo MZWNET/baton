@@ -1,5 +1,6 @@
 use std::cell::OnceCell;
 use std::fs::File;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -65,13 +66,11 @@ impl OpencodeAdapter {
         if let Some(version) = self.version.get() {
             return Ok(version);
         }
-        let output = self.run(&["--version"], None)?;
+        let output = String::from_utf8(self.run(&["--version"], None)?)?;
         Ok(self.version.get_or_init(|| output.trim().to_owned()))
     }
 
-    fn run(&self, args: &[&str], cwd: Option<&Path>) -> Result<String> {
-        use std::io::{Read, Seek, SeekFrom};
-
+    fn run(&self, args: &[&str], cwd: Option<&Path>) -> Result<Vec<u8>> {
         let name = self.agent.name();
         // The agent exits before a pipe drains, cutting large exports short, so stdout goes to a file
         let mut stdout: File = tempfile::tempfile()?;
@@ -90,10 +89,11 @@ impl OpencodeAdapter {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let mut text = String::new();
         stdout.seek(SeekFrom::Start(0))?;
-        stdout.read_to_string(&mut text)?;
-        Ok(text)
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes)?;
+
+        Ok(bytes)
     }
 }
 
@@ -155,8 +155,6 @@ impl Source for OpencodeAdapter {
 
 impl Adapter for OpencodeAdapter {
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
-        use std::io::Write;
-
         let id = ascending_ids::session_id(export.seed, time::unix_millis(export.created));
         let v2 = self.is_v2()?;
         let data = if v2 {
@@ -165,7 +163,11 @@ impl Adapter for OpencodeAdapter {
             bundle_writer::write_bundle(export, &id, self.version()?, blobs)?
         };
         let mut file = Builder::new().prefix("baton-").suffix(".json").tempfile()?;
-        file.write_all(data.to_string().as_bytes())?;
+        {
+            let mut writer = BufWriter::new(&mut file);
+            serde_json::to_writer(&mut writer, &data)?;
+            writer.flush()?;
+        }
         let file_path = file.path().to_string_lossy().into_owned();
         let args = if v2 {
             vec!["--standalone", "session", "import", &file_path]
@@ -173,7 +175,7 @@ impl Adapter for OpencodeAdapter {
             vec!["--pure", "import", &file_path]
         };
         // The agent assigns an imported session to the project of the directory it runs in
-        let output = self.run(&args, Some(export.cwd))?;
+        let output = String::from_utf8(self.run(&args, Some(export.cwd))?)?;
         if !output.contains(&id) {
             bail!(
                 "{} import did not import {id}: {}",
@@ -209,7 +211,7 @@ impl Adapter for OpencodeAdapter {
             );
         }
         let flag = if v2 { "--standalone" } else { "--pure" };
-        self.run(&[flag, "session", "delete", &session.id], None)?;
+        String::from_utf8(self.run(&[flag, "session", "delete", &session.id], None)?)?;
         Ok(())
     }
 
@@ -221,9 +223,13 @@ impl Adapter for OpencodeAdapter {
 }
 
 // Exports can be preceded by log lines, so the JSON starts at the first brace
-fn first_json(output: &str) -> Result<Value> {
-    let start = output.find('{').context("the export printed no JSON")?;
-    Deserializer::from_str(&output[start..])
+fn first_json(output: &[u8]) -> Result<Value> {
+    let start = output
+        .iter()
+        .position(|byte| *byte == b'{')
+        .context("the export printed no JSON")?;
+
+    Deserializer::from_slice(&output[start..])
         .into_iter()
         .next()
         .context("the export printed no JSON")?

@@ -29,11 +29,8 @@ pub(super) fn read(
             continue;
         };
         let bubble: Option<String> = connection
-            .query_row(
-                "SELECT CAST(value AS TEXT) FROM cursorDiskKV WHERE key = ?1",
-                [format!("bubbleId:{composer}:{id}")],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT CAST(value AS TEXT) FROM cursorDiskKV WHERE key = ?1")?
+            .query_row([format!("bubbleId:{composer}:{id}")], |row| row.get(0))
             .optional()?;
         let Some(bubble) = bubble.and_then(|bubble| serde_json::from_str::<Value>(&bubble).ok())
         else {

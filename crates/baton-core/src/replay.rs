@@ -24,8 +24,7 @@ pub fn events<'a>(path: &[&'a Event]) -> Vec<&'a Event> {
 /// Two event sequences with equal digests read the same in every agent, which is how an exported prefix is recognized when a native session flows back.
 pub fn digest<'a>(bodies: impl IntoIterator<Item = &'a Body>) -> String {
     bodies.into_iter().fold(String::new(), |previous, body| {
-        let portable = hash::canonical_json(&portable(body));
-        hash::sha256_hex(format!("{previous}{portable}").as_bytes())
+        hash::canonical_sha256(previous.as_bytes(), &portable(body))
     })
 }
 
@@ -82,7 +81,7 @@ mod tests {
         let path: Vec<&Event> = chained.iter().collect();
         let replayed: Vec<String> = events(&path)
             .iter()
-            .map(|event| event.body.text())
+            .map(|event| event.body.text().into_owned())
             .collect();
         assert_eq!(replayed, ["after reset", "answer"]);
     }

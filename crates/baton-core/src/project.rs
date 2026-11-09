@@ -19,6 +19,12 @@ pub struct Project {
     pub path: String,
 }
 
+#[derive(Clone)]
+struct Repository {
+    remote: Option<String>,
+    root: Option<String>,
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -54,20 +60,40 @@ fn inspect(cwd: &Path) -> Option<Project> {
     if !cwd.is_dir() {
         return None;
     }
+    let canonical_cwd = fs::canonicalize(cwd).ok()?;
+    if !canonical_cwd
+        .ancestors()
+        .any(|dir| dir.join(".git").exists())
+    {
+        return None;
+    }
     let top = git(cwd, &["rev-parse", "--show-toplevel"])?;
-    let cwd = fs::canonicalize(cwd).ok()?;
     let top = fs::canonicalize(top).ok()?;
-    let path = cwd.strip_prefix(&top).ok()?.to_string_lossy().into_owned();
-    let remotes = git(&top, &["remote"]).unwrap_or_default();
-    let remote = remotes
-        .lines()
-        .find(|name| *name == "origin")
-        .or_else(|| remotes.lines().min());
-    let remote = remote
-        .and_then(|name| git(&top, &["remote", "get-url", name]))
-        .and_then(|url| normalize_remote(&url));
-    let root = git(&top, &["rev-list", "--max-parents=0", "HEAD"])
-        .and_then(|roots| roots.lines().min().map(str::to_owned));
+    let path = canonical_cwd
+        .strip_prefix(&top)
+        .ok()?
+        .to_string_lossy()
+        .into_owned();
+    static REPOSITORIES: LazyLock<Mutex<HashMap<PathBuf, Repository>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut repositories = REPOSITORIES.lock().unwrap();
+    let Repository { remote, root } = repositories
+        .entry(top.clone())
+        .or_insert_with(|| {
+            let remotes = git(&top, &["remote"]).unwrap_or_default();
+            let remote = remotes
+                .lines()
+                .find(|name| *name == "origin")
+                .or_else(|| remotes.lines().min());
+            let remote = remote
+                .and_then(|name| git(&top, &["remote", "get-url", name]))
+                .and_then(|url| normalize_remote(&url));
+            let root = git(&top, &["rev-list", "--max-parents=0", "HEAD"])
+                .and_then(|roots| roots.lines().min().map(str::to_owned));
+            Repository { remote, root }
+        })
+        .clone();
+
     Some(Project { remote, root, path })
 }
 
@@ -114,63 +140,89 @@ fn scan(path: &Path, depth: usize, checkouts: &mut Vec<(PathBuf, Project)>) {
     }
 }
 
-fn checkouts() -> &'static [(PathBuf, Project)] {
-    static CHECKOUTS: LazyLock<Vec<(PathBuf, Project)>> = LazyLock::new(|| {
+struct Checkouts {
+    paths: Vec<(PathBuf, Project)>,
+    remotes: HashMap<String, usize>,
+    roots: HashMap<String, usize>,
+}
+
+fn checkouts() -> &'static Checkouts {
+    static CHECKOUTS: LazyLock<Checkouts> = LazyLock::new(|| {
         let mut checkouts = Vec::new();
         if let Some(roots) = env::var_os("BATON_PROJECTS") {
             for root in env::split_paths(&roots) {
                 scan(&root, 0, &mut checkouts);
             }
         }
-        checkouts
+        let mut remotes = HashMap::new();
+        let mut roots = HashMap::new();
+        for (index, (_, project)) in checkouts.iter().enumerate() {
+            if let Some(remote) = &project.remote {
+                remotes.entry(remote.clone()).or_insert(index);
+            }
+            if let Some(root) = &project.root {
+                roots.entry(root.clone()).or_insert(index);
+            }
+        }
+        Checkouts {
+            paths: checkouts,
+            remotes,
+            roots,
+        }
     });
     &CHECKOUTS
 }
 
 fn map_path(cwd: &Path) -> Option<PathBuf> {
-    let maps = env::var_os("BATON_PATH_MAP")?;
+    static MAPS: LazyLock<Vec<(PathBuf, PathBuf)>> = LazyLock::new(|| {
+        let Some(maps) = env::var_os("BATON_PATH_MAP") else {
+            return Vec::new();
+        };
+        env::split_paths(&maps)
+            .filter_map(|entry| {
+                let (from, to) = entry.to_str()?.split_once('=')?;
+                Some((PathBuf::from(from), PathBuf::from(to)))
+            })
+            .collect()
+    });
     let mut best = None;
-    for entry in env::split_paths(&maps) {
-        let Some(entry) = entry.to_str() else {
-            continue;
-        };
-        let Some((from, to)) = entry.split_once('=') else {
-            continue;
-        };
-        let from = Path::new(from);
+    for (from, to) in MAPS.iter() {
         let Ok(suffix) = cwd.strip_prefix(from) else {
             continue;
         };
         let length = from.components().count();
-        if best.as_ref().is_none_or(|(previous, _)| length > *previous) {
-            let to = PathBuf::from(to);
-            let path = if suffix.as_os_str().is_empty() {
-                to
-            } else {
-                to.join(suffix)
-            };
-            best = Some((length, path));
+        if best
+            .as_ref()
+            .is_none_or(|(previous, _, _)| length > *previous)
+        {
+            best = Some((length, to, suffix));
         }
     }
-    best.map(|(_, path)| path).filter(|path| path.exists())
+    best.map(|(_, to, suffix)| {
+        if suffix.as_os_str().is_empty() {
+            to.clone()
+        } else {
+            to.join(suffix)
+        }
+    })
+    .filter(|path| path.exists())
 }
 
 /// Resolves a recorded project and directory to a directory on this machine.
 pub fn resolve(project: Option<&Project>, cwd: Option<&str>) -> Option<PathBuf> {
     if let Some(project) = project {
-        let remote = project.remote.as_ref().and_then(|remote| {
-            checkouts()
-                .iter()
-                .find(|(_, candidate)| candidate.remote.as_ref() == Some(remote))
-        });
-        let checkout = remote.or_else(|| {
-            project.root.as_ref().and_then(|root| {
-                checkouts()
-                    .iter()
-                    .find(|(_, candidate)| candidate.root.as_ref() == Some(root))
-            })
-        });
-        if let Some((checkout, _)) = checkout {
+        let checkout = project
+            .remote
+            .as_ref()
+            .and_then(|remote| checkouts().remotes.get(remote))
+            .or_else(|| {
+                project
+                    .root
+                    .as_ref()
+                    .and_then(|root| checkouts().roots.get(root))
+            });
+        if let Some(index) = checkout {
+            let checkout = &checkouts().paths[*index].0;
             return Some(if project.path.is_empty() {
                 checkout.clone()
             } else {

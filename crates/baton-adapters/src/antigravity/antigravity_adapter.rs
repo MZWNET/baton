@@ -9,7 +9,7 @@ use baton_core::{
     time,
 };
 use chrono::DateTime;
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
 use crate::antigravity::conversation::{self, USER_INPUT};
@@ -75,17 +75,7 @@ impl AntigravityAdapter {
              FROM conversation_summaries",
         )?;
         let found = statement.query_map([], |row| {
-            let uris: String = row.get(2)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                Row {
-                    title: Some(row.get::<_, String>(1)?).filter(|title| !title.is_empty()),
-                    cwd: serde_json::from_str::<Value>(&uris)
-                        .ok()
-                        .and_then(|uris| uris[0].as_str().and_then(uri::path)),
-                    top_level: row.get(3)?,
-                },
-            ))
+            Ok((row.get::<_, String>(0)?, Row::from_row(row, 1)?))
         })?;
         for row in found {
             let (id, row) = row?;
@@ -95,7 +85,7 @@ impl AntigravityAdapter {
     }
 
     // Without its summary row the conversation does not show up in agy's picker
-    fn list(&self, id: &str, link: &str, export: &Export, steps: &[Step]) -> Result<()> {
+    fn insert_summary(&self, id: &str, link: &str, export: &Export, steps: &[Step]) -> Result<()> {
         let db = self.root.join("conversation_summaries.db");
         let new = !db.exists();
         let mut connection = sqlite::open_or_create(&db)?;
@@ -148,6 +138,19 @@ struct Row {
     top_level: bool,
 }
 
+impl Row {
+    fn from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Row> {
+        let uris: String = row.get(offset + 1)?;
+        Ok(Row {
+            title: Some(row.get::<_, String>(offset)?).filter(|title| !title.is_empty()),
+            cwd: serde_json::from_str::<Value>(&uris)
+                .ok()
+                .and_then(|uris| uris[0].as_str().and_then(uri::path)),
+            top_level: row.get(offset + 2)?,
+        })
+    }
+}
+
 impl Source for AntigravityAdapter {
     fn agent(&self) -> Agent {
         Agent::Antigravity
@@ -181,11 +184,20 @@ impl Source for AntigravityAdapter {
         let connection = sqlite::open_read_only(&session.path)?;
         let conversation = conversation::read(&connection, blobs)?;
         let root = session.path.parent().and_then(Path::parent);
-        let summaries = match root {
-            Some(root) => AntigravityAdapter::summaries(root)?,
-            None => HashMap::new(),
+        let row = match root.map(|root| root.join("conversation_summaries.db")) {
+            Some(db) if db.is_file() => {
+                let connection = sqlite::open_read_only(&db)?;
+                connection
+                    .query_row(
+                        "SELECT title, workspace_uris, parent_conversation_id = '' AND nesting_depth = 0 FROM conversation_summaries WHERE conversation_id = ?1",
+                        [&session.id],
+                        |row| Row::from_row(row, 0),
+                    )
+                    .optional()?
+            }
+            _ => None,
         };
-        let row = summaries.get(&session.id);
+        let row = row.as_ref();
         Ok(NativeRead {
             info: Info {
                 cwd: row.and_then(|row| row.cwd.clone()).or(conversation.cwd),
@@ -205,10 +217,8 @@ impl Adapter for AntigravityAdapter {
         let link = uri::from_path(&export.cwd.to_string_lossy());
         let steps = step_writer::steps(export.events, blobs)?;
         let created = time::unix_millis(export.created);
-        // The database is built aside and published whole, so agy never sees half of it
-        let scratch = tempfile::NamedTempFile::new()?;
-        {
-            let mut connection = Connection::open(scratch.path())?;
+        let db = self.root.join("conversations").join(format!("{id}.db"));
+        sqlite::publish_new(&db, |connection| {
             connection.execute_batch(CONVERSATION_SCHEMA)?;
             let transaction = connection.transaction()?;
             transaction.execute(
@@ -226,18 +236,25 @@ impl Adapter for AntigravityAdapter {
                 "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
                 [metadata],
             )?;
-            for (index, step) in steps.iter().enumerate() {
-                transaction.execute(
+            {
+                let mut insert = transaction.prepare(
                     "INSERT INTO steps (idx, step_type, status, has_subtrajectory, metadata, step_payload, step_format)
                      VALUES (?1, ?2, ?3, 0, ?4, ?5, 0)",
-                    params![index as i64, step.kind as i64, step.status as i64, step.metadata, step.payload],
                 )?;
+                for (index, step) in steps.iter().enumerate() {
+                    insert.execute(params![
+                        index as i64,
+                        step.kind as i64,
+                        step.status as i64,
+                        step.metadata,
+                        step.payload
+                    ])?;
+                }
             }
             transaction.commit()?;
-        }
-        let db = self.root.join("conversations").join(format!("{id}.db"));
-        files::create_new(&db, &fs::read(scratch.path())?)?;
-        if let Err(error) = self.list(&id, &link, export, &steps) {
+            Ok(())
+        })?;
+        if let Err(error) = self.insert_summary(&id, &link, export, &steps) {
             fs::remove_file(&db)?;
             return Err(error);
         }

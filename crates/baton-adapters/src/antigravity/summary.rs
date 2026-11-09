@@ -49,3 +49,18 @@ pub(super) fn entries(bytes: &[u8]) -> HashMap<String, Vec<u8>> {
     }
     entries
 }
+
+pub(super) fn entry<'a>(bytes: &'a [u8], id: &str) -> Option<&'a [u8]> {
+    let map = Message::parse(bytes).ok()?;
+    let mut found = None;
+    for entry in map.repeated(1) {
+        if let Ok(entry) = Message::parse(entry)
+            && entry.string(1) == Some(id)
+            && let Some(value) = entry.bytes(2)
+        {
+            found = Some(value);
+        }
+    }
+
+    found
+}

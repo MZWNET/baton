@@ -43,14 +43,14 @@ impl AntigravityIdeAdapter {
     }
 
     // A missing or unreadable editor state only costs the titles
-    fn summaries(&self) -> Result<HashMap<String, Summary>> {
+    fn summary_topic(&self) -> Result<Vec<u8>> {
         let db = self
             .user_data
             .join("User")
             .join("globalStorage")
             .join("state.vscdb");
         if !db.is_file() {
-            return Ok(HashMap::new());
+            return Ok(Vec::new());
         }
         let connection = sqlite::open_read_only(&db)?;
         let topic: Option<String> = connection
@@ -60,21 +60,28 @@ impl AntigravityIdeAdapter {
                 |row| row.get(0),
             )
             .optional()?;
-        let topic = topic
+        Ok(topic
             .and_then(|topic| images::decode(&topic))
-            .unwrap_or_default();
+            .unwrap_or_default())
+    }
+
+    fn summaries(&self) -> Result<HashMap<String, Summary>> {
+        let topic = self.summary_topic()?;
         let mut summaries = HashMap::new();
         for (id, row) in summary::entries(&topic) {
-            let found = Message::parse(&row)
-                .ok()
-                .and_then(|row| images::decode(row.string(1)?))
-                .and_then(|bytes| summary::summary(&bytes));
+            let found = decode_summary(&row);
             if let Some(found) = found {
                 summaries.insert(id, found);
             }
         }
         Ok(summaries)
     }
+}
+
+fn decode_summary(bytes: &[u8]) -> Option<Summary> {
+    let row = Message::parse(bytes).ok()?;
+    let bytes = images::decode(row.string(1)?)?;
+    summary::summary(&bytes)
 }
 
 // The untruncated log when the IDE wrote one
@@ -130,8 +137,9 @@ impl Source for AntigravityIdeAdapter {
                 reader.record(line.start, &record);
             }
         }
-        let summaries = self.summaries()?;
-        let summary = summaries.get(&session.id);
+        let topic = self.summary_topic()?;
+        let summary = summary::entry(&topic, &session.id).and_then(decode_summary);
+        let summary = summary.as_ref();
         Ok(NativeRead {
             info: Info {
                 cwd: summary

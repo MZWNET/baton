@@ -123,11 +123,8 @@ impl Source for CursorIdeAdapter {
                 let root = images::decode(state).context("reading Cursor's conversation state")?;
                 let load = |id: &str| -> Result<Vec<u8>> {
                     transaction
-                        .query_row(
-                            "SELECT value FROM cursorDiskKV WHERE key = ?1",
-                            [format!("agentKv:blob:{id}")],
-                            |row| row.get(0),
-                        )
+                        .prepare_cached("SELECT value FROM cursorDiskKV WHERE key = ?1")?
+                        .query_row([format!("agentKv:blob:{id}")], |row| row.get(0))
                         .with_context(|| format!("loading Cursor blob {id}"))
                 };
                 let graph = graph_parser::read(&root, created, &load, blobs)?;

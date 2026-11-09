@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -116,16 +118,16 @@ impl Body {
         matches!(self, Body::Meta(meta) if meta["type"] == "reset")
     }
 
-    /// The text a person would search for: message text, the tool name with its arguments, tool output, or the summary.
-    pub fn text(&self) -> String {
+    /// The text of the body: message text, the tool name with its arguments, tool output, or the summary
+    pub fn text(&self) -> Cow<'_, str> {
         match self {
-            Body::User(user) => user.text.clone(),
-            Body::Assistant(assistant) => assistant.text.clone(),
-            Body::ToolCall(call) => format!("{} {}", call.name, call.input),
-            Body::ToolResult(result) => result.text.clone(),
-            Body::Compaction(compaction) => compaction.summary.clone(),
-            Body::Thinking(thinking) => thinking.text.clone(),
-            Body::Meta(meta) => meta.to_string(),
+            Body::User(user) => Cow::Borrowed(&user.text),
+            Body::Assistant(assistant) => Cow::Borrowed(&assistant.text),
+            Body::ToolCall(call) => Cow::Owned(format!("{} {}", call.name, call.input)),
+            Body::ToolResult(result) => Cow::Borrowed(&result.text),
+            Body::Compaction(compaction) => Cow::Borrowed(&compaction.summary),
+            Body::Thinking(thinking) => Cow::Borrowed(&thinking.text),
+            Body::Meta(meta) => Cow::Owned(meta.to_string()),
         }
     }
 }

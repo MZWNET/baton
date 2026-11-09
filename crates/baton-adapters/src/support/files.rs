@@ -4,9 +4,9 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use baton_core::journal;
-use ruzstd::decoding::StreamingDecoder;
+use baton_core::{NativeSession, Stamp, journal};
 use serde_json::Value;
+use uuid::Uuid;
 
 // The home directory as Node reports it to the agents, which on Windows prefers `USERPROFILE` to the profile folder
 pub(crate) fn home() -> Result<PathBuf> {
@@ -74,6 +74,25 @@ pub(crate) fn read_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+// Sessions are named after their UUID, excluding other transcripts such as Claude's subagent agent-<id>.jsonl
+pub(crate) fn uuid_jsonl_session(file: &Path) -> Result<Option<NativeSession>> {
+    let Some(id) = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".jsonl"))
+        .filter(|id| Uuid::parse_str(id).is_ok())
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(NativeSession {
+        id: id.to_owned(),
+        path: file.to_path_buf(),
+        stamp: Stamp::of(file)?,
+        title: None,
+    }))
+}
+
 // A path with every character other than an ASCII letter or digit turned into a dash, per UTF-16 unit as JavaScript agents count them
 pub(crate) fn dashed(path: &str) -> String {
     let mut dashed = String::with_capacity(path.len());
@@ -128,7 +147,7 @@ pub(crate) fn head(path: &Path, count: usize) -> Result<Vec<Value>> {
 
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let reader: Box<dyn Read> = if journal::is_compressed(path) {
-        Box::new(StreamingDecoder::new(file)?)
+        Box::new(zstd::Decoder::new(file)?)
     } else {
         Box::new(file)
     };

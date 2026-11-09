@@ -18,7 +18,7 @@ pub use adapter::{
     Adapter, Cursor, Export, Info, NativeRead, NativeSession, Progress, Source, Stamp,
 };
 pub use agent::Agent;
-pub use cache::{Index, SearchHit, SessionSummary};
+pub use cache::{Index, SessionSummary};
 pub use model::{
     Assistant, Body, Compaction, Direction, Draft, Event, ForkPoint, Image, Link, NativeRef,
     Origin, Session, SessionMeta, Thinking, ToolCall, ToolResult, User,

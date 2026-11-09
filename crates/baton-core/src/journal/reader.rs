@@ -1,9 +1,9 @@
-use std::fs::{self, File};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::iter;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use ruzstd::decoding::StreamingDecoder;
 
 use crate::journal::tree::Tree;
 use crate::journal::{Line, Parser};
@@ -114,17 +114,41 @@ fn read_tail<P: Parser>(
 }
 
 fn read_full<P: Parser>(path: &Path, mut parser: P) -> Result<NativeRead> {
-    let bytes = read_file(path)?;
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let compressed = is_compressed(path);
+    let mut reader: Box<dyn BufRead> = if compressed {
+        Box::new(BufReader::new(
+            zstd::Decoder::new(file)
+                .with_context(|| format!("decompressing {}", path.display()))?,
+        ))
+    } else {
+        Box::new(BufReader::new(file))
+    };
     let mut tree = Tree::default();
-    let mut end = 0;
-    for line in lines(&bytes) {
-        end = line.end;
-        let Ok(value) = serde_json::from_slice(line.bytes) else {
-            continue;
-        };
-        if let Line::Node(node) = parser.line(line.start as u64, value)? {
+    let mut end = 0u64;
+    let mut tail = Vec::with_capacity(TAIL_WINDOW);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        if !compressed && line.last() != Some(&b'\n') {
+            break;
+        }
+        let start = end;
+        end += line.len() as u64;
+        if line.len() >= TAIL_WINDOW {
+            tail.clear();
+            tail.extend_from_slice(&line[line.len() - TAIL_WINDOW..]);
+        } else {
+            let excess = (tail.len() + line.len()).saturating_sub(TAIL_WINDOW);
+            tail.drain(..excess);
+            tail.extend_from_slice(&line);
+        }
+        let bytes = line.strip_suffix(b"\n").unwrap_or(&line);
+        if let Ok(value) = serde_json::from_slice(bytes)
+            && let Line::Node(node) = parser.line(start, value)?
+        {
             tree.push(node);
         }
+        line.clear();
     }
     let active = tree.active_path();
     Ok(NativeRead {
@@ -132,31 +156,11 @@ fn read_full<P: Parser>(path: &Path, mut parser: P) -> Result<NativeRead> {
         drafts: active.drafts,
         continued: false,
         progress: Progress {
-            offset: end as u64,
-            tail_hash: hash_tail(&bytes[..end]),
+            offset: end,
+            tail_hash: hash::sha256_hex(&tail),
             leaf: active.leaf,
         },
     })
-}
-
-fn read_file(path: &Path) -> Result<Vec<u8>> {
-    use std::io::{BufRead, BufReader, Read};
-
-    if !is_compressed(path) {
-        return fs::read(path).with_context(|| format!("reading {}", path.display()));
-    }
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut bytes = Vec::new();
-    while !reader.fill_buf()?.is_empty() {
-        StreamingDecoder::new(&mut reader)
-            .with_context(|| format!("decompressing {}", path.display()))?
-            .read_to_end(&mut bytes)?;
-    }
-    if bytes.last().is_some_and(|&byte| byte != b'\n') {
-        bytes.push(b'\n');
-    }
-    Ok(bytes)
 }
 
 fn hash_tail(bytes: &[u8]) -> String {
@@ -166,6 +170,7 @@ fn hash_tail(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::Write;
 
     use serde_json::{Value, json};
@@ -197,7 +202,10 @@ mod tests {
     }
 
     fn texts(read: &NativeRead) -> Vec<String> {
-        read.drafts.iter().map(|draft| draft.body.text()).collect()
+        read.drafts
+            .iter()
+            .map(|draft| draft.body.text().into_owned())
+            .collect()
     }
 
     fn cursor(path: &Path, progress: Progress) -> Cursor {
@@ -212,17 +220,12 @@ mod tests {
 
     #[test]
     fn reads_all_concatenated_zstd_frames() {
-        use ruzstd::encoding::{CompressionLevel, compress_to_vec};
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl.zstd");
         let header = b"{\"type\":\"session\",\"id\":\"header\"}\n";
         let events = b"{\"id\":\"a\",\"parent\":\"header\"}\n{\"id\":\"b\",\"parent\":\"a\"}\n";
-        let mut compressed = compress_to_vec(header.as_slice(), CompressionLevel::Fastest);
-        compressed.extend(compress_to_vec(
-            events.as_slice(),
-            CompressionLevel::Fastest,
-        ));
+        let mut compressed = zstd::bulk::compress(header, 1).unwrap();
+        compressed.extend(zstd::bulk::compress(events, 1).unwrap());
         fs::write(&path, compressed).unwrap();
 
         let read = read(&path, None, |_| Echo).unwrap();

@@ -54,7 +54,7 @@ impl Event {
     pub(crate) fn id_for(parent: Option<&str>, body: &Body) -> String {
         let mut value = serde_json::to_value(body).expect("event bodies serialize to JSON");
         value["parent"] = parent.map_or(Value::Null, |parent| Value::String(parent.to_owned()));
-        hash::sha256_hex(hash::canonical_json(&value).as_bytes())
+        hash::canonical_sha256(b"", &value)
     }
 
     /// Turns drafts into a chain of events following `parent`, each event the parent of the next.
@@ -130,13 +130,20 @@ mod tests {
     }
 
     #[test]
-    fn events_serialize_in_plan_field_order() {
+    fn events_serialize_to_the_stored_line_format() {
         let event = &Event::chain([user("hi")], None, Agent::Omp, "n")[0];
         let line = serde_json::to_string(event).unwrap();
-        assert!(line.starts_with(r#"{"v":1,"id":""#), "{line}");
-        assert!(
-            line.contains(r#","ts":"2026-01-01T00:00:00.000Z","origin":{"agent":"omp","native_id":"n"},"kind":"user","payload":{"text":"hi"}}"#),
-            "{line}"
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            serde_json::json!({
+                "v": 1,
+                "id": event.id,
+                "parent": null,
+                "ts": "2026-01-01T00:00:00.000Z",
+                "origin": {"agent": "omp", "native_id": "n"},
+                "kind": "user",
+                "payload": {"text": "hi"}
+            })
         );
         assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), *event);
     }

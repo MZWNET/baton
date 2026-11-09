@@ -1,14 +1,17 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 
-use anyhow::{Result, bail};
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::cache::database;
 use crate::project::{identify, matches};
 use crate::storage::record_order;
 use crate::{Agent, Direction, Project, Store};
 
+const SCHEMA_VERSION: i64 = 7;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -23,7 +26,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     alternate_branches INTEGER NOT NULL,
     leaf TEXT,
     replayable INTEGER NOT NULL
-);
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS links (
     session TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -35,7 +38,7 @@ CREATE TABLE IF NOT EXISTS links (
     removed INTEGER NOT NULL,
     removable INTEGER NOT NULL,
     PRIMARY KEY (session, name)
-);
+) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS links_lookup ON links (host, agent, native_id, version, name);
 CREATE INDEX IF NOT EXISTS links_native_id ON links (native_id, agent, host, version, name);
 CREATE TABLE IF NOT EXISTS files (
@@ -43,7 +46,7 @@ CREATE TABLE IF NOT EXISTS files (
     kind TEXT NOT NULL,
     name TEXT NOT NULL,
     PRIMARY KEY (session, kind, name)
-);
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS events (
     session TEXT NOT NULL,
     id TEXT NOT NULL,
@@ -56,17 +59,9 @@ CREATE TABLE IF NOT EXISTS events (
     PRIMARY KEY (session, id)
 );
 CREATE INDEX IF NOT EXISTS events_parent ON events (session, parent);
-CREATE VIRTUAL TABLE IF NOT EXISTS texts USING fts5(
-    session UNINDEXED,
-    event UNINDEXED,
-    kind UNINDEXED,
-    ts UNINDEXED,
-    body,
-    tokenize = 'trigram'
-);
 ";
 
-/// A rebuildable SQLite index of the data directory in `index.db`, for listing, searching and resolving sessions.
+/// A rebuildable SQLite index of the data directory in `index.db`, for listing and resolving sessions
 ///
 /// [`Baton::open`](crate::Baton::open) brings the index up to date, including sessions a sync tool brought in from elsewhere.
 pub struct Index {
@@ -92,20 +87,6 @@ pub struct SessionSummary {
     pub agents: Vec<String>,
 }
 
-/// An event whose text matched [`Index::search`].
-pub struct SearchHit {
-    /// The session holding the event.
-    pub session: String,
-    /// The session title.
-    pub title: Option<String>,
-    /// The event kind, such as `user` or `tool_result`.
-    pub kind: String,
-    /// When the event happened.
-    pub timestamp: String,
-    /// The searchable text of the event, as given by [`Body::text`](crate::Body::text).
-    pub body: String,
-}
-
 /// What materializing needs to know about a session, read without loading it.
 pub(crate) struct MaterializationSession {
     pub id: String,
@@ -126,22 +107,44 @@ pub(crate) struct MaterializationLink {
 impl Index {
     pub(crate) fn open(cache: &Path, data: &Path, host: &str) -> Result<Index> {
         let path = cache.join("index.db");
-        let db = Connection::open(&path)?;
-        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 5 {
-            db.execute_batch("BEGIN; DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS texts; DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS events; PRAGMA user_version = 5; COMMIT;")?;
+        let version: i64 = {
+            let db = Connection::open(&path)?;
+
+            db.pragma_query_value(None, "user_version", |row| row.get(0))?
+        };
+        if version != SCHEMA_VERSION {
+            // Dropping old tables would walk every page
+            Self::remove(cache)?;
         }
-        drop(db);
         let db = database::open(
             &path,
             data,
             SCHEMA,
-            &["sessions", "links", "texts", "files", "events"],
+            &["sessions", "links", "files", "events"],
         )?;
+        if version != SCHEMA_VERSION {
+            db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        db.set_prepared_statement_cache_capacity(48);
+
         Ok(Index {
             db,
             host: host.to_owned(),
         })
+    }
+
+    pub(crate) fn remove(cache: &Path) -> Result<()> {
+        for name in ["index.db", "index.db-wal", "index.db-shm"] {
+            let path = cache.join(name);
+            match fs::remove_file(&path) {
+                Err(error) if error.kind() != ErrorKind::NotFound => {
+                    return Err(error).with_context(|| format!("removing {}", path.display()));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 
     // Indexes new immutable files and rebuilds sessions when indexed files disappear
@@ -165,20 +168,22 @@ impl Index {
                 indexed.entry(id).or_default().insert((kind, name));
             }
         }
-        let ids: HashSet<String> = store.ids()?.into_iter().collect();
+        let sessions = store.session_files()?;
+        let ids: HashSet<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
         for gone in indexed.keys() {
-            if !ids.contains(gone) {
+            if !ids.contains(gone.as_str()) {
                 remove_session(&transaction, gone)?;
             }
         }
-        for id in &ids {
-            let event_files = store.files(id, "events")?;
-            let record_files = store.files(id, "records")?;
-            let current: HashSet<(String, String)> = event_files
+        for session in &sessions {
+            let id = &session.id;
+            let current: HashSet<(String, String)> = session
+                .events
                 .iter()
                 .map(|name| ("events".to_owned(), name.clone()))
                 .chain(
-                    record_files
+                    session
+                        .records
                         .iter()
                         .map(|name| ("records".to_owned(), name.clone())),
                 )
@@ -195,7 +200,7 @@ impl Index {
                 continue;
             }
             if new_session {
-                transaction.execute("INSERT INTO sessions (id, created, updated, events, alternate_branches, replayable) VALUES (?1, '', '', 0, 0, 0)", [id])?;
+                transaction.prepare_cached("INSERT INTO sessions (id, created, updated, events, alternate_branches, replayable) VALUES (?1, '', '', 0, 0, 0)")?.execute([id])?;
             }
             let added = current.difference(previous).collect::<Vec<_>>();
             let mut new_events = added
@@ -209,55 +214,45 @@ impl Index {
                 let (version, _) = record_order(name);
                 for event in store.segment(id, name)? {
                     let previous: Option<(String, String)> = transaction
-                        .query_row(
+                        .prepare_cached(
                             "SELECT version, name FROM events WHERE session = ?1 AND id = ?2",
-                            params![id, event.id],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
+                        )?
+                        .query_row(params![id, event.id], |row| Ok((row.get(0)?, row.get(1)?)))
                         .optional()?;
                     if let Some((previous_version, previous_name)) = previous {
                         if (version, name.as_str())
-                            >= (previous_version.as_str(), previous_name.as_str())
+                            < (previous_version.as_str(), previous_name.as_str())
                         {
-                            continue;
+                            transaction.prepare_cached("UPDATE events SET version = ?3, name = ?4, ts = ?5 WHERE session = ?1 AND id = ?2")?
+                                .execute(params![id, event.id, version, name, event.timestamp])?;
                         }
-                        transaction.execute(
-                            "DELETE FROM texts WHERE session = ?1 AND event = ?2",
-                            params![id, event.id],
-                        )?;
+                        continue;
                     }
-                    transaction.execute(
-                        "INSERT OR REPLACE INTO events (session, id, version, name, parent, ts, replayable, reset) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        params![id, event.id, version, name, event.parent, event.timestamp, event.body.replayable(), event.body.is_reset()],
-                    )?;
-                    if event.body.replayable() {
-                        transaction.execute(
-                            "INSERT INTO texts (session, event, kind, ts, body) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![id, event.id, event.body.kind(), event.timestamp, event.body.text()],
-                        )?;
-                    }
+                    transaction.prepare_cached(
+                        "INSERT INTO events (session, id, version, name, parent, ts, replayable, reset) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    )?.execute(params![id, event.id, version, name, event.parent, event.timestamp, event.body.replayable(), event.body.is_reset()])?;
                 }
             }
             if new_session || added.iter().any(|(kind, _)| kind == "records") {
-                let meta = store.record_meta(id)?;
-                transaction.execute(
+                let (meta, links) = store.index_records(id, &session.records)?;
+                transaction.prepare_cached(
                     "UPDATE sessions SET title = ?2, cwd = ?3, project_remote = ?4, project_root = ?5, project_path = ?6 WHERE id = ?1",
-                    params![id, meta.title, meta.cwd, meta.project.as_ref().and_then(|project| project.remote.as_deref()), meta.project.as_ref().and_then(|project| project.root.as_deref()), meta.project.as_ref().map(|project| project.path.as_str())],
-                )?;
-                transaction.execute("DELETE FROM links WHERE session = ?1", [id])?;
-                for (name, link) in store.link_versions(id)? {
+                )?.execute(params![id, meta.title, meta.cwd, meta.project.as_ref().and_then(|project| project.remote.as_deref()), meta.project.as_ref().and_then(|project| project.root.as_deref()), meta.project.as_ref().map(|project| project.path.as_str())])?;
+                transaction
+                    .prepare_cached("DELETE FROM links WHERE session = ?1")?
+                    .execute([id])?;
+                for (name, link) in links {
                     let (version, _) = record_order(&name);
                     let removable = link.direction == Direction::Export
                         && !link.continued
                         && link.exported_digest.is_some();
-                    transaction.execute(
+                    transaction.prepare_cached(
                         "INSERT INTO links (session, name, version, host, agent, native_id, path, removed, removable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![id, name, version, link.host, link.agent.name(), link.native_id, link.path, link.removed, removable],
-                    )?;
+                    )?.execute(params![id, name, version, link.host, link.agent.name(), link.native_id, link.path, link.removed, removable])?;
                 }
             }
             if events_changed {
-                transaction.execute(
+                transaction.prepare_cached(
                     "UPDATE sessions SET
                     created = COALESCE((SELECT MIN(ts) FROM events WHERE session = ?1), ''),
                     updated = COALESCE((SELECT MAX(ts) FROM events WHERE session = ?1), ''),
@@ -265,23 +260,20 @@ impl Index {
                     alternate_branches = (SELECT COUNT(*) > 1 FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id)),
                     leaf = (SELECT e.id FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id) ORDER BY e.ts DESC, e.id DESC LIMIT 1)
                  WHERE id = ?1",
-                    [id],
-                )?;
-                transaction.execute(
+                )?.execute([id])?;
+                transaction.prepare_cached(
                     "WITH RECURSIVE branch(id, parent, reset, replayable) AS (
                      SELECT e.id, e.parent, e.reset, e.replayable FROM events e JOIN sessions s ON s.id = e.session AND s.leaf = e.id WHERE e.session = ?1
                      UNION
                      SELECT e.id, e.parent, e.reset, e.replayable FROM branch b JOIN events e ON e.session = ?1 AND e.id = b.parent WHERE NOT b.reset
                  )
                  UPDATE sessions SET replayable = EXISTS (SELECT 1 FROM branch WHERE replayable) WHERE id = ?1",
-                    [id],
-                )?;
+                )?.execute([id])?;
             }
             for (kind, name) in added {
-                transaction.execute(
-                    "INSERT INTO files (session, kind, name) VALUES (?1, ?2, ?3)",
-                    params![id, kind, name],
-                )?;
+                transaction
+                    .prepare_cached("INSERT INTO files (session, kind, name) VALUES (?1, ?2, ?3)")?
+                    .execute(params![id, kind, name])?;
             }
         }
         transaction.commit()?;
@@ -308,8 +300,9 @@ impl Index {
         native_id: &str,
         host: Option<&str>,
     ) -> Result<Option<String>> {
-        Ok(self.db.query_row(
+        Ok(self.db.prepare_cached(
             "SELECT l.session FROM links l WHERE (?1 IS NULL OR l.agent = ?1) AND l.native_id = ?2 AND (?3 IS NULL OR l.host = ?3) AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC, l.session DESC LIMIT 1",
+        )?.query_row(
             params![agent.map(Agent::name), native_id, host],
             |row| row.get(0),
         ).optional()?)
@@ -317,22 +310,24 @@ impl Index {
 
     /// Finds an active provider link by file path on any host.
     pub fn linked_file(&self, agent: Agent, path: &Path) -> Result<Option<(String, String)>> {
-        Ok(self.db.query_row(
+        Ok(self.db.prepare_cached(
             "SELECT l.session, l.native_id FROM links l WHERE l.agent = ?1 AND l.path = ?2 AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC, l.session DESC LIMIT 1",
+        )?.query_row(
             params![agent.name(), path.to_string_lossy()], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?)
     }
 
     /// The newest active native link for a session and agent on this host.
     pub fn latest_native(&self, session: &str, agent: Agent) -> Result<Option<String>> {
-        Ok(self.db.query_row(
+        Ok(self.db.prepare_cached(
             "SELECT l.native_id FROM links l WHERE l.session = ?1 AND l.host = ?2 AND l.agent = ?3 AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC LIMIT 1",
+        )?.query_row(
             params![session, self.host, agent.name()], |row| row.get(0),
         ).optional()?)
     }
 
     pub(crate) fn registry_links(&self, agent: Agent) -> Result<Vec<(String, String)>> {
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             "SELECT l.session, l.name FROM links l WHERE l.agent = ?1 AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC, l.session DESC"
         )?;
         let rows = statement.query_map([agent.name()], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -342,7 +337,7 @@ impl Index {
     pub(crate) fn materialization_sessions(&self) -> Result<Vec<MaterializationSession>> {
         let mut statement = self
             .db
-            .prepare("SELECT id, leaf, replayable FROM sessions ORDER BY id")?;
+            .prepare_cached("SELECT id, leaf, replayable FROM sessions ORDER BY id")?;
         let rows = statement.query_map([], |row| {
             Ok(MaterializationSession {
                 id: row.get(0)?,
@@ -354,7 +349,7 @@ impl Index {
     }
 
     pub(crate) fn materialization_links(&self, agent: Agent) -> Result<Vec<MaterializationLink>> {
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             "SELECT l.session, l.native_id, l.removable FROM links l WHERE l.host = ?1 AND l.agent = ?2 AND NOT l.removed
              AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))
              ORDER BY l.session, l.native_id",
@@ -370,16 +365,16 @@ impl Index {
     }
 
     pub(crate) fn sessions_without_project(&self) -> Result<Vec<(String, Option<String>)>> {
-        let mut statement = self
-            .db
-            .prepare("SELECT id, cwd FROM sessions WHERE project_path IS NULL ORDER BY id")?;
+        let mut statement = self.db.prepare_cached(
+            "SELECT id, cwd FROM sessions WHERE project_path IS NULL ORDER BY id",
+        )?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// The session linked to the native session of `agent` whose id starts with `prefix`; fails when several sessions match.
     pub fn linked_session_by_prefix(&self, agent: Agent, prefix: &str) -> Result<Option<String>> {
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             "SELECT DISTINCT l.session FROM links l WHERE l.agent = ?1 AND substr(l.native_id, 1, length(?2)) = ?2 AND NOT l.removed
              AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))",
         )?;
@@ -392,7 +387,7 @@ impl Index {
     pub fn resolve(&self, prefix: &str) -> Result<Option<String>> {
         let mut statement = self
             .db
-            .prepare("SELECT id FROM sessions WHERE substr(id, 1, length(?1)) = ?1")?;
+            .prepare_cached("SELECT id FROM sessions WHERE substr(id, 1, length(?1)) = ?1")?;
         let rows = statement.query_map([prefix], |row| row.get(0))?;
         let ids = rows.collect::<rusqlite::Result<Vec<String>>>()?;
         if ids.iter().any(|id| id == prefix) {
@@ -404,18 +399,15 @@ impl Index {
     pub(crate) fn title(&self, session: &str) -> Result<Option<String>> {
         let title = self
             .db
-            .query_row(
-                "SELECT title FROM sessions WHERE id = ?1",
-                [session],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT title FROM sessions WHERE id = ?1")?
+            .query_row([session], |row| row.get(0))
             .optional()?;
         Ok(title.flatten())
     }
 
     /// Sessions from the project directory `cwd` and linked to `agent`, each filter applying only when given, most recently updated first.
     pub fn list(&self, cwd: Option<&str>, agent: Option<Agent>) -> Result<Vec<SessionSummary>> {
-        let mut statement = self.db.prepare(
+        let mut statement = self.db.prepare_cached(
             "WITH active_links AS (
                  SELECT l.session, l.agent FROM links l
                  WHERE NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))
@@ -465,49 +457,6 @@ impl Index {
         }
         Ok(sessions)
     }
-
-    /// The newest replayable events containing every one of `terms`, compared case-insensitively, at most `limit` of them.
-    ///
-    /// Terms of three or more characters are looked up in the trigram index and shorter ones are scanned for, so substrings match in any language.
-    pub fn search(&self, terms: &[String], limit: usize) -> Result<Vec<SearchHit>> {
-        // Trigram MATCH cannot find shorter terms, and SQLite never hands a LIKE with an ESCAPE clause to the index
-        let (indexed, scanned): (Vec<&String>, Vec<&String>) =
-            terms.iter().partition(|term| term.chars().count() >= 3);
-        let mut conditions = Vec::new();
-        let mut values = Vec::new();
-        if !indexed.is_empty() {
-            let mut phrases = Vec::with_capacity(indexed.len());
-            for term in indexed {
-                phrases.push(format!("\"{}\"", term.replace('"', "\"\"")));
-            }
-            conditions.push("t.texts MATCH ?");
-            values.push(phrases.join(" AND "));
-        }
-        for term in scanned {
-            let escaped = term
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            conditions.push("t.body LIKE ? ESCAPE '\\'");
-            values.push(format!("%{escaped}%"));
-        }
-        let sql = format!(
-            "SELECT t.session, s.title, t.kind, t.ts, t.body FROM texts t JOIN sessions s ON s.id = t.session
-             WHERE {} ORDER BY t.ts DESC LIMIT {limit}",
-            conditions.join(" AND ")
-        );
-        let mut statement = self.db.prepare(&sql)?;
-        let rows = statement.query_map(params_from_iter(values), |row| {
-            Ok(SearchHit {
-                session: row.get(0)?,
-                title: row.get(1)?,
-                kind: row.get(2)?,
-                timestamp: row.get(3)?,
-                body: row.get(4)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<SearchHit>>>()?)
-    }
 }
 
 fn unique(mut matches: Vec<String>, query: &str) -> Result<Option<String>> {
@@ -518,9 +467,13 @@ fn unique(mut matches: Vec<String>, query: &str) -> Result<Option<String>> {
 }
 
 fn remove_session(transaction: &rusqlite::Transaction<'_>, id: &str) -> Result<()> {
-    transaction.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
-    for table in ["links", "texts", "files", "events"] {
-        transaction.execute(&format!("DELETE FROM {table} WHERE session = ?1"), [id])?;
+    for sql in [
+        "DELETE FROM events WHERE session = ?1",
+        "DELETE FROM links WHERE session = ?1",
+        "DELETE FROM files WHERE session = ?1",
+        "DELETE FROM sessions WHERE id = ?1",
+    ] {
+        transaction.prepare_cached(sql)?.execute([id])?;
     }
     Ok(())
 }

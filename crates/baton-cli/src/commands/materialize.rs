@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use baton_adapters::Paseo;
-use baton_core::{Adapter, Agent, Baton, Direction, Exported, Materialized, materialization_cwd};
+use baton_core::{Agent, Baton, Direction, Exported, Materialized, materialization_cwd};
 
 use super::{export, import};
 
@@ -16,8 +16,6 @@ pub(crate) fn run(baton: &mut Baton, agents: &[Agent]) -> Result<()> {
             continue;
         }
         let adapter = baton_adapters::adapter(agent)?;
-        import::run(baton, Some(agent), None)?;
-        baton.refresh()?;
         let natives = match adapter.discover(None) {
             Ok(natives) => natives,
             Err(error) => {
@@ -25,6 +23,10 @@ pub(crate) fn run(baton: &mut Baton, agents: &[Agent]) -> Result<()> {
                 continue;
             }
         };
+        let mut tally = import::Tally::default();
+        import::import_sessions(baton, adapter.as_ref(), &natives, &mut tally);
+        import::finish(baton, &tally)?;
+        baton.refresh()?;
         let summary = baton.materialize(&*adapter, &natives, None)?;
         for warning in &summary.warnings {
             eprintln!("baton: {agent}: {warning}");
@@ -41,21 +43,17 @@ pub(crate) fn run(baton: &mut Baton, agents: &[Agent]) -> Result<()> {
     Ok(())
 }
 
-fn import_provider(baton: &mut Baton, adapter: &dyn Adapter) -> Result<()> {
-    for native in adapter.discover(None)? {
-        if let Err(error) = baton.import(adapter, &native) {
-            eprintln!("baton: {}:{}: {error:#}", adapter.agent(), native.id);
-        }
-    }
-    Ok(())
-}
-
 fn materialize_paseo(baton: &mut Baton) -> Result<()> {
     let paseo = Paseo::new(Paseo::default_home()?);
     let available = paseo.available();
     if !available {
         eprintln!("baton: paseo daemon is not running; skipping registration and deletion");
     }
+    let mut registrations = if available {
+        export::discover_registrations(&paseo)?
+    } else {
+        HashMap::new()
+    };
     let mut groups: HashMap<Agent, HashSet<String>> = HashMap::new();
     for (id, link) in baton.registry_sessions(Agent::Paseo)? {
         if let Some(provider) = link.provider
@@ -67,9 +65,13 @@ fn materialize_paseo(baton: &mut Baton) -> Result<()> {
     let mut summary = Materialized::default();
     for (provider, ids) in groups {
         let adapter = baton_adapters::adapter(provider)?;
-        import_provider(baton, adapter.as_ref())?;
-        baton.refresh()?;
         let natives = adapter.discover(None)?;
+        for native in &natives {
+            if let Err(error) = baton.import(adapter.as_ref(), native) {
+                eprintln!("baton: {}:{}: {error:#}", adapter.agent(), native.id);
+            }
+        }
+        baton.refresh()?;
         let result = baton.materialize(adapter.as_ref(), &natives, Some(&ids))?;
         summary.exported += result.exported;
         summary.refreshed += result.refreshed;
@@ -82,12 +84,16 @@ fn materialize_paseo(baton: &mut Baton) -> Result<()> {
             continue;
         }
         let natives = adapter.discover(None)?;
+        let mut natives_by_id = HashMap::new();
+        for native in &natives {
+            natives_by_id.entry(native.id.as_str()).or_insert(native);
+        }
         for id in ids {
             let session = baton.store.load(&id)?;
             let latest = baton.index.latest_native(&id, provider)?;
             let native = latest
                 .as_ref()
-                .and_then(|id| natives.iter().find(|native| &native.id == id));
+                .and_then(|id| natives_by_id.get(id.as_str()).copied());
             let own: Vec<_> = session
                 .meta
                 .links
@@ -105,7 +111,15 @@ fn materialize_paseo(baton: &mut Baton) -> Result<()> {
                     native: native.clone(),
                     cwd: materialization_cwd(&session)?,
                 };
-                if let Err(error) = export::register(baton, &paseo, &id, provider, &exported) {
+                if let Err(error) = export::register(
+                    baton,
+                    &paseo,
+                    &mut registrations,
+                    &id,
+                    provider,
+                    &exported,
+                    session.meta.title.as_deref(),
+                ) {
                     summary.warnings.push(format!("{id}: {error:#}"));
                 }
             }
@@ -122,6 +136,7 @@ fn materialize_paseo(baton: &mut Baton) -> Result<()> {
                 }
                 match paseo.delete(&link.native_id) {
                     Ok(()) => {
+                        registrations.retain(|_, agent| agent.id != link.native_id);
                         let mut removed = link.clone();
                         removed.removed = true;
                         baton.record_link(&id, removed, None)?;

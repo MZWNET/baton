@@ -124,13 +124,13 @@ impl Source for AntigravityDesktopAdapter {
     ) -> Result<NativeRead> {
         let connection = sqlite::open_read_only(&session.path)?;
         let conversation = conversation::read(&connection, blobs)?;
-        let summaries = session
+        let summary = session
             .path
             .parent()
             .and_then(Path::parent)
-            .map(AntigravityDesktopAdapter::summaries)
-            .unwrap_or_default();
-        let summary = summaries.get(&session.id);
+            .and_then(|root| fs::read(root.join("agyhub_summaries_proto.pb")).ok())
+            .and_then(|bytes| summary::entry(&bytes, &session.id).and_then(summary::summary));
+        let summary = summary.as_ref();
         Ok(NativeRead {
             info: Info {
                 cwd: summary

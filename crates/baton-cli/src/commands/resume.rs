@@ -7,7 +7,6 @@ use baton_adapters::Paseo;
 use baton_core::{Agent, Baton};
 
 use super::export;
-use crate::resolve;
 
 // Takes the store by value so its lock is released before the agent starts
 pub(crate) fn run(
@@ -17,21 +16,35 @@ pub(crate) fn run(
     provider: Option<Agent>,
     cwd: Option<&Path>,
 ) -> Result<()> {
-    let provider = export::paseo_provider(agent, provider)?;
-    let session = resolve::session_id(&mut baton, query)?;
-    let adapter = baton_adapters::adapter(provider.unwrap_or(agent))?;
-    let exported = baton.export(&session, adapter.as_ref(), cwd)?;
+    let export::ExportedSession {
+        session,
+        provider,
+        adapter,
+        exported,
+    } = export::export_session(&mut baton, query, agent, provider, cwd)?;
     if let Some(provider) = provider {
         let paseo = Paseo::new(Paseo::default_home()?);
         if !paseo.available() {
             bail!("paseo daemon is not running; cannot open a Paseo agent");
         }
-        let id = export::register(&baton, &paseo, &session, provider, &exported)?;
+        let title = baton.store.load(&session)?.meta.title;
+        let mut registrations = export::discover_registrations(&paseo)?;
+        let id = export::register(
+            &baton,
+            &paseo,
+            &mut registrations,
+            &session,
+            provider,
+            &exported,
+            title.as_deref(),
+        )?;
         drop(baton);
+
         return Err(hand_over(paseo.open_command(&id))).context("starting paseo");
     }
     drop(baton);
     let command = adapter.resume_command(&exported.native, &exported.cwd);
+
     Err(hand_over(command)).with_context(|| format!("starting {agent}"))
 }
 

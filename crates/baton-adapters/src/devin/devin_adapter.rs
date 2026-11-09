@@ -59,11 +59,7 @@ impl Source for DevinAdapter {
     }
 
     fn discover(&self, path: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let db = match path {
-            Some(path) if path.is_file() => path.to_path_buf(),
-            Some(dir) => dir.join("sessions.db"),
-            None => self.db.clone(),
-        };
+        let db = sqlite::resolve_path(path, &self.db, "sessions.db");
         if !db.is_file() {
             return Ok(Vec::new());
         }
@@ -163,19 +159,21 @@ impl Adapter for DevinAdapter {
             ],
         )?;
         let mut newest = 0;
-        for (index, node) in nodes.iter().enumerate() {
-            transaction.execute(
+        {
+            let mut insert = transaction.prepare(
                 "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
+            )?;
+            for (index, node) in nodes.iter().enumerate() {
+                insert.execute(params![
                     id,
                     index as i64,
                     index.checked_sub(1).map(|parent| parent as i64),
                     node.chat_message.to_string(),
                     node.created,
-                ],
-            )?;
-            newest = transaction.last_insert_rowid();
+                ])?;
+                newest = transaction.last_insert_rowid();
+            }
         }
         transaction.commit()?;
         Ok(NativeSession {

@@ -13,11 +13,11 @@ baton-core.workspace = true
 chrono.workspace = true
 md-5.workspace = true
 rusqlite.workspace = true
-ruzstd.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 uuid.workspace = true
+zstd.workspace = true
 
 [lints]
 workspace = true

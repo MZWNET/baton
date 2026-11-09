@@ -73,11 +73,7 @@ impl Source for MastracodeAdapter {
     }
 
     fn discover(&self, path: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let db = match path {
-            Some(path) if path.is_file() => path.to_path_buf(),
-            Some(dir) => dir.join("mastra.db"),
-            None => self.db.clone(),
-        };
+        let db = sqlite::resolve_path(path, &self.db, "mastra.db");
         if !db.is_file() {
             return Ok(Vec::new());
         }
@@ -171,19 +167,21 @@ impl Adapter for MastracodeAdapter {
                 updated,
             ],
         )?;
-        for message in &messages {
-            transaction.execute(
+        {
+            let mut insert = transaction.prepare(
                 "INSERT INTO mastra_messages (id, thread_id, content, role, type, \"createdAt\", \"resourceId\")
                  VALUES (?1, ?2, ?3, ?4, 'v2', ?5, ?6)",
-                params![
+            )?;
+            for message in &messages {
+                insert.execute(params![
                     identifiers::uuid_v4(),
                     id,
                     Value::to_string(&message.content),
                     message.role,
                     message.created,
                     project.resource,
-                ],
-            )?;
+                ])?;
+            }
         }
         transaction.commit()?;
         Ok(NativeSession {

@@ -224,9 +224,24 @@ impl Paseo {
         }
     }
 
-    /// Finds the persisted record of a newly registered agent.
-    pub fn registered(&self, id: &str) -> Result<PaseoAgent> {
-        self.discover()?
+    /// Reads the persisted record of a newly registered agent
+    pub fn record(&self, id: &str) -> Result<PaseoAgent> {
+        let filename = format!("{id}.json");
+        let mut agents = Vec::new();
+        for path in files::read_dir(&self.home.join("agents"))? {
+            if path.is_dir() {
+                let record = path.join(&filename);
+                if record.is_file() {
+                    self.read_record(&record, &mut agents)?;
+                }
+            } else if path
+                .file_name()
+                .is_some_and(|name| name == filename.as_str())
+            {
+                self.read_record(&path, &mut agents)?;
+            }
+        }
+        agents
             .into_iter()
             .find(|agent| agent.id == id)
             .with_context(|| format!("paseo agent {id} has no active record"))

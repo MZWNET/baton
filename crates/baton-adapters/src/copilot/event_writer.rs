@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use anyhow::Result;
 use baton_core::{Blobs, Event, Image};
@@ -16,7 +16,7 @@ pub(super) struct EventWriter<'a> {
     out: String,
     parent: Option<String>,
     timestamp: String,
-    assets: HashSet<String>,
+    assets: HashMap<String, usize>,
 }
 
 impl<'a> EventWriter<'a> {
@@ -26,7 +26,7 @@ impl<'a> EventWriter<'a> {
             out: String::new(),
             parent: None,
             timestamp: String::new(),
-            assets: HashSet::new(),
+            assets: HashMap::new(),
         }
     }
 
@@ -107,14 +107,20 @@ impl<'a> EventWriter<'a> {
 
     // Writes the asset record before the first record that refers to it, and returns the reference
     fn asset(&mut self, timestamp: &str, image: &Image) -> Result<Value> {
-        let bytes = self.blobs.get(&image.blob)?;
         let asset = format!("sha256:{}", image.blob);
-        if self.assets.insert(asset.clone()) {
+        let length = if let Some(&length) = self.assets.get(&asset) {
+            length
+        } else {
+            let bytes = self.blobs.get(&image.blob)?;
+            let length = bytes.len();
             let data = json!({"assetId": asset, "type": "image", "mimeType": image.mime,
-                              "byteLength": bytes.len(), "data": images::encode(&bytes)});
+                              "byteLength": length, "data": images::encode(&bytes)});
             self.push(timestamp, "session.binary_asset", data);
-        }
-        Ok(json!({"assetId": asset, "mimeType": image.mime, "byteLength": bytes.len()}))
+            self.assets.insert(asset.clone(), length);
+            length
+        };
+
+        Ok(json!({"assetId": asset, "mimeType": image.mime, "byteLength": length}))
     }
 
     fn push(&mut self, timestamp: &str, kind: &str, data: Value) {

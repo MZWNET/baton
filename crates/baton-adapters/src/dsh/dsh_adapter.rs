@@ -5,7 +5,6 @@ use anyhow::Result;
 use baton_core::{
     Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp, journal,
 };
-use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 
 use crate::dsh::event_parser::EventParser;
 use crate::dsh::event_writer::EventWriter;
@@ -153,17 +152,13 @@ impl Adapter for DshAdapter {
             writer.push_title(timestamp, title);
         }
         let (header, events) = writer.finish();
-        let bytes = if plain {
-            format!("{header}{events}").into_bytes()
+        if plain {
+            files::create_new(&path, format!("{header}{events}").as_bytes())?;
         } else {
-            let mut bytes = compress_to_vec(header.as_bytes(), CompressionLevel::Fastest);
-            bytes.extend(compress_to_vec(
-                events.as_bytes(),
-                CompressionLevel::Fastest,
-            ));
-            bytes
-        };
-        files::create_new(&path, &bytes)?;
+            let mut bytes = zstd::bulk::compress(header.as_bytes(), 1)?;
+            bytes.extend(zstd::bulk::compress(events.as_bytes(), 1)?);
+            files::create_new(&path, &bytes)?;
+        }
         Ok(NativeSession {
             id,
             stamp: Stamp::of(&path)?,

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -105,27 +106,89 @@ impl Source for HermesAdapter {
     }
 
     fn discover(&self, path: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let db = match path {
-            Some(path) if path.is_file() => path.to_path_buf(),
-            Some(home) => home.join("state.db"),
-            None => self.home.join("state.db"),
-        };
+        let db = sqlite::resolve_path(path, &self.home.join("state.db"), "state.db");
         if !db.is_file() {
             return Ok(Vec::new());
         }
-        let connection = sqlite::open_read_only(&db)?;
+        let mut connection = sqlite::open_read_only(&db)?;
+        let snapshot = connection.transaction()?;
         let ids = {
-            let mut statement = connection.prepare(LISTED)?;
+            let mut statement = snapshot.prepare(LISTED)?;
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<Vec<String>>>()?
         };
+        let mut continuations = HashMap::new();
+        {
+            let mut statement = snapshot.prepare(
+                "SELECT parent.id, child.id FROM sessions parent JOIN sessions child ON child.parent_session_id = parent.id
+                 LEFT JOIN (SELECT session_id, MAX(timestamp) AS latest FROM messages GROUP BY session_id) m ON m.session_id = child.id
+                 WHERE parent.end_reason = 'compression'
+                   AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
+                   AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
+                   AND COALESCE(child.source, '') != 'tool'
+                 ORDER BY parent.id, CASE WHEN child.end_reason = 'compression' THEN 0 WHEN child.ended_at IS NULL THEN 1 ELSE 2 END,
+                          COALESCE((SELECT MAX(v) FROM (SELECT child.last_activity_at AS v UNION ALL SELECT m.latest)), child.started_at) DESC,
+                          child.started_at DESC, child.id DESC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (parent, child) = row?;
+                continuations.entry(parent).or_insert(child);
+            }
+        }
+        let mut stats = HashMap::new();
+        {
+            let mut statement = snapshot.prepare("SELECT session_id, COUNT(*) FILTER (WHERE active = 1), COALESCE(MAX(id), 0) FROM messages WHERE session_id IS NOT NULL GROUP BY session_id")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, active, newest) = row?;
+                stats.insert(id, (active, newest));
+            }
+        }
+        let mut titles = HashMap::new();
+        {
+            let mut statement = snapshot.prepare("SELECT id, title FROM sessions")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (id, title) = row?;
+                titles.insert(id, title);
+            }
+        }
         let mut sessions = Vec::with_capacity(ids.len());
         for id in ids {
-            let lineage = lineage(&connection, &id)?;
+            let mut seen = HashSet::new();
+            let mut current = id.as_str();
+            let mut stamp = Stamp { size: 0, mtime: 0 };
+            let mut title = None;
+            while seen.insert(current) {
+                if let Some(&(active, newest)) = stats.get(current) {
+                    stamp.size += active as u64;
+                    stamp.mtime = stamp.mtime.max(newest);
+                }
+                if let Some(Some(found)) = titles.get(current)
+                    && !found.is_empty()
+                {
+                    title = Some(found.clone());
+                }
+                match continuations.get(current) {
+                    Some(next) => current = next,
+                    None => break,
+                }
+            }
             sessions.push(NativeSession {
                 path: db.clone(),
-                stamp: stamp(&connection, &lineage)?,
-                title: title(&connection, &lineage)?,
+                stamp,
+                title,
                 id,
             });
         }
@@ -225,19 +288,21 @@ impl Adapter for HermesAdapter {
             ],
         )?;
         let mut newest = 0;
-        for (index, row) in rows.iter().enumerate() {
-            let archived = index < first_active;
-            let calls = (!row.tool_calls.is_empty()).then(|| json!(row.tool_calls).to_string());
-            let finish = (row.role == "assistant").then_some(if calls.is_some() {
-                "tool_calls"
-            } else {
-                "stop"
-            });
-            transaction.execute(
+        {
+            let mut insert = transaction.prepare(
                 "INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, tool_name, finish_reason,
                                        timestamp, observed, _compressed_summary, active, compacted)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11)",
-                params![
+            )?;
+            for (index, row) in rows.iter().enumerate() {
+                let archived = index < first_active;
+                let calls = (!row.tool_calls.is_empty()).then(|| json!(row.tool_calls).to_string());
+                let finish = (row.role == "assistant").then_some(if calls.is_some() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                });
+                insert.execute(params![
                     id,
                     row.role,
                     row.content,
@@ -249,15 +314,15 @@ impl Adapter for HermesAdapter {
                     row.summary,
                     !archived,
                     archived,
-                ],
-            )?;
-            newest = transaction.last_insert_rowid();
-            if index + 1 == first_active {
-                let marker = json!({"_baton_compacted_through": newest}).to_string();
-                transaction.execute(
-                    "UPDATE sessions SET model_config = ?2 WHERE id = ?1",
-                    params![id, marker],
-                )?;
+                ])?;
+                newest = transaction.last_insert_rowid();
+                if index + 1 == first_active {
+                    let marker = json!({"_baton_compacted_through": newest}).to_string();
+                    transaction.execute(
+                        "UPDATE sessions SET model_config = ?2 WHERE id = ?1",
+                        params![id, marker],
+                    )?;
+                }
             }
         }
         transaction.commit()?;
@@ -311,21 +376,6 @@ fn lineage(connection: &Connection, root: &str) -> Result<Vec<String>> {
             _ => return Ok(lineage),
         }
     }
-}
-
-// Appends and compactions raise the newest row id, rewinds lower the number of active rows
-fn stamp(connection: &Connection, lineage: &[String]) -> Result<Stamp> {
-    let mut stamp = Stamp { size: 0, mtime: 0 };
-    for id in lineage {
-        let (active, newest): (i64, i64) = connection.query_row(
-            "SELECT COUNT(*) FILTER (WHERE active = 1), COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        stamp.size += active as u64;
-        stamp.mtime = stamp.mtime.max(newest);
-    }
-    Ok(stamp)
 }
 
 // Rotation carries the title over as `title #2`, so the newest session of a lineage with a title names it

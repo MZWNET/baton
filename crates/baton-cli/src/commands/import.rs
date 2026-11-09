@@ -4,10 +4,10 @@ use std::path::Path;
 
 use anyhow::Result;
 use baton_adapters::Paseo;
-use baton_core::{Agent, Baton, Direction, ImportOutcome};
+use baton_core::{Agent, Baton, Direction, ImportOutcome, NativeSession, Source};
 
 #[derive(Default)]
-struct Tally {
+pub(crate) struct Tally {
     created: usize,
     updated: usize,
     forked: usize,
@@ -34,35 +34,49 @@ pub(crate) fn run(baton: &mut Baton, agent: Option<Agent>, path: Option<&Path>) 
                 continue;
             }
         };
-        for native in sessions {
-            let reference = format!("{agent}:{}", native.id);
-            match baton.import(&*source, &native) {
-                Ok(ImportOutcome::Created { session }) => {
-                    tally.created += 1;
-                    println!("new     {session}  {reference}");
-                }
-                Ok(ImportOutcome::Appended { session, events }) => {
-                    tally.updated += 1;
-                    println!("update  {session}  +{events}  {reference}");
-                }
-                Ok(ImportOutcome::Forked {
-                    session,
-                    from,
-                    events,
-                }) => {
-                    tally.forked += 1;
-                    println!("fork    {session}  from {from}  +{events}  {reference}");
-                }
-                Ok(ImportOutcome::Unchanged) => tally.unchanged += 1,
-                Err(error) => eprintln!("baton: {reference}: {error:#}"),
+        import_sessions(baton, &*source, &sessions, &mut tally);
+    }
+    finish(baton, &tally)
+}
+
+pub(crate) fn import_sessions(
+    baton: &mut Baton,
+    source: &dyn Source,
+    sessions: &[NativeSession],
+    tally: &mut Tally,
+) {
+    for native in sessions {
+        let reference = format!("{}:{}", source.agent(), native.id);
+        match baton.import(source, native) {
+            Ok(ImportOutcome::Created { session }) => {
+                tally.created += 1;
+                println!("new     {session}  {reference}");
             }
+            Ok(ImportOutcome::Appended { session, events }) => {
+                tally.updated += 1;
+                println!("update  {session}  +{events}  {reference}");
+            }
+            Ok(ImportOutcome::Forked {
+                session,
+                from,
+                events,
+            }) => {
+                tally.forked += 1;
+                println!("fork    {session}  from {from}  +{events}  {reference}");
+            }
+            Ok(ImportOutcome::Unchanged) => tally.unchanged += 1,
+            Err(error) => eprintln!("baton: {reference}: {error:#}"),
         }
     }
+}
+
+pub(crate) fn finish(baton: &mut Baton, tally: &Tally) -> Result<()> {
     baton.backfill_projects()?;
     println!(
         "{} new, {} updated, {} forked, {} unchanged",
         tally.created, tally.updated, tally.forked, tally.unchanged
     );
+
     Ok(())
 }
 
@@ -76,13 +90,16 @@ fn import_paseo(baton: &mut Baton, path: Option<&Path>, tally: &mut Tally) -> Re
     for agent in paseo.discover()? {
         if let Entry::Vacant(entry) = providers.entry(agent.provider) {
             let source = baton_adapters::source(agent.provider)?;
-            let natives = source.discover(None)?;
+            let mut natives = HashMap::new();
+            for native in source.discover(None)? {
+                natives
+                    .entry(Paseo::handle(agent.provider, &native))
+                    .or_insert(native);
+            }
             entry.insert((source, natives));
         }
         let (source, natives) = &providers[&agent.provider];
-        let native = natives
-            .iter()
-            .find(|native| Paseo::handle(agent.provider, native) == agent.handle);
+        let native = natives.get(&agent.handle);
         let linked = if let Some(native) = native {
             let outcome = baton.import(&**source, native)?;
             match outcome {

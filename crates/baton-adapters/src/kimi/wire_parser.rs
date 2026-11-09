@@ -214,7 +214,10 @@ impl Parser for WireParser<'_> {
         if bodies.is_empty() {
             return Ok(Line::Skip);
         }
-        let timestamp = json::timestamp_from_millis(&record["time"], &time::now());
+        let timestamp = record["time"]
+            .as_i64()
+            .and_then(time::from_unix_millis)
+            .unwrap_or_else(time::now);
         // Records have no ids, so their byte offsets stand in
         let id = offset.to_string();
         let parent = self.last.replace(id.clone());

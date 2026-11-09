@@ -138,16 +138,15 @@ impl<'a> JournalWriter<'a> {
     }
 
     fn image_block(&self, image: &Image) -> Result<Value> {
-        let bytes = self.blobs.get(&image.blob)?;
         let data = match &self.blob_dir {
             Some(blob_dir) => {
                 let path = blob_dir.join(&image.blob);
                 if !path.exists() {
-                    files::create_new(&path, &bytes)?;
+                    files::create_new(&path, &self.blobs.get(&image.blob)?)?;
                 }
                 format!("blob:sha256:{}", image.blob)
             }
-            None => images::encode(&bytes),
+            None => images::encode(&self.blobs.get(&image.blob)?),
         };
         Ok(json!({"type": "image", "data": data, "mimeType": image.mime}))
     }

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use baton_core::{Blobs, Body, Compaction, Draft, Image, Thinking, ToolCall, ToolResult, time};
 use serde_json::Value;
@@ -71,10 +73,12 @@ pub(super) fn drafts(row: &Row, blobs: &Blobs) -> Result<Vec<Draft>> {
 
 // Each step lists its text and calls, then the results MastraCode folded into the calls, which is how the model saw them
 fn assistant(parts: &[Value], result_order: &Value, blobs: &Blobs) -> Result<Vec<Body>> {
-    let order: Vec<&str> = result_order
-        .as_array()
-        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+    let mut order = HashMap::new();
+    if let Some(ids) = result_order.as_array() {
+        for (position, id) in ids.iter().filter_map(Value::as_str).enumerate() {
+            order.entry(id).or_insert(position);
+        }
+    }
     let mut bodies = Vec::new();
     for step in parts.split(|part| part["type"] == "step-start") {
         let mut results: Vec<(&str, Body)> = Vec::new();
@@ -102,7 +106,7 @@ fn assistant(parts: &[Value], result_order: &Value, blobs: &Blobs) -> Result<Vec
             }
         }
         if !order.is_empty() {
-            results.sort_by_key(|(id, _)| order.iter().position(|ordered| ordered == id));
+            results.sort_by_key(|(id, _)| order.get(id).copied());
         }
         bodies.extend(results.into_iter().map(|(_, result)| result));
     }

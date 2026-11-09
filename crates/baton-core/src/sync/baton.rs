@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -131,15 +130,8 @@ impl Baton {
         let (data, cache, _lock) = locked_dirs()?;
         let store = Store::new(data.clone(), host()?);
         let migrated = migration::run(&data, &store)?;
-        for name in ["index.db", "index.db-wal", "index.db-shm"] {
-            let path = cache.join(name);
-            match fs::remove_file(&path) {
-                Err(error) if error.kind() != ErrorKind::NotFound => {
-                    return Err(error).with_context(|| format!("removing {}", path.display()));
-                }
-                _ => {}
-            }
-        }
+        Index::remove(&cache)?;
+
         Ok(migrated)
     }
 
@@ -155,9 +147,9 @@ impl Baton {
 
     /// Records a changed registry link and supplies a title only when the session has none.
     pub fn record_link(&self, session_id: &str, link: Link, title: Option<String>) -> Result<()> {
-        let session = self.store.load(session_id)?;
-        let changed = !session.meta.links.contains(&link);
-        let title = title.filter(|_| session.meta.title.is_none());
+        let meta = self.store.record_meta(session_id)?;
+        let changed = !meta.links.contains(&link);
+        let title = title.filter(|_| meta.title.is_none());
         if changed || title.is_some() {
             self.store.record(
                 session_id,
@@ -503,15 +495,27 @@ impl Baton {
             removed: false,
             direction: Direction::Export,
         };
-        if !session.meta.links.contains(&link) {
+        let incoming = Incoming {
+            agent: adapter.agent(),
+            native: &native,
+            info: read.info,
+            progress: read.progress,
+        };
+        let title = incoming
+            .title()
+            .filter(|title| session.meta.title.as_ref() != Some(title));
+        let link = (!session.meta.links.contains(&link)).then_some(link);
+        if title.is_some() || link.is_some() {
             self.store.record(
                 &session.meta.id,
                 &Record {
-                    link: Some(link),
+                    title,
+                    link,
                     ..Record::default()
                 },
             )?;
         }
+        self.save_cursor(&incoming, leaf.map(str::to_owned), &session.meta.id)?;
         Ok(Exported { native, cwd })
     }
 
