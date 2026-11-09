@@ -46,13 +46,15 @@ pub enum Agent {
     AntigravityIde,
     /// [Cursor Agent](https://cursor.com/cli), which keeps chats under `~/.cursor/chats`.
     Cursor,
+    /// [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), which keeps sessions under `~/.dsh/sessions`.
+    Dsh,
     /// The [Cursor](https://cursor.com/) editor, which keeps chats in its global state database; read only.
     CursorIde,
 }
 
 impl Agent {
     /// Every supported agent, in the order imports visit them.
-    pub const ALL: [Agent; 21] = [
+    pub const ALL: [Agent; 22] = [
         Agent::Pi,
         Agent::Omp,
         Agent::Claude,
@@ -73,6 +75,7 @@ impl Agent {
         Agent::AntigravityDesktop,
         Agent::AntigravityIde,
         Agent::Cursor,
+        Agent::Dsh,
         Agent::CursorIde,
     ];
 
@@ -99,6 +102,7 @@ impl Agent {
             Agent::AntigravityDesktop => "antigravity-desktop",
             Agent::AntigravityIde => "antigravity-ide",
             Agent::Cursor => "cursor",
+            Agent::Dsh => "dsh",
             Agent::CursorIde => "cursor-ide",
         }
     }

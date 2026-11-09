@@ -29,7 +29,7 @@ impl Home {
     }
 
     // Agents keep their stores under HOME on Unix and USERPROFILE on Windows, unless these variables move them
-    const STORE_VARIABLES: [&str; 22] = [
+    const STORE_VARIABLES: [&str; 23] = [
         "PI_CODING_AGENT_DIR",
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
@@ -52,6 +52,7 @@ impl Home {
         "QWEN_RUNTIME_DIR",
         "KIMI_CODE_HOME",
         "CURSOR_CONFIG_DIR",
+        "DSH_HOME",
     ];
 
     fn baton(&self, args: &[&str]) -> String {

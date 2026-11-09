@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use baton_adapters::{
     AntigravityAdapter, ClaudeAdapter, CodexAdapter, CopilotAdapter, CursorAdapter, DevinAdapter,
-    GrokAdapter, HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpenhandsAdapter,
-    PiAdapter, QwenAdapter, VibeAdapter,
+    DshAdapter, GrokAdapter, HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter,
+    OpenhandsAdapter, PiAdapter, QwenAdapter, VibeAdapter,
 };
 use baton_core::{Adapter, Agent, Blobs, Body, Event, Export, Image, Source, replay};
 use rusqlite::Connection;
@@ -132,6 +132,7 @@ fn seeded_exports_have_the_same_native_id_and_path_in_fresh_stores() {
             ("vibe", Box::new(VibeAdapter::new(root.join("vibe")))),
             ("qwen", Box::new(QwenAdapter::new(root.join("qwen")))),
             ("kimi", Box::new(KimiAdapter::new(root.join("kimi")))),
+            ("dsh", Box::new(DshAdapter::new(root.join("dsh")))),
             ("muse", Box::new(MuseAdapter::new(root.join("muse")))),
             (
                 "antigravity",
@@ -502,6 +503,22 @@ fn kimi_round_trips_exactly_and_resumes_from_the_last_summary() {
     assert!(
         wire.contains(r#""compactedCount":6"#),
         "the summary replaces the six messages before it in Kimi's context: {wire}"
+    );
+}
+
+#[test]
+fn dsh_round_trips_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let root = dir.path().join("dsh");
+    let back = round_trip(&DshAdapter::new(root.clone()), &blobs);
+    assert_eq!(back.read, back.expected);
+    assert_eq!(back.title.as_deref(), Some("Round trip"));
+    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
+    assert_eq!(back.file.file_name().unwrap(), "session.v4.jsonl.zstd");
+    assert_eq!(
+        back.file.parent().and_then(|dir| dir.parent()),
+        Some(root.join("sessions/--work-demo--").as_path())
     );
 }
 

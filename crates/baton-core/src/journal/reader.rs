@@ -24,7 +24,8 @@ pub struct JsonLine<'a> {
 
 /// Whether `path` is a zstd compressed file, which is always read in full.
 pub fn is_compressed(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| extension == "zst")
+    path.extension()
+        .is_some_and(|extension| extension == "zst" || extension == "zstd")
 }
 
 /// The complete lines of `bytes`; a last line without a newline is still being written and is left out.
@@ -139,16 +140,19 @@ fn read_full<P: Parser>(path: &Path, mut parser: P) -> Result<NativeRead> {
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
-    use std::io::Read;
+    use std::io::{BufRead, BufReader, Read};
 
     if !is_compressed(path) {
         return fs::read(path).with_context(|| format!("reading {}", path.display()));
     }
-    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut reader = BufReader::new(file);
     let mut bytes = Vec::new();
-    StreamingDecoder::new(&mut file)
-        .with_context(|| format!("decompressing {}", path.display()))?
-        .read_to_end(&mut bytes)?;
+    while !reader.fill_buf()?.is_empty() {
+        StreamingDecoder::new(&mut reader)
+            .with_context(|| format!("decompressing {}", path.display()))?
+            .read_to_end(&mut bytes)?;
+    }
     if bytes.last().is_some_and(|&byte| byte != b'\n') {
         bytes.push(b'\n');
     }
@@ -204,6 +208,26 @@ mod tests {
             event: None,
             session: String::new(),
         }
+    }
+
+    #[test]
+    fn reads_all_concatenated_zstd_frames() {
+        use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl.zstd");
+        let header = b"{\"type\":\"session\",\"id\":\"header\"}\n";
+        let events = b"{\"id\":\"a\",\"parent\":\"header\"}\n{\"id\":\"b\",\"parent\":\"a\"}\n";
+        let mut compressed = compress_to_vec(header.as_slice(), CompressionLevel::Fastest);
+        compressed.extend(compress_to_vec(
+            events.as_slice(),
+            CompressionLevel::Fastest,
+        ));
+        fs::write(&path, compressed).unwrap();
+
+        let read = read(&path, None, |_| Echo).unwrap();
+        assert_eq!(texts(&read), ["header", "a", "b"]);
+        assert_eq!(read.progress.leaf.as_deref(), Some("b"));
     }
 
     #[test]

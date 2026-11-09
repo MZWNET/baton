@@ -3,9 +3,9 @@ use baton_core::{Adapter, Agent, Source};
 
 use crate::{
     AntigravityAdapter, AntigravityDesktopAdapter, AntigravityIdeAdapter, ClaudeAdapter,
-    CodexAdapter, CopilotAdapter, CursorAdapter, CursorIdeAdapter, DevinAdapter, GrokAdapter,
-    HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpencodeAdapter, OpenhandsAdapter,
-    PiAdapter, QwenAdapter, VibeAdapter,
+    CodexAdapter, CopilotAdapter, CursorAdapter, CursorIdeAdapter, DevinAdapter, DshAdapter,
+    GrokAdapter, HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpencodeAdapter,
+    OpenhandsAdapter, PiAdapter, QwenAdapter, VibeAdapter,
 };
 
 /// The source of `agent`'s sessions at the agent's default location, honoring the agent's own environment overrides such as `CODEX_HOME`.
@@ -52,6 +52,7 @@ pub fn adapter(agent: Agent) -> Result<Box<dyn Adapter>> {
             Box::new(AntigravityAdapter::new(AntigravityAdapter::default_root()?))
         }
         Agent::Cursor => Box::new(CursorAdapter::new(CursorAdapter::default_root()?)),
+        Agent::Dsh => Box::new(DshAdapter::new(DshAdapter::default_home()?)),
         Agent::AntigravityDesktop | Agent::AntigravityIde | Agent::CursorIde => {
             bail!("baton can only read {agent} sessions")
         }

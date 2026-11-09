@@ -6,9 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use baton_adapters::{
-    ClaudeAdapter, CodexAdapter, CopilotAdapter, DevinAdapter, GrokAdapter, HermesAdapter,
-    KimiAdapter, MastracodeAdapter, MuseAdapter, OpenhandsAdapter, PiAdapter, QwenAdapter,
-    VibeAdapter,
+    ClaudeAdapter, CodexAdapter, CopilotAdapter, DevinAdapter, DshAdapter, GrokAdapter,
+    HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpenhandsAdapter, PiAdapter,
+    QwenAdapter, VibeAdapter,
 };
 use baton_core::{Agent, Blobs, Body, Draft, Image, NativeRead, NativeSession, Source};
 use serde_json::{Value, json};
@@ -1322,6 +1322,79 @@ fn kimi_reads_typed_turns_and_loop_events_and_follows_undo() {
         support::result("call_2", "exit 1", vec![], true)
     );
     assert_eq!(read.info.cwd.as_deref(), Some("/workspace/kimi"));
+    assert_eq!(
+        read.info.created.as_deref(),
+        Some("2026-01-01T09:00:00.000Z")
+    );
+}
+
+#[test]
+fn dsh_reads_the_latest_generation_and_visible_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let root = dir.path().join("dsh");
+    let session = root.join("sessions/--work-demo--/session-x");
+    let records = [
+        json!({"type": "session", "version": 4, "id": "session-x", "createdAt": 1_767_258_000_000_i64, "cwd": "/work/demo", "isSeeded": false, "delegationDepth": 0}),
+        json!({"type": "turn/start", "seq": 0, "time": 1_767_258_000_001_i64, "data": {"turn": 1}}),
+        json!({"type": "user/message", "seq": 1, "time": 1_767_258_000_002_i64, "data": {"id": "injected", "role": "user", "source": {"kind": "agent-instructions"}, "content": [{"type": "text", "text": "hidden instructions"}]}, "surfaceOp": "append"}),
+        json!({"type": "user/message", "seq": 2, "time": 1_767_258_000_003_i64, "data": {"id": "user-1", "role": "user", "source": {"kind": "user"}, "content": [{"type": "text", "text": "look"}, {"type": "image", "attachment": {"attachmentId": format!("sha256:{PIXELS_SHA256}"), "mediaType": "image/png", "bytes": 6, "width": 0, "height": 0}}]}, "surfaceOp": "append"}),
+        json!({"type": "step/start", "seq": 3, "time": 1_767_258_000_004_i64, "data": {"turn": 1, "step": 1}}),
+        json!({"type": "assistant/message", "seq": 4, "time": 1_767_258_000_005_i64, "data": {"turn": 1, "step": 1, "message": {"id": "assistant-1", "role": "assistant", "source": {"kind": "model", "provider": "deepseek-official", "model": "deepseek-flash"}, "content": [{"type": "reasoning", "text": "hmm"}, {"type": "text", "text": "reading"}, {"type": "tool-call", "id": "call_1", "name": "read", "arguments": "{\"path\":\"a\"}"}, {"type": "tool-call", "id": "call_2", "name": "read", "arguments": "{\"path\":\"b\"}"}]}, "stream": []}, "surfaceOp": "append"}),
+        json!({"type": "tool/call", "seq": 5, "time": 1_767_258_000_006_i64, "data": {"turn": 1, "step": 1, "callId": "call_1", "name": "read", "arguments": "{\"path\":\"a\"}"}}),
+        json!({"type": "tool/result", "seq": 6, "time": 1_767_258_000_007_i64, "data": {"turn": 1, "step": 1, "message": {"id": "result-1", "role": "tool", "source": {"kind": "tool", "callId": "call_1"}, "toolCallId": "call_1", "content": [{"type": "text", "text": "a body"}], "isError": false}}, "surfaceOp": "append"}),
+        json!({"type": "tool/call", "seq": 7, "time": 1_767_258_000_008_i64, "data": {"turn": 1, "step": 1, "callId": "call_2", "name": "read", "arguments": "{\"path\":\"b\"}"}}),
+        json!({"type": "tool/result", "seq": 8, "time": 1_767_258_000_009_i64, "data": {"turn": 1, "step": 1, "message": {"id": "result-2", "role": "tool", "source": {"kind": "tool", "callId": "call_2"}, "toolCallId": "call_2", "content": [{"type": "text", "text": "missing"}], "isError": true}}, "surfaceOp": "append"}),
+        json!({"type": "tool/result", "seq": 9, "time": 1_767_258_000_010_i64, "data": {"turn": 1, "step": 1, "message": {"id": "result-1", "role": "tool", "source": {"kind": "tool", "callId": "call_1"}, "toolCallId": "call_1", "content": [{"type": "text", "text": "pruned"}], "isError": false}}, "surfaceOp": {"op": "replace", "startSeq": 6, "endSeq": 6}, "sourceEventSeqs": [6]}),
+        json!({"type": "step/end", "seq": 10, "time": 1_767_258_000_011_i64, "data": {"turn": 1, "step": 1}}),
+        json!({"type": "turn/end", "seq": 11, "time": 1_767_258_000_012_i64, "data": {"turn": 1, "reason": {"kind": "completed"}}}),
+        json!({"type": "compaction/start", "seq": 12, "time": 1_767_258_000_013_i64, "data": {"compactionId": "compact-1", "turn": null}}),
+        json!({"type": "compaction/summary", "seq": 13, "time": 1_767_258_000_014_i64, "data": {"compactionId": "compact-1", "summary": [{"type": "text", "text": "read a"}, {"type": "text", "text": "b was missing"}], "shadowedRange": {"start": 1, "end": 8}, "shadowedSeqs": [1, 2, 4, 9, 8], "shadowedTokenCount": 0, "provider": "deepseek-official", "model": "deepseek-flash"}}),
+        json!({"type": "user/message", "seq": 14, "time": 1_767_258_000_015_i64, "data": {"id": "checkpoint-1", "role": "user", "source": {"kind": "compact-checkpoint", "compactionId": "compact-1"}, "content": [{"type": "text", "text": "<compacted-summary>"}, {"type": "text", "text": "read a"}, {"type": "text", "text": "b was missing"}, {"type": "text", "text": "</compacted-summary>"}]}, "surfaceOp": {"op": "replace", "startSeq": 1, "endSeq": 8}, "sourceEventSeqs": [12, 13, 1, 2, 4, 9, 8]}),
+        json!({"type": "compaction/end", "seq": 15, "time": 1_767_258_000_016_i64, "data": {"compactionId": "compact-1", "turn": null}}),
+        json!({"type": "session/title", "seq": 16, "time": 1_767_258_000_017_i64, "data": {"title": "Dsh fixture", "messageSeqs": [], "source": {"kind": "user"}}}),
+    ];
+    support::write(&session.join("session.v4.jsonl"), &support::jsonl(&records));
+    support::write(
+        &session.join("session.v3.jsonl"),
+        &support::jsonl(&[
+            json!({"type": "session", "version": 3, "id": "old-session", "createdAt": 1_767_258_000_000_i64}),
+        ]),
+    );
+    support::write(
+        &root.join("sessions/--work-demo--/session-child/session.v4.jsonl"),
+        &support::jsonl(&[
+            json!({"type": "session", "version": 4, "id": "session-child", "createdAt": 1_767_258_000_000_i64, "cwd": "/work/demo", "isSeeded": false, "origin": "subagent", "delegationDepth": 1}),
+        ]),
+    );
+    support::write(
+        &root.join(format!(
+            "attachments/v1/objects/{}/{PIXELS_SHA256}",
+            &PIXELS_SHA256[..2]
+        )),
+        "pixels",
+    );
+    let adapter = DshAdapter::new(root);
+    let native = only(&adapter);
+    assert_eq!(native.id, "session-x");
+    assert_eq!(native.path, session.join("session.v4.jsonl"));
+    let read = adapter.read(&native, None, &blobs).unwrap();
+    assert_eq!(
+        support::bodies(&read.drafts),
+        vec![
+            support::user("look", vec![pixels()]),
+            support::meta(json!({"type": "model", "model": "deepseek-flash"})),
+            support::thinking("hmm", None),
+            support::assistant("reading"),
+            support::call("call_1", "read", json!({"path": "a"})),
+            support::call("call_2", "read", json!({"path": "b"})),
+            support::result("call_1", "a body", vec![], false),
+            support::result("call_2", "missing", vec![], true),
+            support::compaction("read a\nb was missing"),
+        ]
+    );
+    assert_eq!(read.info.title.as_deref(), Some("Dsh fixture"));
+    assert_eq!(read.info.cwd.as_deref(), Some("/work/demo"));
     assert_eq!(
         read.info.created.as_deref(),
         Some("2026-01-01T09:00:00.000Z")

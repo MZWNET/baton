@@ -24,6 +24,7 @@ Keep the conversations of your coding agents in one append-only history, back it
 | [Muse Code](https://dev.meta.ai/docs/muse-code/) | `muse` | Read / Write |
 | [Antigravity CLI](https://antigravity.google/docs/cli/) | `antigravity` | Read / Write |
 | [Cursor Agent](https://cursor.com/cli) | `cursor` | Read / Write |
+| [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) | `dsh` | Read / Write |
 | [Antigravity](https://antigravity.google/) desktop app | `antigravity-desktop` | Read only |
 | [Antigravity](https://antigravity.google/) IDE | `antigravity-ide` | Read only |
 | [Cursor](https://cursor.com/) editor | `cursor-ide` | Read only |
@@ -92,6 +93,7 @@ baton migrate                                # convert a data directory from the
 - Thinking is stored but never written back to an agent, tool calls are written as history and never run again, and auth, hooks, and MCP settings are untouched.
 - Each agent's location variables are honored, such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
 - OpenCode and Kilo Code sessions go through the `opencode` and `kilo` commands on `PATH`.
+- DeepSeek Harness cannot open a session by id, so `baton resume --in dsh` starts `dsh web`, where the session is listed under its workspace or Ungrouped.
 
 ## Credits
 
