@@ -1,5 +1,5 @@
-mod devin_adapter;
-mod node_parser;
-mod node_writer;
+mod adapter;
+mod parser;
+mod writer;
 
-pub use devin_adapter::DevinAdapter;
+pub use adapter::DevinAdapter;

@@ -1,15 +1,17 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::{Mutex, mpsc};
+use std::{fs, thread};
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::cache::database;
 use crate::project::{identify, matches};
 use crate::storage::record_order;
-use crate::{Agent, Direction, Project, Store};
+use crate::{Agent, Direction, Link, Project, SessionMeta, Store};
 
 const SCHEMA_VERSION: i64 = 7;
 const SCHEMA: &str = "
@@ -65,8 +67,31 @@ CREATE INDEX IF NOT EXISTS events_parent ON events (session, parent);
 ///
 /// [`Baton::open`](crate::Baton::open) brings the index up to date, including sessions a sync tool brought in from elsewhere.
 pub struct Index {
-    db: Connection,
+    db: Mutex<Connection>,
     host: String,
+}
+
+struct Pending {
+    id: String,
+    rebuild: bool,
+    new_session: bool,
+    segments: Vec<String>,
+    records: Option<Vec<String>>,
+    added: Vec<(String, String)>,
+}
+
+struct IndexedEvent {
+    id: String,
+    parent: Option<String>,
+    timestamp: String,
+    replayable: bool,
+    reset: bool,
+}
+
+struct Loaded {
+    pending: Pending,
+    segments: Vec<(String, Vec<IndexedEvent>)>,
+    records: Option<(SessionMeta, Vec<(String, Link)>)>,
 }
 
 /// One session as listed by [`Index::list`].
@@ -128,7 +153,7 @@ impl Index {
         db.set_prepared_statement_cache_capacity(48);
 
         Ok(Index {
-            db,
+            db: Mutex::new(db),
             host: host.to_owned(),
         })
     }
@@ -149,7 +174,7 @@ impl Index {
 
     // Indexes new immutable files and rebuilds sessions when indexed files disappear
     pub(crate) fn refresh(&mut self, store: &Store) -> Result<()> {
-        let transaction = self.db.transaction()?;
+        let transaction = self.db.get_mut().unwrap().transaction()?;
         let mut indexed: HashMap<String, HashSet<(String, String)>> = HashMap::new();
         {
             let mut statement = transaction.prepare("SELECT id FROM sessions")?;
@@ -175,7 +200,8 @@ impl Index {
                 remove_session(&transaction, gone)?;
             }
         }
-        for session in &sessions {
+        let mut pending = Vec::new();
+        for session in sessions {
             let id = &session.id;
             let current: HashSet<(String, String)> = session
                 .events
@@ -192,90 +218,44 @@ impl Index {
             let mut previous = indexed.get(id).unwrap_or(&empty);
             let rebuild = !previous.is_subset(&current);
             if rebuild {
-                remove_session(&transaction, id)?;
                 previous = &empty;
             }
             let new_session = rebuild || !indexed.contains_key(id);
             if !new_session && previous == &current {
                 continue;
             }
-            if new_session {
-                transaction.prepare_cached("INSERT INTO sessions (id, created, updated, events, alternate_branches, replayable) VALUES (?1, '', '', 0, 0, 0)")?.execute([id])?;
-            }
-            let added = current.difference(previous).collect::<Vec<_>>();
-            let mut new_events = added
+            let added = current.difference(previous).cloned().collect::<Vec<_>>();
+            let mut segments = added
                 .iter()
                 .filter(|(kind, _)| kind == "events")
-                .map(|(_, name)| name)
+                .map(|(_, name)| name.clone())
                 .collect::<Vec<_>>();
-            let events_changed = new_session || !new_events.is_empty();
-            new_events.sort_by(|a, b| record_order(a).cmp(&record_order(b)));
-            for name in new_events {
-                let (version, _) = record_order(name);
-                for event in store.segment(id, name)? {
-                    let previous: Option<(String, String)> = transaction
-                        .prepare_cached(
-                            "SELECT version, name FROM events WHERE session = ?1 AND id = ?2",
-                        )?
-                        .query_row(params![id, event.id], |row| Ok((row.get(0)?, row.get(1)?)))
-                        .optional()?;
-                    if let Some((previous_version, previous_name)) = previous {
-                        if (version, name.as_str())
-                            < (previous_version.as_str(), previous_name.as_str())
-                        {
-                            transaction.prepare_cached("UPDATE events SET version = ?3, name = ?4, ts = ?5 WHERE session = ?1 AND id = ?2")?
-                                .execute(params![id, event.id, version, name, event.timestamp])?;
-                        }
-                        continue;
-                    }
-                    transaction.prepare_cached(
-                        "INSERT INTO events (session, id, version, name, parent, ts, replayable, reset) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    )?.execute(params![id, event.id, version, name, event.parent, event.timestamp, event.body.replayable(), event.body.is_reset()])?;
-                }
-            }
-            if new_session || added.iter().any(|(kind, _)| kind == "records") {
-                let (meta, links) = store.index_records(id, &session.records)?;
-                transaction.prepare_cached(
-                    "UPDATE sessions SET title = ?2, cwd = ?3, project_remote = ?4, project_root = ?5, project_path = ?6 WHERE id = ?1",
-                )?.execute(params![id, meta.title, meta.cwd, meta.project.as_ref().and_then(|project| project.remote.as_deref()), meta.project.as_ref().and_then(|project| project.root.as_deref()), meta.project.as_ref().map(|project| project.path.as_str())])?;
-                transaction
-                    .prepare_cached("DELETE FROM links WHERE session = ?1")?
-                    .execute([id])?;
-                for (name, link) in links {
-                    let (version, _) = record_order(&name);
-                    let removable = link.direction == Direction::Export
-                        && !link.continued
-                        && link.exported_digest.is_some();
-                    transaction.prepare_cached(
-                        "INSERT INTO links (session, name, version, host, agent, native_id, path, removed, removable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    )?.execute(params![id, name, version, link.host, link.agent.name(), link.native_id, link.path, link.removed, removable])?;
-                }
-            }
-            if events_changed {
-                transaction.prepare_cached(
-                    "UPDATE sessions SET
-                    created = COALESCE((SELECT MIN(ts) FROM events WHERE session = ?1), ''),
-                    updated = COALESCE((SELECT MAX(ts) FROM events WHERE session = ?1), ''),
-                    events = (SELECT COUNT(*) FROM events WHERE session = ?1),
-                    alternate_branches = (SELECT COUNT(*) > 1 FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id)),
-                    leaf = (SELECT e.id FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id) ORDER BY e.ts DESC, e.id DESC LIMIT 1)
-                 WHERE id = ?1",
-                )?.execute([id])?;
-                transaction.prepare_cached(
-                    "WITH RECURSIVE branch(id, parent, reset, replayable) AS (
-                     SELECT e.id, e.parent, e.reset, e.replayable FROM events e JOIN sessions s ON s.id = e.session AND s.leaf = e.id WHERE e.session = ?1
-                     UNION
-                     SELECT e.id, e.parent, e.reset, e.replayable FROM branch b JOIN events e ON e.session = ?1 AND e.id = b.parent WHERE NOT b.reset
-                 )
-                 UPDATE sessions SET replayable = EXISTS (SELECT 1 FROM branch WHERE replayable) WHERE id = ?1",
-                )?.execute([id])?;
-            }
-            for (kind, name) in added {
-                transaction
-                    .prepare_cached("INSERT INTO files (session, kind, name) VALUES (?1, ?2, ?3)")?
-                    .execute(params![id, kind, name])?;
-            }
+            segments.sort_by(|a, b| record_order(a).cmp(&record_order(b)));
+            let records = (new_session || added.iter().any(|(kind, _)| kind == "records"))
+                .then_some(session.records);
+            pending.push(Pending {
+                id: session.id,
+                rebuild,
+                new_session,
+                segments,
+                records,
+                added,
+            });
         }
+        let (sender, receiver) = mpsc::sync_channel(rayon::current_num_threads());
+        thread::scope(|scope| -> Result<()> {
+            scope.spawn(move || {
+                pending
+                    .into_par_iter()
+                    .try_for_each_with(sender, |sender, pending| {
+                        sender.send(load(store, pending)).ok()
+                    })
+            });
+            for loaded in receiver {
+                apply(&transaction, loaded?)?;
+            }
+            Ok(())
+        })?;
         transaction.commit()?;
         Ok(())
     }
@@ -300,34 +280,41 @@ impl Index {
         native_id: &str,
         host: Option<&str>,
     ) -> Result<Option<String>> {
-        Ok(self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        let session = db.prepare_cached(
             "SELECT l.session FROM links l WHERE (?1 IS NULL OR l.agent = ?1) AND l.native_id = ?2 AND (?3 IS NULL OR l.host = ?3) AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC, l.session DESC LIMIT 1",
         )?.query_row(
             params![agent.map(Agent::name), native_id, host],
             |row| row.get(0),
-        ).optional()?)
+        ).optional()?;
+        Ok(session)
     }
 
     /// Finds an active provider link by file path on any host.
     pub fn linked_file(&self, agent: Agent, path: &Path) -> Result<Option<(String, String)>> {
-        Ok(self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        let link = db.prepare_cached(
             "SELECT l.session, l.native_id FROM links l WHERE l.agent = ?1 AND l.path = ?2 AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC, l.session DESC LIMIT 1",
         )?.query_row(
             params![agent.name(), path.to_string_lossy()], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?)
+        ).optional()?;
+        Ok(link)
     }
 
     /// The newest active native link for a session and agent on this host.
     pub fn latest_native(&self, session: &str, agent: Agent) -> Result<Option<String>> {
-        Ok(self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        let native_id = db.prepare_cached(
             "SELECT l.native_id FROM links l WHERE l.session = ?1 AND l.host = ?2 AND l.agent = ?3 AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC LIMIT 1",
         )?.query_row(
             params![session, self.host, agent.name()], |row| row.get(0),
-        ).optional()?)
+        ).optional()?;
+        Ok(native_id)
     }
 
     pub(crate) fn registry_links(&self, agent: Agent) -> Result<Vec<(String, String)>> {
-        let mut statement = self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare_cached(
             "SELECT l.session, l.name FROM links l WHERE l.agent = ?1 AND NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session)) ORDER BY l.version DESC, l.name DESC, l.session DESC"
         )?;
         let rows = statement.query_map([agent.name()], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -335,9 +322,9 @@ impl Index {
     }
 
     pub(crate) fn materialization_sessions(&self) -> Result<Vec<MaterializationSession>> {
-        let mut statement = self
-            .db
-            .prepare_cached("SELECT id, leaf, replayable FROM sessions ORDER BY id")?;
+        let db = self.db.lock().unwrap();
+        let mut statement =
+            db.prepare_cached("SELECT id, leaf, replayable FROM sessions ORDER BY id")?;
         let rows = statement.query_map([], |row| {
             Ok(MaterializationSession {
                 id: row.get(0)?,
@@ -349,7 +336,8 @@ impl Index {
     }
 
     pub(crate) fn materialization_links(&self, agent: Agent) -> Result<Vec<MaterializationLink>> {
-        let mut statement = self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare_cached(
             "SELECT l.session, l.native_id, l.removable FROM links l WHERE l.host = ?1 AND l.agent = ?2 AND NOT l.removed
              AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))
              ORDER BY l.session, l.native_id",
@@ -365,7 +353,8 @@ impl Index {
     }
 
     pub(crate) fn sessions_without_project(&self) -> Result<Vec<(String, Option<String>)>> {
-        let mut statement = self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare_cached(
             "SELECT id, cwd FROM sessions WHERE project_path IS NULL ORDER BY id",
         )?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -374,7 +363,8 @@ impl Index {
 
     /// The session linked to the native session of `agent` whose id starts with `prefix`; fails when several sessions match.
     pub fn linked_session_by_prefix(&self, agent: Agent, prefix: &str) -> Result<Option<String>> {
-        let mut statement = self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare_cached(
             "SELECT DISTINCT l.session FROM links l WHERE l.agent = ?1 AND substr(l.native_id, 1, length(?2)) = ?2 AND NOT l.removed
              AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))",
         )?;
@@ -385,9 +375,9 @@ impl Index {
 
     /// The session whose id is `prefix` or uniquely starts with it; fails when several sessions match.
     pub fn resolve(&self, prefix: &str) -> Result<Option<String>> {
-        let mut statement = self
-            .db
-            .prepare_cached("SELECT id FROM sessions WHERE substr(id, 1, length(?1)) = ?1")?;
+        let db = self.db.lock().unwrap();
+        let mut statement =
+            db.prepare_cached("SELECT id FROM sessions WHERE substr(id, 1, length(?1)) = ?1")?;
         let rows = statement.query_map([prefix], |row| row.get(0))?;
         let ids = rows.collect::<rusqlite::Result<Vec<String>>>()?;
         if ids.iter().any(|id| id == prefix) {
@@ -397,8 +387,8 @@ impl Index {
     }
 
     pub(crate) fn title(&self, session: &str) -> Result<Option<String>> {
-        let title = self
-            .db
+        let db = self.db.lock().unwrap();
+        let title = db
             .prepare_cached("SELECT title FROM sessions WHERE id = ?1")?
             .query_row([session], |row| row.get(0))
             .optional()?;
@@ -407,7 +397,9 @@ impl Index {
 
     /// Sessions from the project directory `cwd` and linked to `agent`, each filter applying only when given, most recently updated first.
     pub fn list(&self, cwd: Option<&str>, agent: Option<Agent>) -> Result<Vec<SessionSummary>> {
-        let mut statement = self.db.prepare_cached(
+        let identity = cwd.and_then(|cwd| identify(Path::new(cwd)));
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare_cached(
             "WITH active_links AS (
                  SELECT l.session, l.agent FROM links l
                  WHERE NOT l.removed AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))
@@ -440,7 +432,6 @@ impl Index {
                 project,
             ))
         })?;
-        let identity = cwd.and_then(|cwd| identify(Path::new(cwd)));
         let mut sessions = Vec::new();
         for row in rows {
             let (summary, project) = row?;
@@ -457,6 +448,103 @@ impl Index {
         }
         Ok(sessions)
     }
+}
+
+fn load(store: &Store, pending: Pending) -> Result<Loaded> {
+    let mut segments = Vec::with_capacity(pending.segments.len());
+    for name in &pending.segments {
+        let events = store
+            .segment(&pending.id, name)?
+            .into_iter()
+            .map(|event| IndexedEvent {
+                id: event.id,
+                parent: event.parent,
+                timestamp: event.timestamp,
+                replayable: event.body.replayable(),
+                reset: event.body.is_reset(),
+            })
+            .collect();
+        segments.push((name.clone(), events));
+    }
+    let records = pending
+        .records
+        .as_ref()
+        .map(|records| store.index_records(&pending.id, records))
+        .transpose()?;
+
+    Ok(Loaded {
+        pending,
+        segments,
+        records,
+    })
+}
+
+fn apply(transaction: &rusqlite::Transaction<'_>, loaded: Loaded) -> Result<()> {
+    let Pending {
+        id,
+        rebuild,
+        new_session,
+        added,
+        ..
+    } = loaded.pending;
+    if rebuild {
+        remove_session(transaction, &id)?;
+    }
+    if new_session {
+        transaction.prepare_cached("INSERT INTO sessions (id, created, updated, events, alternate_branches, replayable) VALUES (?1, '', '', 0, 0, 0)")?.execute([&id])?;
+    }
+    let events_changed = new_session || !loaded.segments.is_empty();
+    for (name, events) in loaded.segments {
+        let (version, _) = record_order(&name);
+        for event in events {
+            transaction.prepare_cached(
+                "INSERT INTO events (session, id, version, name, parent, ts, replayable, reset) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT (session, id) DO UPDATE SET version = excluded.version, name = excluded.name, ts = excluded.ts WHERE (excluded.version, excluded.name) < (events.version, events.name)",
+            )?.execute(params![id, event.id, version, name, event.parent, event.timestamp, event.replayable, event.reset])?;
+        }
+    }
+    if let Some((meta, links)) = loaded.records {
+        transaction.prepare_cached(
+            "UPDATE sessions SET title = ?2, cwd = ?3, project_remote = ?4, project_root = ?5, project_path = ?6 WHERE id = ?1",
+        )?.execute(params![id, meta.title, meta.cwd, meta.project.as_ref().and_then(|project| project.remote.as_deref()), meta.project.as_ref().and_then(|project| project.root.as_deref()), meta.project.as_ref().map(|project| project.path.as_str())])?;
+        transaction
+            .prepare_cached("DELETE FROM links WHERE session = ?1")?
+            .execute([&id])?;
+        for (name, link) in links {
+            let (version, _) = record_order(&name);
+            let removable = link.direction == Direction::Export
+                && !link.continued
+                && link.exported_digest.is_some();
+            transaction.prepare_cached(
+                "INSERT INTO links (session, name, version, host, agent, native_id, path, removed, removable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?.execute(params![id, name, version, link.host, link.agent.name(), link.native_id, link.path, link.removed, removable])?;
+        }
+    }
+    if events_changed {
+        transaction.prepare_cached(
+            "UPDATE sessions SET
+                    created = COALESCE((SELECT MIN(ts) FROM events WHERE session = ?1), ''),
+                    updated = COALESCE((SELECT MAX(ts) FROM events WHERE session = ?1), ''),
+                    events = (SELECT COUNT(*) FROM events WHERE session = ?1),
+                    alternate_branches = (SELECT COUNT(*) > 1 FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id)),
+                    leaf = (SELECT e.id FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id) ORDER BY e.ts DESC, e.id DESC LIMIT 1)
+                 WHERE id = ?1",
+        )?.execute([&id])?;
+        transaction.prepare_cached(
+            "WITH RECURSIVE branch(id, parent, reset, replayable) AS (
+                     SELECT e.id, e.parent, e.reset, e.replayable FROM events e JOIN sessions s ON s.id = e.session AND s.leaf = e.id WHERE e.session = ?1
+                     UNION
+                     SELECT e.id, e.parent, e.reset, e.replayable FROM branch b JOIN events e ON e.session = ?1 AND e.id = b.parent WHERE NOT b.reset
+                 )
+                 UPDATE sessions SET replayable = EXISTS (SELECT 1 FROM branch WHERE replayable) WHERE id = ?1",
+        )?.execute([&id])?;
+    }
+    for (kind, name) in added {
+        transaction
+            .prepare_cached("INSERT INTO files (session, kind, name) VALUES (?1, ?2, ?3)")?
+            .execute(params![id, kind, name])?;
+    }
+
+    Ok(())
 }
 
 fn unique(mut matches: Vec<String>, query: &str) -> Result<Option<String>> {

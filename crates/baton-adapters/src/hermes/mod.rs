@@ -1,5 +1,5 @@
-mod hermes_adapter;
-mod row_parser;
-mod row_writer;
+mod adapter;
+mod parser;
+mod writer;
 
-pub use hermes_adapter::HermesAdapter;
+pub use adapter::HermesAdapter;

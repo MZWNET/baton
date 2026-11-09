@@ -47,7 +47,7 @@ baton export <id> --to claude [--cwd <dir>]     # write a new Claude Code sessio
 baton export <id> --to paseo --provider claude  # write it for Claude Code, then register it in Paseo
 baton resume <id> --in codex [--cwd <dir>]      # export, then open it in Codex
 baton materialize --in omp --in claude          # write every session into each agent, in the matching local project
-baton migrate                                   # convert a data directory from the old events.jsonl and meta.json layout
+baton migrate                                   # convert a data directory written by an older baton to the current layout
 ```
 
 `<id>` is a baton session id, a unique prefix of it, or `agent:native_id` such as `omp:01a1a978`.
@@ -55,47 +55,31 @@ baton migrate                                   # convert a data directory from 
 ### Syncing and continuing
 
 - Imports are incremental and idempotent.
-- A session exported to another agent and continued there flows back into the same baton session on the next import, becoming a fork that records where it branched if the baton session moved on meanwhile.
-- `baton materialize --in <agent>` (repeatable) imports that agent first, then writes every baton session it lacks on this machine as a native session so the agent's resume list shows them; rerunning it writes nothing new.
-- When a session moves on after its materialized copy was written, baton writes a fresh copy and deletes the old one only if baton wrote it and it was never continued; Codex copies listed in `session_index.jsonl` and OpenHands keep the old copy with a warning.
+- A session exported to another agent and continued there flows back into the same baton session on the next import, as a fork if the baton session moved on meanwhile.
+- `baton materialize --in <agent>` (repeatable) imports that agent, then writes every session it lacks on this machine so its resume list shows them; rerunning writes nothing new.
+- The data directory only ever gains files and session ids derive from the native session, so machines sync by copying files between data directories (for example through a git repository); a session continued on two machines keeps both branches, the newest is active and `baton show` lists the others.
+- `export`, `resume`, and `materialize` place a session in the checkout under `BATON_PROJECTS` with the same git identity (the `origin` remote, or else the root commit, plus the directory inside the repository), falling back to `BATON_PATH_MAP` and then the recorded directory; `list --cwd` also matches sessions recorded under another machine's path of the same repository.
 
-### Project directories
-
-`export`, `resume`, `materialize`, and `list --cwd` locate a session's project on this machine by git identity (the `origin` remote, or else the root commit, plus the directory inside the repository), falling back to path mapping and then the recorded directory:
+## Configuration
 
 | Variable | Purpose |
 | --- | --- |
+| `BATON_HOME` | Data directory; defaults to `~/.local/share/baton` (Linux), `~/Library/Application Support/baton` (macOS), `%APPDATA%\baton\data` (Windows) |
+| `BATON_HOST` | Identifies this machine in the synced data; defaults to the host name |
+| `BATON_CACHE_DIR` | Import cursors and the session index (rebuilt when missing); defaults to the platform cache directory |
 | `BATON_PROJECTS` | `PATH`-separated directories searched up to three levels deep for matching git checkouts |
 | `BATON_PATH_MAP` | `PATH`-separated `from=to` path prefix pairs used when no checkout matches (for example `/root/repos=/Users/me/repos`) |
+| `RAYON_NUM_THREADS` | Limits the threads used by imports, `materialize`, and session index rebuilds, which use all CPU cores by default |
 
-- `list --cwd` also matches sessions recorded under another machine's path of the same repository.
-- OpenCode and Kilo Code require the project directory to exist to receive a session.
-
-## Storage
-
-```
-<data>/sessions/<id>/events/<host>-<uuid>.jsonl.zst   zstd-compressed events
-<data>/sessions/<id>/records/<host>-<uuid>.json       title, cwd, fork point or a link to a native session
-<data>/blobs/<sha256>                                 images
-```
-
-| Setting | Default |
-| --- | --- |
-| `BATON_HOME` (`<data>`) | `~/.local/share/baton` (Linux), `~/Library/Application Support/baton` (macOS), `%APPDATA%\baton\data` (Windows) |
-| `BATON_HOST` (`<host>`) | Machine host name |
-| `BATON_CACHE_DIR` | Platform cache directory; holds import cursors and the session index (rebuilt when missing) |
-
-- Files are only added, never changed, and session ids derive from the native session they came from, so machines can sync by copying files between data directories (for example through a git repository).
-- A session continued on two machines keeps both branches; the newest is active and `baton show` lists the others.
+Each agent's own location variables are honored, such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PASEO_HOME`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
 
 ## Worth knowing
 
-- Agent sessions are only read during import. Exports create new sessions and never overwrite existing ones.
-- Thinking is stored but never written back to an agent, tool calls are written as history and never run again, and auth, hooks, and MCP settings are untouched.
-- Each agent's location variables are honored, such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PASEO_HOME`, `XDG_DATA_HOME`, and `XDG_CONFIG_HOME`.
-- OpenCode and Kilo Code sessions go through the `opencode` and `kilo` commands on `PATH`.
-- Paseo keeps no conversations of its own: baton imports a Paseo agent through its provider's session (Claude Code, Codex, OpenCode, Pi, Oh My Pi), so the chat stays one baton session and remembers the Paseo agent with its title; archived and internal Paseo agents are skipped.
-- `--to paseo` and `--in paseo` take `--provider` for `export` and `resume`; `materialize --in paseo` restores every session that was a Paseo agent somewhere under its original provider through `paseo` and a running Paseo daemon, and skips registration with a warning when the daemon is not running.
+- Agent sessions are only read during import; exports create new sessions and never overwrite existing ones.
+- Thinking is stored but never written back, tool calls are written as history and never run again, and auth, hooks, and MCP settings are untouched.
+- OpenCode and Kilo Code sessions go through the `opencode` and `kilo` commands on `PATH`, and the project directory must exist to receive a session.
+- Paseo keeps no conversations of its own: baton imports a Paseo agent through its provider's session (Claude Code, Codex, OpenCode, Pi, Oh My Pi), so the chat stays one baton session.
+- `export --to paseo` and `resume --in paseo` take `--provider`, while `materialize --in paseo` restores every session that was a Paseo agent somewhere under its original provider; registering goes through `paseo` and a running Paseo daemon, and `materialize --in paseo` skips registration with a warning when the daemon is not running.
 - DeepSeek Harness cannot open a session by id, so `baton resume --in dsh` starts `dsh web`, where the session is listed under its workspace or Ungrouped.
 
 ## Credits

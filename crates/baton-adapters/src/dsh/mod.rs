@@ -1,6 +1,6 @@
-mod dsh_adapter;
-mod event_parser;
-mod event_writer;
+mod adapter;
+mod parser;
 mod project_key;
+mod writer;
 
-pub use dsh_adapter::DshAdapter;
+pub use adapter::DshAdapter;

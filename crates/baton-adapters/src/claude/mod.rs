@@ -1,6 +1,6 @@
-mod claude_adapter;
+mod adapter;
+mod parser;
 mod project_key;
-mod transcript_parser;
-mod transcript_writer;
+mod writer;
 
-pub use claude_adapter::ClaudeAdapter;
+pub use adapter::ClaudeAdapter;

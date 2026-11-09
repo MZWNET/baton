@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -24,20 +25,20 @@ CREATE TABLE IF NOT EXISTS cursors (
 
 // Import cursors in `state.db`; without its cursor a native session is read in full, and a branch it switched to meanwhile imports as a fork
 pub(crate) struct Cursors {
-    db: Connection,
+    db: Mutex<Connection>,
 }
 
 impl Cursors {
     pub(crate) fn open(cache: &Path, data: &Path) -> Result<Cursors> {
         let db = database::open(&cache.join("state.db"), data, SCHEMA, &["cursors"])?;
-        Ok(Cursors { db })
+        Ok(Cursors { db: Mutex::new(db) })
     }
 
     pub(crate) fn get(&self, agent: Agent, native_id: &str) -> Result<Option<Cursor>> {
         use rusqlite::OptionalExtension;
 
-        let cursor = self
-            .db
+        let db = self.db.lock().unwrap();
+        let cursor = db
             .prepare_cached(
                 "SELECT path, size, mtime, offset, tail_hash, leaf, event, session FROM cursors
                  WHERE agent = ?1 AND native_id = ?2",
@@ -63,7 +64,8 @@ impl Cursors {
     }
 
     pub(crate) fn save(&self, agent: Agent, native_id: &str, cursor: &Cursor) -> Result<()> {
-        self.db.prepare_cached(
+        let db = self.db.lock().unwrap();
+        db.prepare_cached(
             "INSERT OR REPLACE INTO cursors (agent, native_id, path, size, mtime, offset, tail_hash, leaf, event, session)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?.execute(

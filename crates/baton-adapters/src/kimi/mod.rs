@@ -1,5 +1,5 @@
-mod kimi_adapter;
-mod wire_parser;
-mod wire_writer;
+mod adapter;
+mod parser;
+mod writer;
 
-pub use kimi_adapter::KimiAdapter;
+pub use adapter::KimiAdapter;

@@ -1,6 +1,6 @@
+mod adapter;
 mod fingerprint;
-mod message_parser;
-mod message_writer;
-mod vibe_adapter;
+mod parser;
+mod writer;
 
-pub use vibe_adapter::VibeAdapter;
+pub use adapter::VibeAdapter;

@@ -1,5 +1,5 @@
-mod qwen_adapter;
-mod record_parser;
-mod record_writer;
+mod adapter;
+mod parser;
+mod writer;
 
-pub use qwen_adapter::QwenAdapter;
+pub use adapter::QwenAdapter;

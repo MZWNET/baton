@@ -1,6 +1,6 @@
-mod log_parser;
-mod log_writer;
+mod adapter;
 mod markers;
-mod muse_adapter;
+mod parser;
+mod writer;
 
-pub use muse_adapter::MuseAdapter;
+pub use adapter::MuseAdapter;

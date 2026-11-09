@@ -6,7 +6,7 @@ use anyhow::Result;
 use baton_core::{Agent, Blobs, Cursor, Info, NativeRead, NativeSession, Progress, Source};
 use rusqlite::OptionalExtension;
 
-use crate::antigravity::conversation;
+use crate::antigravity::parser;
 use crate::antigravity::summary::{self, Summary};
 use crate::support::protobuf::Message;
 use crate::support::{files, sqlite};
@@ -99,7 +99,7 @@ impl Source for AntigravityDesktopAdapter {
     }
 
     fn discover(&self, path: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let (root, dbs) = conversation::databases(&self.root, path)?;
+        let (root, dbs) = parser::databases(&self.root, path)?;
         let summaries = AntigravityDesktopAdapter::summaries(root);
         let mut sessions = Vec::new();
         for (db, id) in dbs {
@@ -123,7 +123,7 @@ impl Source for AntigravityDesktopAdapter {
         blobs: &Blobs,
     ) -> Result<NativeRead> {
         let connection = sqlite::open_read_only(&session.path)?;
-        let conversation = conversation::read(&connection, blobs)?;
+        let conversation = parser::read(&connection, blobs)?;
         let summary = session
             .path
             .parent()

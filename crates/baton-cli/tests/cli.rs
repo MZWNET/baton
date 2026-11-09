@@ -138,6 +138,37 @@ impl Home {
         project.join(format!("{id}.jsonl"))
     }
 
+    fn continue_claude(&self, claude_id: &str, question: (&str, &str), answer: (&str, &str)) {
+        let transcript = self.claude_transcript(claude_id);
+        let last = fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<Value>(line).ok()?["uuid"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .next_back()
+            .unwrap();
+        let project = self.project();
+        let record = |uuid: &str, parent: &str, kind: &str, content: Value| {
+            json!({"type": kind, "uuid": uuid, "parentUuid": parent, "sessionId": claude_id, "isSidechain": false,
+                   "cwd": project, "timestamp": "2026-01-02T00:00:00.000Z", "message": {"role": kind, "content": content}})
+        };
+        append(
+            &transcript,
+            &[
+                record(question.0, &last, "user", json!(question.1)),
+                record(
+                    answer.0,
+                    question.0,
+                    "assistant",
+                    json!([{"type": "text", "text": answer.1}]),
+                ),
+            ],
+        );
+    }
+
     fn claude_transcripts(&self) -> Vec<PathBuf> {
         let projects = self.path(".claude/projects");
         if !projects.exists() {
@@ -843,34 +874,7 @@ fn exported_sessions_flow_back_and_a_diverged_source_forks() {
     let output = home.baton(&["import"]);
     assert!(output.contains("0 new, 0 updated, 0 forked"), "{output}");
 
-    let transcript = home.claude_transcript(&claude_id);
-    let last = fs::read_to_string(&transcript)
-        .unwrap()
-        .lines()
-        .filter_map(|line| {
-            serde_json::from_str::<Value>(line).ok()?["uuid"]
-                .as_str()
-                .map(String::from)
-        })
-        .next_back()
-        .unwrap();
-    let project = home.project();
-    let record = |uuid: &str, parent: &str, kind: &str, content: Value| {
-        json!({"type": kind, "uuid": uuid, "parentUuid": parent, "sessionId": claude_id, "isSidechain": false,
-               "cwd": project, "timestamp": "2026-01-02T00:00:00.000Z", "message": {"role": kind, "content": content}})
-    };
-    append(
-        &transcript,
-        &[
-            record("c1", &last, "user", json!("question two")),
-            record(
-                "c2",
-                "c1",
-                "assistant",
-                json!([{"type": "text", "text": "answer two"}]),
-            ),
-        ],
-    );
+    home.continue_claude(&claude_id, ("c1", "question two"), ("c2", "answer two"));
     let output = home.baton(&["import", "--agent", "claude"]);
     assert!(
         output.contains(&format!("update  {session}  +2")),
@@ -909,6 +913,32 @@ fn exported_sessions_flow_back_and_a_diverged_source_forks() {
         home.baton(&["show", &format!("claude:{}", &claude_id[..8])])
             .contains(&session)
     );
+}
+
+#[test]
+fn two_continued_exports_of_one_session_update_it_once_and_fork_once() {
+    let home = Home::new();
+    write_pi(
+        &home,
+        &[
+            header("/work"),
+            ask("a1", None, 1, "question one"),
+            answer("a2", "a1", 2, "answer one"),
+        ],
+    );
+    home.baton(&["import"]);
+    let session = home.sessions().remove(0);
+    let first = home.export(&session, "claude");
+    let second = home.export(&session, "claude");
+    home.continue_claude(&first, ("f1", "first continuation"), ("f2", "first answer"));
+    home.continue_claude(
+        &second,
+        ("s1", "second continuation"),
+        ("s2", "second answer"),
+    );
+
+    let output = home.baton(&["import", "--agent", "claude"]);
+    assert!(output.contains("0 new, 1 updated, 1 forked"), "{output}");
 }
 
 #[test]

@@ -1,5 +1,5 @@
-mod codex_adapter;
-mod rollout_parser;
-mod rollout_writer;
+mod adapter;
+mod parser;
+mod writer;
 
-pub use codex_adapter::CodexAdapter;
+pub use adapter::CodexAdapter;

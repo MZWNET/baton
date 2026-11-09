@@ -7,8 +7,8 @@ use baton_core::{
 };
 use serde_json::{Value, json};
 
-use crate::opencode::bundle_writer::{self, UNNAMED};
-use crate::opencode::{bundle_parser, transfer_parser, transfer_writer};
+use crate::opencode::writer::bundle::UNNAMED;
+use crate::opencode::{parser, writer};
 
 // What `opencode export` prints for a session with two steps, attachments, a failed and an unfinished tool, and a compaction
 fn exported() -> Value {
@@ -122,7 +122,7 @@ fn ordering_drafts(blobs: &Blobs) -> Vec<Draft> {
 fn exports_keep_step_order_and_pair_compaction_summaries() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let read = bundle_parser::parse_bundle(&exported(), &blobs).unwrap();
+    let read = parser::bundle::parse(&exported(), &blobs).unwrap();
     assert_eq!(
         outline(&read.drafts),
         [
@@ -159,9 +159,7 @@ fn exports_keep_step_order_and_pair_compaction_summaries() {
 fn written_bundles_read_back_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let mut drafts = bundle_parser::parse_bundle(&exported(), &blobs)
-        .unwrap()
-        .drafts;
+    let mut drafts = parser::bundle::parse(&exported(), &blobs).unwrap().drafts;
     drafts.extend(ordering_drafts(&blobs));
     let events = Event::chain(drafts, None, Agent::Opencode, "ses_x");
     let path: Vec<&Event> = events.iter().collect();
@@ -173,7 +171,7 @@ fn written_bundles_read_back_unchanged() {
         events: &replayed,
         seed: None,
     };
-    let bundle = bundle_writer::write_bundle(&export, "ses_fixture", "1.19.5", &blobs).unwrap();
+    let bundle = writer::bundle::write(&export, "ses_fixture", "1.19.5", &blobs).unwrap();
     let parts: Vec<&Value> = bundle["messages"]
         .as_array()
         .unwrap()
@@ -207,7 +205,7 @@ fn written_bundles_read_back_unchanged() {
         .map(|message| message["info"]["id"].as_str().unwrap())
         .collect();
     assert!(ids.is_sorted(), "OpenCode orders messages by id");
-    let read = bundle_parser::parse_bundle(&bundle, &blobs).unwrap();
+    let read = parser::bundle::parse(&bundle, &blobs).unwrap();
     let bodies: Vec<&Body> = read.drafts.iter().map(|draft| &draft.body).collect();
     let expected: Vec<&Body> = replayed.iter().map(|event| &event.body).collect();
     assert_eq!(bodies, expected);
@@ -218,13 +216,13 @@ fn written_bundles_read_back_unchanged() {
         title: None,
         ..export
     };
-    let bundle = bundle_writer::write_bundle(&untitled, "ses_fixture", "1.19.5", &blobs).unwrap();
+    let bundle = writer::bundle::write(&untitled, "ses_fixture", "1.19.5", &blobs).unwrap();
     let title = bundle["info"]["title"].as_str().unwrap();
     assert!(
         title.starts_with(UNNAMED),
         "an untitled session gets OpenCode's own placeholder title: {title}"
     );
-    let read = bundle_parser::parse_bundle(&bundle, &blobs).unwrap();
+    let read = parser::bundle::parse(&bundle, &blobs).unwrap();
     assert_eq!(read.info.title, None, "a placeholder title is no title");
 }
 
@@ -260,7 +258,7 @@ fn transferred() -> Value {
 fn v2_exports_list_results_after_their_message() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let read = transfer_parser::parse_transfer(&transferred(), &blobs).unwrap();
+    let read = parser::transfer::parse(&transferred(), &blobs).unwrap();
     assert_eq!(
         outline(&read.drafts),
         [
@@ -295,7 +293,7 @@ fn v2_exports_list_results_after_their_message() {
 fn written_v2_transfers_read_back_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let mut drafts = transfer_parser::parse_transfer(&transferred(), &blobs)
+    let mut drafts = parser::transfer::parse(&transferred(), &blobs)
         .unwrap()
         .drafts;
     drafts.extend(ordering_drafts(&blobs));
@@ -309,7 +307,7 @@ fn written_v2_transfers_read_back_unchanged() {
         events: &replayed,
         seed: None,
     };
-    let data = transfer_writer::write_transfer(&export, "ses_fixture", &blobs).unwrap();
+    let data = writer::transfer::write(&export, "ses_fixture", &blobs).unwrap();
     let blocks: Vec<&Value> = data["messages"]
         .as_array()
         .unwrap()
@@ -342,7 +340,7 @@ fn written_v2_transfers_read_back_unchanged() {
         .map(|message| message["id"].as_str().unwrap())
         .collect();
     assert!(ids.is_sorted(), "OpenCode orders messages by id");
-    let read = transfer_parser::parse_transfer(&data, &blobs).unwrap();
+    let read = parser::transfer::parse(&data, &blobs).unwrap();
     let bodies: Vec<&Body> = read.drafts.iter().map(|draft| &draft.body).collect();
     let expected: Vec<&Body> = replayed.iter().map(|event| &event.body).collect();
     assert_eq!(bodies, expected);

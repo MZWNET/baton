@@ -7,7 +7,7 @@ use baton_core::{
 };
 use serde_json::Value;
 
-use crate::cursor::{bubble_parser, graph_parser};
+use crate::cursor::parser::{bubble, graph};
 use crate::support::{files, images, json, sqlite, uri};
 
 /// Chats of the [Cursor](https://cursor.com/) editor: composers in its global state database, `User/globalStorage/state.vscdb` in the editor's user data directory.
@@ -127,14 +127,14 @@ impl Source for CursorIdeAdapter {
                         .query_row([format!("agentKv:blob:{id}")], |row| row.get(0))
                         .with_context(|| format!("loading Cursor blob {id}"))
                 };
-                let graph = graph_parser::read(&root, created, &load, blobs)?;
+                let graph = graph::read(&root, created, &load, blobs)?;
                 (graph.drafts, graph.cwd, graph.created)
             }
             None => {
                 let created = created.and_then(time::from_unix_millis);
                 let start = created.clone().unwrap_or_else(time::now);
                 (
-                    bubble_parser::read(&transaction, &session.id, &composer, &start)?,
+                    bubble::read(&transaction, &session.id, &composer, &start)?,
                     None,
                     created,
                 )

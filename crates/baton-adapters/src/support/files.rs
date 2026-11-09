@@ -118,6 +118,22 @@ pub(crate) fn create_new(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// For files whose names determine their content
+pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().expect("published paths have a directory");
+    fs::create_dir_all(dir)?;
+    let mut scratch = tempfile::NamedTempFile::new_in(dir)?;
+    scratch.write_all(bytes)?;
+
+    match fs::hard_link(scratch.path(), path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("creating {}", path.display())),
+    }
+}
+
 pub(crate) fn remove_file(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),

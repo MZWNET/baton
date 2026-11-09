@@ -1,4 +1,4 @@
-//! Every file based adapter reads back exactly what it wrote, which is what lets exported sessions flow back.
+//! Every adapter baton writes reads back what it wrote, except what its format cannot keep
 
 mod support;
 
@@ -15,6 +15,46 @@ use rusqlite::Connection;
 use serde_json::json;
 
 const CREATED: &str = "2026-01-01T00:00:00.000Z";
+
+fn writable_adapter(agent: Agent, root: &Path) -> Option<Box<dyn Adapter>> {
+    Some(match agent {
+        Agent::Pi | Agent::Omp => Box::new(PiAdapter::new(agent, root.to_path_buf())),
+        Agent::Claude => Box::new(ClaudeAdapter::new(root.to_path_buf())),
+        Agent::Codex => Box::new(CodexAdapter::new(root.to_path_buf())),
+        Agent::Mastracode => Box::new(MastracodeAdapter::new(root.join("mastra.db"))),
+        // Hermes and Devin only write into a database their agent created
+        Agent::Hermes => {
+            support::database(
+                &root.join("state.db"),
+                include_str!("fixtures/hermes-state.sql"),
+            );
+            Box::new(HermesAdapter::new(root.to_path_buf()))
+        }
+        Agent::Devin => {
+            support::database(
+                &root.join("sessions.db"),
+                include_str!("fixtures/devin-sessions.sql"),
+            );
+            Box::new(DevinAdapter::new(root.join("sessions.db")))
+        }
+        Agent::Copilot => Box::new(CopilotAdapter::new(root.to_path_buf())),
+        Agent::Grok => Box::new(GrokAdapter::new(root.to_path_buf())),
+        Agent::Openhands => Box::new(OpenhandsAdapter::new(root.to_path_buf())),
+        Agent::Vibe => Box::new(VibeAdapter::new(root.to_path_buf())),
+        Agent::Qwen => Box::new(QwenAdapter::new(root.to_path_buf())),
+        Agent::Kimi => Box::new(KimiAdapter::new(root.to_path_buf())),
+        Agent::Dsh => Box::new(DshAdapter::new(root.to_path_buf())),
+        Agent::Muse => Box::new(MuseAdapter::new(root.to_path_buf())),
+        Agent::Antigravity => Box::new(AntigravityAdapter::new(root.to_path_buf())),
+        Agent::Cursor => Box::new(CursorAdapter::new(root.to_path_buf())),
+        // Tests cannot assume their CLIs are installed; src/opencode/tests.rs round-trips their formats
+        Agent::Opencode | Agent::Kilo => return None,
+        // Baton only reads these agents
+        Agent::AntigravityDesktop | Agent::AntigravityIde | Agent::CursorIde | Agent::Paseo => {
+            return None;
+        }
+    })
+}
 
 fn sample(blobs: &Blobs) -> Vec<Event> {
     let image = Image {
@@ -94,78 +134,64 @@ fn seeded_exports_have_the_same_native_id_and_path_in_fresh_stores() {
         events: &replayed,
         seed: Some(uuid::Uuid::parse_str("12345678-1234-5678-9234-567812345678").unwrap()),
     };
-    let adapters = |root: &Path| -> Vec<(&str, Box<dyn Adapter>)> {
-        support::database(
-            &root.join("hermes/state.db"),
-            include_str!("fixtures/hermes-state.sql"),
-        );
-        support::database(
-            &root.join("devin/sessions.db"),
-            include_str!("fixtures/devin-sessions.sql"),
-        );
-        vec![
-            ("pi", Box::new(PiAdapter::new(Agent::Pi, root.join("pi")))),
-            (
-                "omp",
-                Box::new(PiAdapter::new(Agent::Omp, root.join("omp"))),
-            ),
-            ("claude", Box::new(ClaudeAdapter::new(root.join("claude")))),
-            ("codex", Box::new(CodexAdapter::new(root.join("codex")))),
-            ("hermes", Box::new(HermesAdapter::new(root.join("hermes")))),
-            (
-                "mastracode",
-                Box::new(MastracodeAdapter::new(root.join("mastracode/mastra.db"))),
-            ),
-            (
-                "devin",
-                Box::new(DevinAdapter::new(root.join("devin/sessions.db"))),
-            ),
-            (
-                "copilot",
-                Box::new(CopilotAdapter::new(root.join("copilot"))),
-            ),
-            ("grok", Box::new(GrokAdapter::new(root.join("grok")))),
-            (
-                "openhands",
-                Box::new(OpenhandsAdapter::new(root.join("openhands"))),
-            ),
-            ("vibe", Box::new(VibeAdapter::new(root.join("vibe")))),
-            ("qwen", Box::new(QwenAdapter::new(root.join("qwen")))),
-            ("kimi", Box::new(KimiAdapter::new(root.join("kimi")))),
-            ("dsh", Box::new(DshAdapter::new(root.join("dsh")))),
-            ("muse", Box::new(MuseAdapter::new(root.join("muse")))),
-            (
-                "antigravity",
-                Box::new(AntigravityAdapter::new(root.join("antigravity"))),
-            ),
-            ("cursor", Box::new(CursorAdapter::new(root.join("cursor")))),
-        ]
-    };
     let first_root = dir.path().join("first");
     let second_root = dir.path().join("second");
-    for ((name, first), (_, second)) in adapters(&first_root)
-        .into_iter()
-        .zip(adapters(&second_root))
-    {
+    for agent in Agent::ALL {
+        let Some(first) = writable_adapter(agent, &first_root.join(agent.name())) else {
+            continue;
+        };
+        let second = writable_adapter(agent, &second_root.join(agent.name())).unwrap();
         let first = first.write(&export, &blobs).unwrap();
         let second = second.write(&export, &blobs).unwrap();
-        assert_eq!(first.id, second.id, "{name}");
+        assert_eq!(first.id, second.id, "{agent}");
         assert_eq!(
             first.path.strip_prefix(&first_root).unwrap(),
             second.path.strip_prefix(&second_root).unwrap(),
-            "{name}"
+            "{agent}"
         );
     }
 }
 
 #[test]
-fn pi_round_trips_exactly() {
+fn every_writable_agent_reads_back_what_it_wrote() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let back = round_trip(&PiAdapter::new(Agent::Pi, dir.path().join("pi")), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
+    for agent in Agent::ALL {
+        let Some(adapter) = writable_adapter(agent, &dir.path().join(agent.name())) else {
+            continue;
+        };
+        let back = round_trip(adapter.as_ref(), &blobs);
+        let keeps_error_flags = !matches!(agent, Agent::Codex | Agent::Hermes);
+        let keeps_title = !matches!(agent, Agent::Openhands | Agent::Muse);
+        let keeps_cwd = !matches!(agent, Agent::Openhands);
+        if keeps_error_flags {
+            assert_eq!(back.read, back.expected, "{agent}");
+        } else {
+            assert_eq!(
+                replay::digest(&back.read),
+                replay::digest(&back.expected),
+                "{agent}"
+            );
+            assert_eq!(back.read.len(), back.expected.len(), "{agent}");
+        }
+        assert_eq!(
+            back.title.as_deref(),
+            keeps_title.then_some("Round trip"),
+            "{agent}"
+        );
+        assert_eq!(
+            back.cwd.as_deref(),
+            keeps_cwd.then_some("/work/demo"),
+            "{agent}"
+        );
+    }
+}
+
+#[test]
+fn pi_buckets_sessions_by_the_escaped_project_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    round_trip(&PiAdapter::new(Agent::Pi, dir.path().join("pi")), &blobs);
     assert!(
         dir.path().join("pi/sessions/--work-demo--").is_dir(),
         "pi buckets sessions by the escaped project path"
@@ -173,13 +199,11 @@ fn pi_round_trips_exactly() {
 }
 
 #[test]
-fn omp_round_trips_exactly_with_a_title_slot_and_blob_files() {
+fn omp_writes_a_title_slot_and_blob_files_without_pi_claiming_its_journal() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("omp");
     let back = round_trip(&PiAdapter::new(Agent::Omp, root.clone()), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
     let text = fs::read_to_string(&back.file).unwrap();
     assert_eq!(
         text.find('\n'),
@@ -201,14 +225,11 @@ fn omp_round_trips_exactly_with_a_title_slot_and_blob_files() {
 }
 
 #[test]
-fn claude_round_trips_exactly() {
+fn claude_names_project_directories_after_the_dashed_path() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("claude");
-    let back = round_trip(&ClaudeAdapter::new(root.clone()), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
+    round_trip(&ClaudeAdapter::new(root.clone()), &blobs);
     assert!(
         root.join("projects/-work-demo").is_dir(),
         "Claude Code names project directories after the dashed path"
@@ -216,7 +237,7 @@ fn claude_round_trips_exactly() {
 }
 
 #[test]
-fn codex_round_trips_everything_but_tool_error_flags() {
+fn codex_writes_the_configured_provider_and_indexes_the_title() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("codex");
@@ -230,10 +251,6 @@ fn codex_round_trips_everything_but_tool_error_flags() {
         rollout.contains(r#""model_provider":"custom""#),
         "Codex only resumes rollouts of the configured provider"
     );
-    assert_eq!(replay::digest(&back.read), replay::digest(&back.expected));
-    assert_eq!(back.read.len(), back.expected.len());
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
     let index = fs::read_to_string(root.join("session_index.jsonl")).unwrap();
     assert!(
         index.contains("Round trip"),
@@ -266,18 +283,14 @@ fn codex_recreates_a_lost_seeded_rollout_without_reindexing_its_title() {
 }
 
 #[test]
-fn hermes_round_trips_everything_but_tool_error_flags_and_replays_from_the_last_summary() {
+fn hermes_replays_from_the_last_summary() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let home = dir.path().join("hermes");
     let db = home.join("state.db");
     support::database(&db, include_str!("fixtures/hermes-state.sql"));
     let adapter = HermesAdapter::new(home);
-    let back = round_trip(&adapter, &blobs);
-    assert_eq!(replay::digest(&back.read), replay::digest(&back.expected));
-    assert_eq!(back.read.len(), back.expected.len());
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
+    round_trip(&adapter, &blobs);
     let connection = Connection::open(&db).unwrap();
     let mut statement = connection
         .prepare("SELECT content FROM messages WHERE active = 1 ORDER BY id")
@@ -318,14 +331,11 @@ fn hermes_leaves_out_a_title_another_session_holds() {
 }
 
 #[test]
-fn mastracode_round_trips_exactly_into_a_database_it_creates() {
+fn mastracode_files_threads_under_the_project_resource_id() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let db = dir.path().join("mastracode/mastra.db");
-    let back = round_trip(&MastracodeAdapter::new(db.clone()), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
+    round_trip(&MastracodeAdapter::new(db.clone()), &blobs);
     let connection = Connection::open(&db).unwrap();
     let resource: String = connection
         .query_row("SELECT \"resourceId\" FROM mastra_threads", [], |row| {
@@ -345,15 +355,12 @@ fn mastracode_round_trips_exactly_into_a_database_it_creates() {
 }
 
 #[test]
-fn devin_round_trips_exactly() {
+fn devin_indexes_user_input_and_replies_for_search() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let db = dir.path().join("devin/sessions.db");
     support::database(&db, include_str!("fixtures/devin-sessions.sql"));
-    let back = round_trip(&DevinAdapter::new(db.clone()), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
+    round_trip(&DevinAdapter::new(db.clone()), &blobs);
     let connection = Connection::open(&db).unwrap();
     let searchable: i64 = connection
         .query_row("SELECT count(*) FROM message_search", [], |row| row.get(0))
@@ -365,13 +372,10 @@ fn devin_round_trips_exactly() {
 }
 
 #[test]
-fn copilot_round_trips_exactly_with_the_title_in_its_workspace_file() {
+fn copilot_writes_the_title_in_its_workspace_file() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let back = round_trip(&CopilotAdapter::new(dir.path().join("copilot")), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
     let workspace = fs::read_to_string(back.file.with_file_name("workspace.yaml")).unwrap();
     assert!(
         workspace.contains("name: \"Round trip\"\nuser_named: true\n"),
@@ -380,14 +384,11 @@ fn copilot_round_trips_exactly_with_the_title_in_its_workspace_file() {
 }
 
 #[test]
-fn grok_round_trips_exactly_under_its_encoded_working_directory() {
+fn grok_buckets_sessions_by_the_encoded_working_directory() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("grok");
-    let back = round_trip(&GrokAdapter::new(root.clone()), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
+    round_trip(&GrokAdapter::new(root.clone()), &blobs);
     assert!(
         root.join("sessions/%2Fwork%2Fdemo").is_dir(),
         "Grok buckets sessions by the percent-encoded working directory"
@@ -395,15 +396,13 @@ fn grok_round_trips_exactly_under_its_encoded_working_directory() {
 }
 
 #[test]
-fn openhands_round_trips_exactly_without_a_title() {
+fn openhands_writes_a_system_prompt_and_naive_local_timestamps() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let back = round_trip(
         &OpenhandsAdapter::new(dir.path().join("conversations")),
         &blobs,
     );
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title, None, "OpenHands stores no title");
     let first = fs::read_dir(back.file.join("events"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -421,13 +420,10 @@ fn openhands_round_trips_exactly_without_a_title() {
 }
 
 #[test]
-fn vibe_round_trips_exactly_with_its_message_count() {
+fn vibe_writes_the_message_count_in_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let back = round_trip(&VibeAdapter::new(dir.path().join("vibe")), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
     let lines = fs::read_to_string(&back.file).unwrap().lines().count();
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(back.file.with_file_name("meta.json")).unwrap())
@@ -477,14 +473,11 @@ fn vibe_answers_calls_whose_results_come_later_with_lines_it_reads_past() {
 }
 
 #[test]
-fn qwen_round_trips_exactly() {
+fn qwen_names_project_directories_after_the_dashed_path() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("qwen");
-    let back = round_trip(&QwenAdapter::new(root.clone()), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
+    round_trip(&QwenAdapter::new(root.clone()), &blobs);
     assert!(
         root.join("projects/-work-demo/chats").is_dir(),
         "Qwen Code names project directories after the dashed path"
@@ -492,13 +485,10 @@ fn qwen_round_trips_exactly() {
 }
 
 #[test]
-fn kimi_round_trips_exactly_and_resumes_from_the_last_summary() {
+fn kimi_records_the_count_replaced_by_the_last_summary() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let back = round_trip(&KimiAdapter::new(dir.path().join("kimi")), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
     let wire = fs::read_to_string(&back.file).unwrap();
     assert!(
         wire.contains(r#""compactedCount":6"#),
@@ -507,14 +497,11 @@ fn kimi_round_trips_exactly_and_resumes_from_the_last_summary() {
 }
 
 #[test]
-fn dsh_round_trips_exactly() {
+fn dsh_writes_its_session_file_in_the_project_bucket() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("dsh");
     let back = round_trip(&DshAdapter::new(root.clone()), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
     assert_eq!(back.file.file_name().unwrap(), "session.v4.jsonl.zstd");
     assert_eq!(
         back.file.parent().and_then(|dir| dir.parent()),
@@ -523,12 +510,10 @@ fn dsh_round_trips_exactly() {
 }
 
 #[test]
-fn muse_round_trips_exactly() {
+fn muse_writes_gapless_sequence_numbers() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let back = round_trip(&MuseAdapter::new(dir.path().join("muse")), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
     let log = fs::read_to_string(&back.file).unwrap();
     let sequences: Vec<u64> = log
         .lines()
@@ -546,14 +531,11 @@ fn muse_round_trips_exactly() {
 }
 
 #[test]
-fn antigravity_round_trips_exactly_and_lists_the_conversation() {
+fn antigravity_lists_the_conversation_in_its_summary_database() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("antigravity-cli");
-    let back = round_trip(&AntigravityAdapter::new(root.clone()), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
+    round_trip(&AntigravityAdapter::new(root.clone()), &blobs);
     let summaries = Connection::open(root.join("conversation_summaries.db")).unwrap();
     let (steps, uris): (i64, String) = summaries
         .query_row(
@@ -567,14 +549,11 @@ fn antigravity_round_trips_exactly_and_lists_the_conversation() {
 }
 
 #[test]
-fn cursor_round_trips_exactly_into_the_bucket_of_its_directory() {
+fn cursor_buckets_chats_by_the_md5_of_their_directory() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("cursor");
     let back = round_trip(&CursorAdapter::new(root.clone()), &blobs);
-    assert_eq!(back.read, back.expected);
-    assert_eq!(back.title.as_deref(), Some("Round trip"));
-    assert_eq!(back.cwd.as_deref(), Some("/work/demo"));
     assert_eq!(
         back.file.parent().and_then(|dir| dir.parent()),
         Some(

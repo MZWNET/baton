@@ -40,14 +40,14 @@ pub(crate) fn run(baton: &mut Baton, agent: Option<Agent>, path: Option<&Path>) 
 }
 
 pub(crate) fn import_sessions(
-    baton: &mut Baton,
+    baton: &Baton,
     source: &dyn Source,
     sessions: &[NativeSession],
     tally: &mut Tally,
 ) {
-    for native in sessions {
+    for (native, outcome) in sessions.iter().zip(baton.import_all(source, sessions)) {
         let reference = format!("{}:{}", source.agent(), native.id);
-        match baton.import(source, native) {
+        match outcome {
             Ok(ImportOutcome::Created { session }) => {
                 tally.created += 1;
                 println!("new     {session}  {reference}");
@@ -70,7 +70,7 @@ pub(crate) fn import_sessions(
     }
 }
 
-pub(crate) fn finish(baton: &mut Baton, tally: &Tally) -> Result<()> {
+pub(crate) fn finish(baton: &Baton, tally: &Tally) -> Result<()> {
     baton.backfill_projects()?;
     println!(
         "{} new, {} updated, {} forked, {} unchanged",

@@ -1,6 +1,6 @@
-mod mastracode_adapter;
-mod message_parser;
-mod message_writer;
+mod adapter;
+mod parser;
 mod project;
+mod writer;
 
-pub use mastracode_adapter::MastracodeAdapter;
+pub use adapter::MastracodeAdapter;

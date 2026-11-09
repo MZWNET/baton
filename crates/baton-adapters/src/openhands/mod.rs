@@ -1,5 +1,5 @@
-mod event_parser;
-mod event_writer;
-mod openhands_adapter;
+mod adapter;
+mod parser;
+mod writer;
 
-pub use openhands_adapter::OpenhandsAdapter;
+pub use adapter::OpenhandsAdapter;

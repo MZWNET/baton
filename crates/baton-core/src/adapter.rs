@@ -109,7 +109,9 @@ pub struct Export<'a> {
 }
 
 /// Reads the sessions of one agent.
-pub trait Source {
+///
+/// `discover` and `read` may run on several threads at once.
+pub trait Source: Send + Sync {
     /// The agent this source handles.
     fn agent(&self) -> Agent;
 
@@ -126,6 +128,8 @@ pub trait Source {
 }
 
 /// Reads and writes the sessions of one agent.
+///
+/// `write` and `remove` may run on several threads at once for different sessions, so an adapter guards what its sessions share.
 ///
 /// Reading has to preserve whatever writing produced: reading a written session must give back the written events, as compared by [`replay::digest`](crate::replay::digest), so that a session continued in an agent can flow back into the unified session it was exported from.
 pub trait Adapter: Source {

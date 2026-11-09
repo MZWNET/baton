@@ -3,10 +3,24 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::{env, fs};
 
 use serde::{Deserialize, Serialize};
+
+// Each key is computed once and outside the map's lock, so threads compute different keys at once
+type Cache<T> = LazyLock<Mutex<HashMap<PathBuf, Arc<OnceLock<T>>>>>;
+
+fn cached<T: Clone>(cache: &Cache<T>, key: &Path, compute: impl FnOnce() -> T) -> T {
+    let cell = cache
+        .lock()
+        .unwrap()
+        .entry(key.to_path_buf())
+        .or_default()
+        .clone();
+
+    cell.get_or_init(compute).clone()
+}
 
 /// The repository identity and the session directory relative to its root.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,38 +88,28 @@ fn inspect(cwd: &Path) -> Option<Project> {
         .ok()?
         .to_string_lossy()
         .into_owned();
-    static REPOSITORIES: LazyLock<Mutex<HashMap<PathBuf, Repository>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    let mut repositories = REPOSITORIES.lock().unwrap();
-    let Repository { remote, root } = repositories
-        .entry(top.clone())
-        .or_insert_with(|| {
-            let remotes = git(&top, &["remote"]).unwrap_or_default();
-            let remote = remotes
-                .lines()
-                .find(|name| *name == "origin")
-                .or_else(|| remotes.lines().min());
-            let remote = remote
-                .and_then(|name| git(&top, &["remote", "get-url", name]))
-                .and_then(|url| normalize_remote(&url));
-            let root = git(&top, &["rev-list", "--max-parents=0", "HEAD"])
-                .and_then(|roots| roots.lines().min().map(str::to_owned));
-            Repository { remote, root }
-        })
-        .clone();
+    static REPOSITORIES: Cache<Repository> = LazyLock::new(Default::default);
+    let Repository { remote, root } = cached(&REPOSITORIES, &top, || {
+        let remotes = git(&top, &["remote"]).unwrap_or_default();
+        let remote = remotes
+            .lines()
+            .find(|name| *name == "origin")
+            .or_else(|| remotes.lines().min());
+        let remote = remote
+            .and_then(|name| git(&top, &["remote", "get-url", name]))
+            .and_then(|url| normalize_remote(&url));
+        let root = git(&top, &["rev-list", "--max-parents=0", "HEAD"])
+            .and_then(|roots| roots.lines().min().map(str::to_owned));
+        Repository { remote, root }
+    });
 
     Some(Project { remote, root, path })
 }
 
 /// Identifies a local working directory, caching the result for this process.
 pub fn identify(cwd: &Path) -> Option<Project> {
-    static CACHE: LazyLock<Mutex<HashMap<PathBuf, Option<Project>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    let mut cache = CACHE.lock().unwrap();
-    cache
-        .entry(cwd.to_path_buf())
-        .or_insert_with(|| inspect(cwd))
-        .clone()
+    static CACHE: Cache<Option<Project>> = LazyLock::new(Default::default);
+    cached(&CACHE, cwd, || inspect(cwd))
 }
 
 fn same_repository(a: &Project, b: &Project) -> bool {

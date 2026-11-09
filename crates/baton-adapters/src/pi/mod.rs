@@ -1,5 +1,5 @@
-mod journal_parser;
-mod journal_writer;
-mod pi_adapter;
+mod adapter;
+mod parser;
+mod writer;
 
-pub use pi_adapter::PiAdapter;
+pub use adapter::PiAdapter;

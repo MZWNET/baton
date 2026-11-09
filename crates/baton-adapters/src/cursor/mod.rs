@@ -1,10 +1,9 @@
-mod bubble_parser;
-mod cursor_adapter;
-mod graph_parser;
-mod graph_writer;
+mod adapter;
 mod ide_adapter;
+mod parser;
 #[cfg(test)]
 mod tests;
+mod writer;
 
-pub use cursor_adapter::CursorAdapter;
+pub use adapter::CursorAdapter;
 pub use ide_adapter::CursorIdeAdapter;

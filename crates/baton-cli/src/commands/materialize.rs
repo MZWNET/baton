@@ -66,19 +66,17 @@ fn materialize_paseo(baton: &mut Baton) -> Result<()> {
     for (provider, ids) in groups {
         let adapter = baton_adapters::adapter(provider)?;
         let natives = adapter.discover(None)?;
-        for native in &natives {
-            if let Err(error) = baton.import(adapter.as_ref(), native) {
+        for (native, outcome) in natives
+            .iter()
+            .zip(baton.import_all(adapter.as_ref(), &natives))
+        {
+            if let Err(error) = outcome {
                 eprintln!("baton: {}:{}: {error:#}", adapter.agent(), native.id);
             }
         }
         baton.refresh()?;
         let result = baton.materialize(adapter.as_ref(), &natives, Some(&ids))?;
-        summary.exported += result.exported;
-        summary.refreshed += result.refreshed;
-        summary.removed += result.removed;
-        summary.up_to_date += result.up_to_date;
-        summary.skipped += result.skipped;
-        summary.warnings.extend(result.warnings);
+        summary += result;
         baton.refresh()?;
         if !available {
             continue;
