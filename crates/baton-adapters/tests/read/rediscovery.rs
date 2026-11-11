@@ -5,6 +5,7 @@ use crate::support;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::path::Path;
 
 use base64::Engine;
@@ -339,16 +340,17 @@ fn opencode_cli_fake() {
     );
     let db = std::path::PathBuf::from(std::env::var_os("OPENCODE_DB").unwrap());
     assert_eq!(std::env::var_os("KILO_DB").unwrap(), db.as_os_str());
-    let root = std::env::var_os("BATON_STAMP_TEST_ROOT").unwrap();
+    // macOS temp directories use a /var symlink that the adapter resolves
+    let db = db.canonicalize().unwrap();
+    let root = Path::new(&std::env::var_os("BATON_STAMP_TEST_ROOT").unwrap())
+        .canonicalize()
+        .unwrap();
     assert!(db.starts_with(&root));
-    let direct = Path::new(&root)
-        .join("data")
-        .join(&name)
-        .join(format!("{name}.db"));
+    let direct = root.join("data").join(&name).join(format!("{name}.db"));
     if db == direct {
         assert_eq!(
             std::env::var_os("XDG_DATA_HOME").unwrap(),
-            Path::new(&root).join("data").as_os_str()
+            root.join("data").as_os_str()
         );
     }
     let connection = Connection::open(db).unwrap();

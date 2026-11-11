@@ -5,19 +5,10 @@ use crate::support;
 use std::fs;
 use std::path::Path;
 
-use baton_adapters::{CodexAdapter, CopilotAdapter, CursorAdapter, GrokAdapter, OpenhandsAdapter};
+use baton_adapters::CodexAdapter;
+#[cfg(unix)]
+use baton_adapters::{CopilotAdapter, CursorAdapter, GrokAdapter, OpenhandsAdapter};
 use baton_core::{Adapter, Agent, Blobs, Event, Export, Source, replay};
-
-fn adapter(name: &str, root: &Path) -> Box<dyn Adapter> {
-    match name {
-        "copilot" => Box::new(CopilotAdapter::new(root.to_path_buf())),
-        "cursor" => Box::new(CursorAdapter::new(root.to_path_buf())),
-        "grok" => Box::new(GrokAdapter::new(root.to_path_buf())),
-        "codex" => Box::new(CodexAdapter::new(root.to_path_buf())),
-        "openhands" => Box::new(OpenhandsAdapter::new(root.to_path_buf())),
-        _ => unreachable!(),
-    }
-}
 
 fn with_export(f: impl FnOnce(&Export<'_>, &Blobs)) {
     let dir = tempfile::tempdir().unwrap();
@@ -156,6 +147,17 @@ fn codex_preserves_existing_rollout_on_collision() {
 #[cfg(unix)]
 #[test]
 fn directories_are_cleaned_after_write_failure_and_seed_can_be_retried() {
+    fn adapter(name: &str, root: &Path) -> Box<dyn Adapter> {
+        match name {
+            "copilot" => Box::new(CopilotAdapter::new(root.to_path_buf())),
+            "cursor" => Box::new(CursorAdapter::new(root.to_path_buf())),
+            "grok" => Box::new(GrokAdapter::new(root.to_path_buf())),
+            "codex" => Box::new(CodexAdapter::new(root.to_path_buf())),
+            "openhands" => Box::new(OpenhandsAdapter::new(root.to_path_buf())),
+            _ => unreachable!(),
+        }
+    }
+
     if let Some(name) = std::env::var_os("BATON_PUBLICATION_FAILURE_AGENT") {
         let root = std::env::var_os("BATON_PUBLICATION_FAILURE_ROOT").unwrap();
         with_export(|export, blobs| {

@@ -162,8 +162,10 @@ fn seeded_exports_have_the_same_native_id_and_path_in_fresh_stores() {
         events: &replayed,
         seed: Some(uuid::Uuid::parse_str("12345678-1234-5678-9234-567812345678").unwrap()),
     };
-    let first_root = dir.path().join("first");
-    let second_root = dir.path().join("second");
+    // RikkaHub canonicalizes its backup path, and macOS temp directories sit behind a /var symlink
+    let root = dir.path().canonicalize().unwrap();
+    let first_root = root.join("first");
+    let second_root = root.join("second");
     for agent in Agent::ALL {
         let Some(first) = writable_adapter(agent, &first_root.join(agent.name())) else {
             continue;
