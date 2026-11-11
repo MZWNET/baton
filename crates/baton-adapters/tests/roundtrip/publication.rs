@@ -96,11 +96,12 @@ fn codex_removal_waits_for_native_index_writer() {
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
         let other = "{\"id\":\"other\",\"thread_name\":\"preserved\"}\n";
-        let mut index = fs::OpenOptions::new()
+        fs::OpenOptions::new()
             .append(true)
             .open(root.join("session_index.jsonl"))
+            .unwrap()
+            .write_all(other.as_bytes())
             .unwrap();
-        index.write_all(other.as_bytes()).unwrap();
         drop(lock);
         done_rx
             .recv_timeout(Duration::from_secs(5))
