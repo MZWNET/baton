@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use baton_core::{
     Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp, journal,
 };
@@ -109,9 +109,7 @@ impl Adapter for CopilotAdapter {
         writer.push_events(export.events)?;
         let dir = self.root.join("session-state").join(&id);
         fs::create_dir_all(self.root.join("session-state"))?;
-        fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let events = dir.join("events.jsonl");
-        files::create_new(&events, writer.finish().as_bytes())?;
         let updated = export
             .events
             .last()
@@ -129,13 +127,17 @@ impl Adapter for CopilotAdapter {
         fields.push(("summary_count", json!(0)));
         fields.push(("created_at", json!(export.created)));
         fields.push(("updated_at", json!(updated)));
-        files::create_new(
-            &dir.join("workspace.yaml"),
-            workspace::render(&fields).as_bytes(),
-        )?;
+        let stamp = files::create_dir_with(&dir, || {
+            files::create_new(
+                &dir.join("workspace.yaml"),
+                workspace::render(&fields).as_bytes(),
+            )?;
+            files::create_new(&events, writer.finish().as_bytes())?;
+            Stamp::of(&events)
+        })?;
         Ok(NativeSession {
             id,
-            stamp: Stamp::of(&events)?,
+            stamp,
             path: events,
             title: None,
         })

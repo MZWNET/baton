@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use baton_core::{Agent, Blobs, Cursor, Info, NativeRead, NativeSession, Progress, Source};
+use baton_core::{Agent, Blobs, Cursor, Info, NativeRead, NativeSession, Progress, Source, Stamp};
 use rusqlite::OptionalExtension;
 
 use crate::antigravity::parser;
@@ -29,7 +29,7 @@ impl AntigravityDesktopAdapter {
         Ok(files::home()?.join(".gemini").join("antigravity"))
     }
 
-    // The app rewrites its cache whole, so a corrupt or missing one only costs the titles
+    // The app rewrites its cache whole, so it may be temporarily missing or incomplete
     fn summaries(root: &Path) -> HashMap<String, Summary> {
         let bytes = fs::read(root.join("agyhub_summaries_proto.pb")).unwrap_or_default();
         summary::entries(&bytes)
@@ -101,13 +101,23 @@ impl Source for AntigravityDesktopAdapter {
     fn discover(&self, path: Option<&Path>) -> Result<Vec<NativeSession>> {
         let (root, dbs) = parser::databases(&self.root, path)?;
         let summaries = AntigravityDesktopAdapter::summaries(root);
+        let summary_file = root.join("agyhub_summaries_proto.pb");
+        let summary_stamp = summary_file
+            .is_file()
+            .then(|| Stamp::of(&summary_file))
+            .transpose()?;
         let mut sessions = Vec::new();
         for (db, id) in dbs {
             if !listed(root, &db, &id)? {
                 continue;
             }
+            let mut stamp = sqlite::stamp(&db)?;
+            if let Some(summary) = summary_stamp {
+                stamp.size = stamp.size.wrapping_add(summary.size);
+                stamp.mtime = stamp.mtime.wrapping_add(summary.mtime);
+            }
             sessions.push(NativeSession {
-                stamp: sqlite::stamp(&db)?,
+                stamp,
                 title: summaries.get(&id).and_then(|summary| summary.title.clone()),
                 path: db,
                 id,

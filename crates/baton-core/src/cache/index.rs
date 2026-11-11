@@ -13,7 +13,7 @@ use crate::project::{identify, matches};
 use crate::storage::record_order;
 use crate::{Agent, Direction, Link, Project, SessionMeta, Store};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 9;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -22,7 +22,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     project_remote TEXT,
     project_root TEXT,
     project_path TEXT,
-    created TEXT NOT NULL,
     updated TEXT NOT NULL,
     events INTEGER NOT NULL,
     alternate_branches INTEGER NOT NULL,
@@ -491,7 +490,7 @@ fn apply(transaction: &rusqlite::Transaction<'_>, loaded: Loaded) -> Result<()> 
         remove_session(transaction, &id)?;
     }
     if new_session {
-        transaction.prepare_cached("INSERT INTO sessions (id, created, updated, events, alternate_branches, replayable) VALUES (?1, '', '', 0, 0, 0)")?.execute([&id])?;
+        transaction.prepare_cached("INSERT INTO sessions (id, updated, events, alternate_branches, replayable) VALUES (?1, '', 0, 0, 0)")?.execute([&id])?;
     }
     let events_changed = new_session || !loaded.segments.is_empty();
     for (name, events) in loaded.segments {
@@ -522,7 +521,6 @@ fn apply(transaction: &rusqlite::Transaction<'_>, loaded: Loaded) -> Result<()> 
     if events_changed {
         transaction.prepare_cached(
             "UPDATE sessions SET
-                    created = COALESCE((SELECT MIN(ts) FROM events WHERE session = ?1), ''),
                     updated = COALESCE((SELECT MAX(ts) FROM events WHERE session = ?1), ''),
                     events = (SELECT COUNT(*) FROM events WHERE session = ?1),
                     alternate_branches = (SELECT COUNT(*) > 1 FROM events e WHERE e.session = ?1 AND NOT EXISTS (SELECT 1 FROM events child WHERE child.session = e.session AND child.parent = e.id)),

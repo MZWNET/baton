@@ -52,11 +52,13 @@ pub enum Agent {
     CursorIde,
     /// [Paseo](https://github.com/getpaseo/paseo), which registers sessions from other agents.
     Paseo,
+    /// [RikkaHub](https://github.com/rikkahub/rikkahub), an Android app whose backups baton reads conversations from and adds them to
+    Rikkahub,
 }
 
 impl Agent {
     /// Every supported agent, in the order imports visit them.
-    pub const ALL: [Agent; 23] = [
+    pub const ALL: [Agent; 24] = [
         Agent::Pi,
         Agent::Omp,
         Agent::Claude,
@@ -80,6 +82,7 @@ impl Agent {
         Agent::Dsh,
         Agent::CursorIde,
         Agent::Paseo,
+        Agent::Rikkahub,
     ];
 
     /// The name used on the command line, in `agent:native_id` references and in stored events.
@@ -108,6 +111,7 @@ impl Agent {
             Agent::Dsh => "dsh",
             Agent::CursorIde => "cursor-ide",
             Agent::Paseo => "paseo",
+            Agent::Rikkahub => "rikkahub",
         }
     }
 }

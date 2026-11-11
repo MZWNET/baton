@@ -7,43 +7,52 @@ use baton_adapters::Paseo;
 use baton_core::{Agent, Baton};
 
 use super::export;
+use crate::resolve;
 
 // Takes the store by value so its lock is released before the agent starts
 pub(crate) fn run(
-    mut baton: Baton,
+    baton: Baton,
     query: &str,
     agent: Agent,
     provider: Option<Agent>,
     cwd: Option<&Path>,
 ) -> Result<()> {
-    let export::ExportedSession {
-        session,
-        provider,
-        adapter,
-        exported,
-    } = export::export_session(&mut baton, query, agent, provider, cwd)?;
-    if let Some(provider) = provider {
-        let paseo = Paseo::new(Paseo::default_home()?);
-        if !paseo.available() {
-            bail!("paseo daemon is not running; cannot open a Paseo agent");
-        }
-        let title = baton.store.load(&session)?.meta.title;
-        let mut registrations = export::discover_registrations(&paseo)?;
-        let id = export::register(
-            &baton,
-            &paseo,
-            &mut registrations,
-            &session,
-            provider,
-            &exported,
-            title.as_deref(),
-        )?;
-        drop(baton);
-
-        return Err(hand_over(paseo.open_command(&id))).context("starting paseo");
+    if agent == Agent::Rikkahub {
+        bail!(
+            "RikkaHub runs on Android: add the session to a backup with `baton export --to rikkahub --backup <file>` and restore that backup in the app"
+        );
     }
+    let (provider, adapter) = export::destination(agent, provider, None)?;
+    // Only a running daemon opens the agent, so without one nothing is exported
+    let paseo = match provider {
+        Some(provider) => {
+            let paseo = Paseo::new(Paseo::default_home()?);
+            if !paseo.available() {
+                bail!("paseo daemon is not running; cannot open a Paseo agent");
+            }
+            let registrations = paseo.discover()?;
+            Some((provider, paseo, registrations))
+        }
+        None => None,
+    };
+    let session = resolve::session_id(&baton, query)?;
+    let exported = baton.export(&session, adapter.as_ref(), cwd)?;
+    let command = match paseo {
+        Some((provider, paseo, registrations)) => {
+            let session = baton.store.load(&session)?;
+            let id = export::register(
+                &baton,
+                &paseo,
+                &registrations,
+                &session.meta,
+                provider,
+                &exported,
+            )?;
+            paseo.open_command(&id)
+        }
+        None => adapter.resume_command(&exported.native, &exported.cwd),
+    };
     drop(baton);
-    let command = adapter.resume_command(&exported.native, &exported.cwd);
 
     Err(hand_over(command)).with_context(|| format!("starting {agent}"))
 }

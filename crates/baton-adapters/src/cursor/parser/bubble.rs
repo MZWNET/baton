@@ -1,7 +1,7 @@
 // Editor chats from before the agent graph keep each message as a JSON bubble, in the order their composer lists them
 
 use anyhow::Result;
-use baton_core::{Body, Draft, Thinking, ToolCall, ToolResult};
+use baton_core::{Body, Draft, Thinking, ToolCall, ToolResult, portable_call_id};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
@@ -45,7 +45,7 @@ pub(in crate::cursor) fn read(
         } else {
             &header["type"]
         };
-        for body in bodies(kind.as_i64(), &bubble) {
+        for body in bodies(kind.as_i64(), &bubble, id) {
             drafts.push(Draft {
                 timestamp: clock.clone(),
                 native_entry_id: Some(id.to_owned()),
@@ -56,7 +56,7 @@ pub(in crate::cursor) fn read(
     Ok(drafts)
 }
 
-fn bodies(kind: Option<i64>, bubble: &Value) -> Vec<Body> {
+fn bodies(kind: Option<i64>, bubble: &Value, bubble_id: &str) -> Vec<Body> {
     let text = bubble["text"].as_str().unwrap_or_default();
     match kind {
         Some(HUMAN) => normalize::user(Content {
@@ -77,7 +77,7 @@ fn bodies(kind: Option<i64>, bubble: &Value) -> Vec<Body> {
             bodies.extend(normalize::assistant(text));
             let tool = &bubble["toolFormerData"];
             if tool.is_object() {
-                bodies.extend(tool_use(tool));
+                bodies.extend(tool_use(tool, bubble_id));
             }
             bodies
         }
@@ -86,8 +86,13 @@ fn bodies(kind: Option<i64>, bubble: &Value) -> Vec<Body> {
 }
 
 // A tool the assistant used, with its result once there is one; arguments and results are often JSON in strings
-fn tool_use(tool: &Value) -> Vec<Body> {
-    let call_id = normalize::call_id(&tool["toolCallId"]);
+fn tool_use(tool: &Value, bubble_id: &str) -> Vec<Body> {
+    // A bubble holds both sides of an id-less tool invocation
+    let id = tool["toolCallId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(bubble_id);
+    let call_id = portable_call_id(id);
     let arguments = if tool["params"].is_null() {
         &tool["rawArgs"]
     } else {
@@ -117,4 +122,47 @@ fn tool_use(tool: &Value) -> Vec<Body> {
         }));
     }
     bodies
+}
+
+#[cfg(test)]
+mod tests {
+    use baton_core::Body;
+    use rusqlite::{Connection, params};
+    use serde_json::json;
+
+    #[test]
+    fn tools_without_ids_pair_with_the_result_in_their_own_bubble() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+            )
+            .unwrap();
+        let mut headers = Vec::new();
+        for (bubble, name) in [("t1", "read_file"), ("t2", "list_dir")] {
+            let value = json!({"type": 2, "toolFormerData": {"name": name, "status": "completed", "params": "{}", "result": format!("from {name}")}});
+            connection
+                .execute(
+                    "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                    params![format!("bubbleId:composer:{bubble}"), value.to_string()],
+                )
+                .unwrap();
+            headers.push(json!({"bubbleId": bubble, "type": 2}));
+        }
+        let data = json!({"fullConversationHeadersOnly": headers});
+        let drafts =
+            super::read(&connection, "composer", &data, "2026-01-01T00:00:00.000Z").unwrap();
+        let ids: Vec<&str> = drafts
+            .iter()
+            .filter_map(|draft| match &draft.body {
+                Body::ToolCall(call) => Some(call.call_id.as_str()),
+                Body::ToolResult(result) => Some(result.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 4, "{ids:?}");
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(ids[2], ids[3]);
+        assert_ne!(ids[0], ids[2]);
+    }
 }

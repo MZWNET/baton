@@ -42,13 +42,15 @@ impl AntigravityIdeAdapter {
         files::editor_data("Antigravity")
     }
 
-    // A missing or unreadable editor state only costs the titles
-    fn summary_topic(&self) -> Result<Vec<u8>> {
-        let db = self
-            .user_data
+    fn summary_db(&self) -> PathBuf {
+        self.user_data
             .join("User")
             .join("globalStorage")
-            .join("state.vscdb");
+            .join("state.vscdb")
+    }
+
+    fn summary_topic(&self) -> Result<Vec<u8>> {
+        let db = self.summary_db();
         if !db.is_file() {
             return Ok(Vec::new());
         }
@@ -59,7 +61,8 @@ impl AntigravityIdeAdapter {
                 [SUMMARIES_KEY],
                 |row| row.get(0),
             )
-            .optional()?;
+            .optional()
+            .with_context(|| format!("reading trajectory summaries from {}", db.display()))?;
         Ok(topic
             .and_then(|topic| images::decode(&topic))
             .unwrap_or_default())
@@ -101,8 +104,35 @@ impl Source for AntigravityIdeAdapter {
     fn discover(&self, path: Option<&Path>) -> Result<Vec<NativeSession>> {
         let root = path.unwrap_or(&self.root);
         let summaries = self.summaries()?;
+        let db = self.summary_db();
+        let summary_stamp = db.is_file().then(|| sqlite::stamp(&db)).transpose()?;
         let mut sessions = Vec::new();
-        for dir in files::read_dir(&root.join("brain"))? {
+        let dirs = if root.is_file() {
+            if !root
+                .file_name()
+                .is_some_and(|name| name == "transcript.jsonl" || name == "transcript_full.jsonl")
+                || !root
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "logs")
+                || !root
+                    .parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == ".system_generated")
+            {
+                return Ok(sessions);
+            }
+            root.parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect()
+        } else {
+            files::read_dir(&root.join("brain"))?
+        };
+        for dir in dirs {
             let Some(id) = dir
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -110,12 +140,21 @@ impl Source for AntigravityIdeAdapter {
             else {
                 continue;
             };
-            let Some(log) = transcript(&dir) else {
+            let Some(log) = (if root.is_file() {
+                Some(root.to_path_buf())
+            } else {
+                transcript(&dir)
+            }) else {
                 continue;
             };
+            let mut stamp = Stamp::of(&log)?;
+            if let Some(summary) = summary_stamp {
+                stamp.size = stamp.size.wrapping_add(summary.size);
+                stamp.mtime = stamp.mtime.wrapping_add(summary.mtime);
+            }
             sessions.push(NativeSession {
                 id: id.to_owned(),
-                stamp: Stamp::of(&log)?,
+                stamp,
                 title: summaries.get(id).and_then(|summary| summary.title.clone()),
                 path: log,
             });

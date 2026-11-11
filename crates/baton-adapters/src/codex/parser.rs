@@ -74,17 +74,17 @@ impl<'a> RolloutParser<'a> {
     }
 
     fn response_item(&self, item: &Value, paginated: bool) -> Result<Vec<Body>> {
-        let call = |name: &str, input: Value| {
+        let call = |name: &str, input: Value| -> Result<Vec<Body>> {
             let id = if item["call_id"].is_string() {
                 &item["call_id"]
             } else {
                 &item["id"]
             };
-            vec![Body::ToolCall(ToolCall {
-                call_id: normalize::call_id(id),
+            Ok(vec![Body::ToolCall(ToolCall {
+                call_id: normalize::call_id(id)?,
                 name: name.to_owned(),
                 input,
-            })]
+            })])
         };
         let name = item["name"].as_str().unwrap_or("unknown");
         let bodies = match item["type"].as_str().unwrap_or_default() {
@@ -95,15 +95,15 @@ impl<'a> RolloutParser<'a> {
                 }
                 bodies
             }
-            "function_call" => call(name, normalize::arguments(&item["arguments"])),
-            "custom_tool_call" => call(name, json!({"input": item["input"]})),
+            "function_call" => call(name, normalize::arguments(&item["arguments"]))?,
+            "custom_tool_call" => call(name, json!({"input": item["input"]}))?,
             "local_shell_call" => {
-                call("local_shell", normalize::tool_input(item["action"].clone()))
+                call("local_shell", normalize::tool_input(item["action"].clone()))?
             }
             "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
                 let output = self.output(&item["output"])?;
                 vec![Body::ToolResult(ToolResult {
-                    call_id: normalize::call_id(&item["call_id"]),
+                    call_id: normalize::call_id(&item["call_id"])?,
                     text: output.content.text,
                     images: output.content.images,
                     is_error: output.is_error,

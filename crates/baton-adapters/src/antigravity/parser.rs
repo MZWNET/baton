@@ -2,8 +2,10 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use baton_core::{Blobs, Body, Compaction, Draft, Image, Thinking, ToolCall, ToolResult, time};
+use anyhow::{Context, Result, anyhow};
+use baton_core::{
+    Blobs, Body, Compaction, Draft, Image, Thinking, ToolCall, ToolResult, portable_call_id, time,
+};
 use rusqlite::Connection;
 use serde_json::Value;
 use uuid::Uuid;
@@ -48,7 +50,7 @@ const MCP_TOOL: u64 = 38;
 const TOOL_STEPS: [u64; 8] = [7, 8, 9, 21, 25, 86, 112, 128];
 pub(super) const DONE: u64 = 3;
 pub(super) const ERROR: u64 = 7;
-// A private field of baton's own: images Antigravity has no place for, and the flag of a compaction summary
+// Legacy images and the flag of a compaction summary
 pub(super) const BATON_FIELD: u32 = 47728;
 
 // What a conversation database says about its session, besides its steps
@@ -145,16 +147,19 @@ impl StepReader<'_> {
                 let result = step.message(140).and_then(|generic| generic.message(2));
                 let named = result.as_ref().and_then(linked_call);
                 let call = answered
-                    .and_then(|call| call.string(1).map(String::from))
+                    .and_then(|call| call.string(1).filter(|id| !id.is_empty()).map(String::from))
                     .or(named);
                 let text = result
                     .as_ref()
                     .and_then(|result| result.string(1))
                     .unwrap_or_default();
-                let mut attached = self.baton_images(baton.as_ref())?;
-                if let Some(media) = result.as_ref().and_then(|result| result.message(4)) {
-                    attached.extend(self.media(&media)?);
+                let mut attached = Vec::new();
+                if let Some(result) = &result {
+                    for media in result.repeated(4) {
+                        attached.extend(self.media(&Message::parse(media)?)?);
+                    }
                 }
+                self.merge_baton_images(&mut attached, baton.as_ref())?;
                 self.result(call, text.to_owned(), attached, status)
             }
             MCP_TOOL => {
@@ -166,6 +171,7 @@ impl StepReader<'_> {
                 let id = call
                     .as_ref()
                     .and_then(|call| call.string(1))
+                    .filter(|id| !id.is_empty())
                     .map(String::from);
                 if let Some(call) = &call
                     && id.as_ref().is_some_and(|id| !self.emitted.contains(id))
@@ -173,11 +179,20 @@ impl StepReader<'_> {
                     bodies.extend(self.call(call));
                 }
                 let text = mcp.string(3).or_else(|| mcp.string(8)).unwrap_or_default();
-                bodies.extend(self.result(id, text.to_owned(), Vec::new(), status));
+                let mut attached = Vec::new();
+                for image in mcp.repeated(5) {
+                    attached.extend(self.image_data(&Message::parse(image)?)?);
+                }
+                for media in mcp.repeated(6) {
+                    attached.extend(self.media(&Message::parse(media)?)?);
+                }
+                self.merge_baton_images(&mut attached, baton.as_ref())?;
+                bodies.extend(self.result(id, text.to_owned(), attached, status));
                 bodies
             }
             kind if TOOL_STEPS.contains(&kind) || answered.is_some() => {
-                let call = answered.and_then(|call| call.string(1).map(String::from));
+                let call = answered
+                    .and_then(|call| call.string(1).filter(|id| !id.is_empty()).map(String::from));
                 let (text, attached) = typed_output(kind, step, self)?;
                 self.result(call, text, attached, status)
             }
@@ -212,9 +227,14 @@ impl StepReader<'_> {
         if baton.is_some_and(|baton| baton.varint(2) == Some(1)) {
             return Ok(vec![Body::Compaction(Compaction { summary: text })]);
         }
+        let mut attached = Vec::new();
+        for image in input.repeated(5) {
+            attached.extend(self.image_data(&Message::parse(image)?)?);
+        }
+        self.merge_baton_images(&mut attached, baton)?;
         let content = Content {
             text,
-            images: self.baton_images(baton)?,
+            images: attached,
         };
         Ok(normalize::user(content).into_iter().collect())
     }
@@ -249,7 +269,7 @@ impl StepReader<'_> {
     }
 
     fn call(&mut self, call: &Message) -> Option<Body> {
-        let id = call.string(1)?.to_owned();
+        let id = call.string(1).filter(|id| !id.is_empty())?.to_owned();
         let input = match call.string(3).filter(|arguments| !arguments.is_empty()) {
             Some(arguments) => normalize::arguments(&Value::from(arguments)),
             None => serde_json::json!({}),
@@ -257,7 +277,7 @@ impl StepReader<'_> {
         self.pending.push_back(id.clone());
         self.emitted.insert(id.clone());
         Some(Body::ToolCall(ToolCall {
-            call_id: normalize::call_id(&Value::from(id)),
+            call_id: portable_call_id(&id),
             name: call.string(2).unwrap_or("unknown").to_owned(),
             input,
         }))
@@ -282,7 +302,7 @@ impl StepReader<'_> {
             },
         };
         vec![Body::ToolResult(ToolResult {
-            call_id: normalize::call_id(&Value::from(call)),
+            call_id: portable_call_id(&call),
             text,
             images,
             is_error: status == ERROR,
@@ -300,16 +320,63 @@ impl StepReader<'_> {
         Ok(found)
     }
 
-    // Media a tool showed the model, kept as a file that may since be gone
-    fn media(&self, media: &Message) -> Result<Option<Image>> {
-        let (Some(mime), Some(path)) = (media.string(1), media.string(5)) else {
+    fn merge_baton_images(&self, attached: &mut Vec<Image>, baton: Option<&Message>) -> Result<()> {
+        let mut matched = vec![false; attached.len()];
+        for image in self.baton_images(baton)? {
+            if let Some(index) = attached
+                .iter()
+                .zip(&matched)
+                .position(|(native, matched)| !matched && *native == image)
+            {
+                matched[index] = true;
+            } else {
+                attached.push(image);
+            }
+        }
+        Ok(())
+    }
+
+    fn image_data(&self, image: &Message) -> Result<Option<Image>> {
+        let Some(mime) = image.string(2).filter(|mime| mime.starts_with("image/")) else {
             return Ok(None);
         };
-        match fs::read(Path::new(path)) {
-            Ok(bytes) if mime.starts_with("image/") => {
-                images::store(self.blobs, mime, &bytes).map(Some)
-            }
-            _ => Ok(None),
+        if let Some(data) = image.string(1).filter(|data| !data.is_empty()) {
+            let bytes =
+                images::decode(data).ok_or_else(|| anyhow!("invalid Antigravity image base64"))?;
+            return images::store(self.blobs, mime, &bytes).map(Some);
+        }
+        match image.string(4) {
+            Some(uri) => self.image_uri(mime, uri),
+            None => Ok(None),
+        }
+    }
+
+    fn media(&self, media: &Message) -> Result<Option<Image>> {
+        let Some(mime) = media.string(1).filter(|mime| mime.starts_with("image/")) else {
+            return Ok(None);
+        };
+        if let Some(bytes) = media.bytes(2) {
+            return images::store(self.blobs, mime, bytes).map(Some);
+        }
+        match media.string(5) {
+            Some(uri) => self.image_uri(mime, uri),
+            None => Ok(None),
+        }
+    }
+
+    fn image_uri(&self, mime: &str, value: &str) -> Result<Option<Image>> {
+        if value.starts_with("data:") {
+            return images::from_data_url(self.blobs, value);
+        }
+        let path = match uri::path(value) {
+            Some(path) => path,
+            None if !value.contains("://") => value.to_owned(),
+            None => return Ok(None),
+        };
+        match fs::read(&path) {
+            Ok(bytes) => images::store(self.blobs, mime, &bytes).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("reading image file {path}")),
         }
     }
 }
@@ -318,8 +385,12 @@ impl StepReader<'_> {
 fn linked_call(result: &Message) -> Option<String> {
     result.repeated(2).find_map(|entry| {
         let entry = Message::parse(entry).ok()?;
-        (entry.string(1)? == "session_migrate_call_id")
-            .then(|| entry.string(2).map(String::from))?
+        (entry.string(1)? == "session_migrate_call_id").then(|| {
+            entry
+                .string(2)
+                .filter(|id| !id.is_empty())
+                .map(String::from)
+        })?
     })
 }
 

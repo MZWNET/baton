@@ -116,8 +116,19 @@ impl Source for DshAdapter {
         cursor: Option<&Cursor>,
         blobs: &Blobs,
     ) -> Result<NativeRead> {
+        let sessions = session.path.ancestors().nth(3);
+        let root = sessions
+            .filter(|path| path.file_name().is_some_and(|name| name == "sessions"))
+            .and_then(Path::parent)
+            .unwrap_or_else(|| {
+                session
+                    .path
+                    .parent()
+                    .expect("session files have a directory")
+            });
+        let objects_dir = root.join("attachments/v1/objects");
         journal::read(&session.path, cursor, |leaf| {
-            EventParser::new(blobs, self.objects_dir(), leaf)
+            EventParser::new(blobs, objects_dir.clone(), leaf)
         })
     }
 }

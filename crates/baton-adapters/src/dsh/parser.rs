@@ -47,7 +47,7 @@ impl<'a> EventParser<'a> {
                     .collect(),
                 _ => Vec::new(),
             },
-            "assistant/message" => self.assistant(&data["message"]),
+            "assistant/message" => self.assistant(&data["message"])?,
             "tool/result"
                 if event["surfaceOp"] == "append"
                     && data["error"]["code"] != "TOOL_NOT_STARTED" =>
@@ -55,7 +55,7 @@ impl<'a> EventParser<'a> {
                 let message = &data["message"];
                 let content = self.content(&message["content"])?;
                 vec![Body::ToolResult(ToolResult {
-                    call_id: normalize::call_id(&message["toolCallId"]),
+                    call_id: normalize::call_id(&message["toolCallId"])?,
                     text: content.text,
                     images: content.images,
                     is_error: message["isError"] == true,
@@ -70,12 +70,12 @@ impl<'a> EventParser<'a> {
         Ok(bodies)
     }
 
-    fn assistant(&mut self, message: &Value) -> Vec<Body> {
+    fn assistant(&mut self, message: &Value) -> Result<Vec<Body>> {
         if message["id"]
             .as_str()
             .is_some_and(|id| id.starts_with(SYNTHETIC_PREFIX))
         {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut bodies = Vec::new();
         if message["source"]["provider"] != BATON_PROVIDER
@@ -93,7 +93,7 @@ impl<'a> EventParser<'a> {
                 })),
                 Some("text") => normalize::assistant(part["text"].as_str().unwrap_or_default()),
                 Some("tool-call") => Some(Body::ToolCall(ToolCall {
-                    call_id: normalize::call_id(&part["id"]),
+                    call_id: normalize::call_id(&part["id"])?,
                     name: part["name"].as_str().unwrap_or("unknown").to_owned(),
                     input: normalize::arguments(&part["arguments"]),
                 })),
@@ -101,7 +101,7 @@ impl<'a> EventParser<'a> {
             };
             bodies.extend(body);
         }
-        bodies
+        Ok(bodies)
     }
 
     fn content(&self, value: &Value) -> Result<Content> {

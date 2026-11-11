@@ -66,16 +66,28 @@ impl OpencodeAdapter {
         if let Some(version) = self.version.get() {
             return Ok(version);
         }
-        let output = String::from_utf8(self.run(&["--version"], None)?)?;
+        let output = String::from_utf8(self.run(&["--version"], None, None)?)?;
         Ok(self.version.get_or_init(|| output.trim().to_owned()))
     }
 
-    fn run(&self, args: &[&str], cwd: Option<&Path>) -> Result<Vec<u8>> {
+    fn run(&self, args: &[&str], cwd: Option<&Path>, database: Option<&Path>) -> Result<Vec<u8>> {
         let name = self.agent.name();
         // The agent exits before a pipe drains, cutting large exports short, so stdout goes to a file
         let mut stdout: File = tempfile::tempfile()?;
         let mut command = program::command(name);
         command.args(args).stdout(stdout.try_clone()?);
+        if let Some(database) = database {
+            let database = std::fs::canonicalize(database)?;
+            command
+                .env("OPENCODE_DB", &database)
+                .env("KILO_DB", &database);
+            if let Some(data) = database.parent()
+                && data.file_name().is_some_and(|dir| dir == name)
+                && let Some(data_home) = data.parent()
+            {
+                command.env("XDG_DATA_HOME", data_home);
+            }
+        }
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
@@ -145,10 +157,18 @@ impl Source for OpencodeAdapter {
     ) -> Result<NativeRead> {
         // `--standalone` keeps OpenCode 2 from starting or reconfiguring the user's background service, `--pure` keeps plugins out
         if self.is_v2()? {
-            let output = self.run(&["--standalone", "session", "export", &session.id], None)?;
+            let output = self.run(
+                &["--standalone", "session", "export", &session.id],
+                None,
+                Some(&session.path),
+            )?;
             return parser::transfer::parse(&first_json(&output)?, blobs);
         }
-        let output = self.run(&["--pure", "export", &session.id], None)?;
+        let output = self.run(
+            &["--pure", "export", &session.id],
+            None,
+            Some(&session.path),
+        )?;
         parser::bundle::parse(&first_json(&output)?, blobs)
     }
 }
@@ -177,7 +197,7 @@ impl Adapter for OpencodeAdapter {
         // The agent assigns an imported session to the project of the directory it runs in
         let output = {
             let _database = self.database_lock.lock().unwrap();
-            String::from_utf8(self.run(&args, Some(export.cwd))?)?
+            String::from_utf8(self.run(&args, Some(export.cwd), None)?)?
         };
         if !output.contains(&id) {
             bail!(
@@ -215,7 +235,7 @@ impl Adapter for OpencodeAdapter {
         }
         let flag = if v2 { "--standalone" } else { "--pure" };
         let _database = self.database_lock.lock().unwrap();
-        String::from_utf8(self.run(&[flag, "session", "delete", &session.id], None)?)?;
+        String::from_utf8(self.run(&[flag, "session", "delete", &session.id], None, None)?)?;
         Ok(())
     }
 

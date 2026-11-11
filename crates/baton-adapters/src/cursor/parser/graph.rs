@@ -171,7 +171,7 @@ impl Reader<'_> {
                     self.reply(&id, text);
                 }
                 for part in parts {
-                    self.assistant_part(&id, part);
+                    self.assistant_part(&id, part)?;
                 }
             }
             Some("tool") => {
@@ -213,7 +213,7 @@ impl Reader<'_> {
         Ok(())
     }
 
-    fn assistant_part(&mut self, id: &str, part: &Value) {
+    fn assistant_part(&mut self, id: &str, part: &Value) -> Result<()> {
         if let Some(model) = json::string(&part["providerOptions"]["cursor"]["modelName"])
             && self.model.as_ref() != Some(&model)
         {
@@ -245,7 +245,7 @@ impl Reader<'_> {
             Some("tool-call") => {
                 let started = self.call_times(&part["toolCallId"]).0;
                 let call = ToolCall {
-                    call_id: normalize::call_id(&part["toolCallId"]),
+                    call_id: normalize::call_id(&part["toolCallId"])?,
                     name: part["toolName"].as_str().unwrap_or("unknown").to_owned(),
                     input: normalize::tool_input(part["args"].clone()),
                 };
@@ -253,6 +253,7 @@ impl Reader<'_> {
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn reply(&mut self, id: &str, text: &str) {
@@ -283,7 +284,7 @@ impl Reader<'_> {
         };
         let (started, ended) = self.call_times(&part["toolCallId"]);
         let result = ToolResult {
-            call_id: normalize::call_id(&part["toolCallId"]),
+            call_id: normalize::call_id(&part["toolCallId"])?,
             text,
             images,
             is_error: failed || part["isError"] == true,

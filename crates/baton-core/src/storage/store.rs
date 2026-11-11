@@ -138,6 +138,7 @@ impl Store {
             .into_iter()
             .filter_map(|(name, record)| record.link.map(|link| (name, link)))
             .collect();
+
         Ok((meta, links))
     }
 
@@ -145,7 +146,7 @@ impl Store {
         self.read_records(id, &self.files(id, "records")?)
     }
 
-    fn read_records(&self, id: &str, names: &[String]) -> Result<Vec<(String, Record)>> {
+    pub(crate) fn read_records(&self, id: &str, names: &[String]) -> Result<Vec<(String, Record)>> {
         names
             .iter()
             .map(|name| {
@@ -264,20 +265,34 @@ impl Store {
         if events.is_empty() {
             return Ok(());
         }
-        let mut lines = Vec::new();
-        for event in events {
-            serde_json::to_writer(&mut lines, event)?;
-            lines.push(b'\n');
-        }
-        let compressed = zstd::bulk::compress(&lines, 1)?;
 
-        self.write_file(id, "events", "jsonl.zst", &compressed)
+        self.write_file(id, "events", "jsonl.zst", &encode_segment(events)?)
     }
 
     pub(crate) fn record(&self, id: &str, record: &Record) -> Result<()> {
-        let mut bytes = serde_json::to_vec(record)?;
-        bytes.push(b'\n');
-        self.write_file(id, "records", "json", &bytes)
+        self.write_file(id, "records", "json", &encode_record(record)?)
+    }
+
+    pub(crate) fn replace_segment(&self, id: &str, name: &str, events: &[Event]) -> Result<()> {
+        let path = self
+            .root
+            .join("sessions")
+            .join(id)
+            .join("events")
+            .join(name);
+
+        replace(&path, &encode_segment(events)?)
+    }
+
+    pub(crate) fn replace_record(&self, id: &str, name: &str, record: &Record) -> Result<()> {
+        let path = self
+            .root
+            .join("sessions")
+            .join(id)
+            .join("records")
+            .join(name);
+
+        replace(&path, &encode_record(record)?)
     }
 
     fn write_file(&self, id: &str, kind: &str, extension: &str, bytes: &[u8]) -> Result<()> {
@@ -285,10 +300,26 @@ impl Store {
         fs::create_dir_all(&dir)?;
         let name = format!("{}-{}.{}", self.host, Uuid::now_v7(), extension);
         let path = dir.join(&name);
-        let temporary = dir.join(format!(".{name}.tmp"));
-        fs::write(&temporary, bytes).with_context(|| format!("writing {}", temporary.display()))?;
-        fs::rename(&temporary, &path).with_context(|| format!("publishing {}", path.display()))
+
+        replace(&path, bytes)
     }
+}
+
+fn encode_segment(events: &[Event]) -> Result<Vec<u8>> {
+    let mut lines = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut lines, event)?;
+        lines.push(b'\n');
+    }
+
+    Ok(zstd::bulk::compress(&lines, 1)?)
+}
+
+fn encode_record(record: &Record) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(record)?;
+    bytes.push(b'\n');
+
+    Ok(bytes)
 }
 
 pub(crate) fn record_order(name: &str) -> (&str, &str) {
@@ -315,4 +346,12 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error).with_context(|| format!("publishing {}", path.display())),
     }
+}
+
+pub(crate) fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    let name = path.file_name().expect("store paths end in a file name");
+    let temporary = path.with_file_name(format!(".{}.tmp", name.to_string_lossy()));
+    fs::write(&temporary, bytes).with_context(|| format!("writing {}", temporary.display()))?;
+
+    fs::rename(&temporary, path).with_context(|| format!("publishing {}", path.display()))
 }

@@ -35,9 +35,9 @@ pub(super) fn drafts(row: &Row, blobs: &Blobs) -> Result<Vec<Draft>> {
         time::from_unix_millis((row.timestamp * 1000.0).round() as i64).unwrap_or_else(time::now);
     let content = content(&row.content, blobs)?;
     let bodies = if row.summary {
-        summary_bodies(row, content)
+        summary_bodies(row, content)?
     } else {
-        bodies(row, content)
+        bodies(row, content)?
     };
     let mut drafts = Vec::with_capacity(bodies.len());
     for body in bodies {
@@ -50,8 +50,8 @@ pub(super) fn drafts(row: &Row, blobs: &Blobs) -> Result<Vec<Draft>> {
     Ok(drafts)
 }
 
-fn bodies(row: &Row, content: Content) -> Vec<Body> {
-    match row.role.as_str() {
+fn bodies(row: &Row, content: Content) -> Result<Vec<Body>> {
+    let bodies = match row.role.as_str() {
         "user" => normalize::user(content).into_iter().collect(),
         "assistant" => {
             let mut bodies = Vec::new();
@@ -63,17 +63,18 @@ fn bodies(row: &Row, content: Content) -> Vec<Body> {
                 bodies.push(Body::Thinking(thinking));
             }
             bodies.extend(normalize::assistant(&content.text));
-            bodies.extend(tool_calls(row.tool_calls.as_deref()));
+            bodies.extend(tool_calls(row.tool_calls.as_deref())?);
             bodies
         }
         "tool" => vec![Body::ToolResult(ToolResult {
-            call_id: normalize::call_id(&Value::from(row.tool_call_id.as_deref())),
+            call_id: normalize::call_id(&Value::from(row.tool_call_id.as_deref()))?,
             is_error: failed(row, &content.text),
             text: content.text,
             images: content.images,
         })],
         _ => Vec::new(),
-    }
+    };
+    Ok(bodies)
 }
 
 fn content(text: &str, blobs: &Blobs) -> Result<Content> {
@@ -102,9 +103,9 @@ fn content(text: &str, blobs: &Blobs) -> Result<Content> {
     })
 }
 
-fn tool_calls(text: Option<&str>) -> Vec<Body> {
+fn tool_calls(text: Option<&str>) -> Result<Vec<Body>> {
     let Some(Value::Array(calls)) = text.and_then(|text| serde_json::from_str(text).ok()) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut bodies = Vec::with_capacity(calls.len());
     for call in &calls {
@@ -113,9 +114,9 @@ fn tool_calls(text: Option<&str>) -> Vec<Body> {
         } else {
             &call["call_id"]
         };
-        bodies.push(Body::ToolCall(unit::decode_function_call(call, id)));
+        bodies.push(Body::ToolCall(unit::decode_function_call(call, id)?));
     }
-    bodies
+    Ok(bodies)
 }
 
 // Hermes has no error column; failures show in the tool's JSON envelope or in the effect disposition
@@ -141,12 +142,12 @@ fn failed(row: &Row, text: &str) -> bool {
 }
 
 // A summary row in any of the shapes Hermes has written, or the legacy shape baton writes
-fn summary_bodies(row: &Row, content: Content) -> Vec<Body> {
+fn summary_bodies(row: &Row, content: Content) -> Result<Vec<Body>> {
     let text = content.text.as_str();
     if let Some(summary) = text.strip_prefix(LEGACY_SUMMARY) {
-        return compaction(summary.strip_prefix('\n').unwrap_or(summary))
+        return Ok(compaction(summary.strip_prefix('\n').unwrap_or(summary))
             .into_iter()
-            .collect();
+            .collect());
     }
     // A summary merged into a kept row follows that row's own content, which stays as it was
     if let Some((before, after)) = text.split_once(PRIOR_CONTEXT_END) {
@@ -157,8 +158,8 @@ fn summary_bodies(row: &Row, content: Content) -> Vec<Body> {
         };
         let (summary, _) = prefixed(after.trim_start_matches('\n'));
         let mut bodies: Vec<Body> = compaction(summary).into_iter().collect();
-        bodies.extend(self::bodies(row, before));
-        return bodies;
+        bodies.extend(self::bodies(row, before)?);
+        return Ok(bodies);
     }
     if text.starts_with(SUMMARY_PREFIX) {
         // A micro-compaction snapshot stands in for one exchange, not for the history before it
@@ -166,7 +167,7 @@ fn summary_bodies(row: &Row, content: Content) -> Vec<Body> {
             .split_once('\n')
             .is_some_and(|(_, rest)| rest.starts_with(SNAPSHOT));
         if row.role == "assistant" && snapshot {
-            return normalize::assistant(text).into_iter().collect();
+            return Ok(normalize::assistant(text).into_iter().collect());
         }
         let (summary, live) = prefixed(text);
         let mut bodies: Vec<Body> = compaction(summary).into_iter().collect();
@@ -175,9 +176,9 @@ fn summary_bodies(row: &Row, content: Content) -> Vec<Body> {
             images: content.images,
         };
         bodies.extend(normalize::user(live));
-        return bodies;
+        return Ok(bodies);
     }
-    compaction(text).into_iter().collect()
+    Ok(compaction(text).into_iter().collect())
 }
 
 // The summary after Hermes's prefix line, and the live message that may follow its end marker

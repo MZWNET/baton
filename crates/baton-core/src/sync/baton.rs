@@ -26,7 +26,7 @@ pub struct Baton {
     /// The index of the unified sessions, up to date as of [`Baton::open`].
     pub index: Index,
     cursors: Cursors,
-    _lock: File,
+    _locks: [File; 2],
 }
 
 /// A native session written by [`Baton::export`].
@@ -52,6 +52,16 @@ pub struct Materialized {
     pub skipped: usize,
     /// Individual sessions or removals that could not be processed.
     pub warnings: Vec<String>,
+}
+
+/// Counts sessions changed by a migration
+pub struct Migrated {
+    /// Sessions converted from the old layout
+    pub converted: usize,
+    /// Sessions with rewritten call identifiers
+    pub rewritten: usize,
+    /// Sessions with corrected project remotes
+    pub corrected: usize,
 }
 
 impl AddAssign for Materialized {
@@ -99,6 +109,7 @@ struct Incoming<'a> {
     native: &'a NativeSession,
     info: Info,
     progress: Progress,
+    continued: bool,
 }
 
 impl Incoming<'_> {
@@ -108,6 +119,16 @@ impl Incoming<'_> {
             .clone()
             .or_else(|| self.info.title.clone())
     }
+
+    fn cursor(&self, event: Option<String>, session: &str) -> Cursor {
+        Cursor {
+            path: self.native.path.clone(),
+            stamp: self.native.stamp,
+            progress: self.progress.clone(),
+            event,
+            session: session.to_owned(),
+        }
+    }
 }
 
 struct Fork<'a> {
@@ -115,15 +136,26 @@ struct Fork<'a> {
     base: Option<String>,
 }
 
+struct PendingExport {
+    exported: Exported,
+    record: Option<Record>,
+    cursor: Cursor,
+}
+
+#[derive(Default)]
+struct PendingMaterialization<'a> {
+    export: Option<PendingExport>,
+    obsolete: Vec<(Link, &'a NativeSession)>,
+    result: Materialized,
+}
+
 impl Baton {
     /// Opens the data directory, `BATON_HOME` or else the platform data directory, and brings the index in the cache directory, `BATON_CACHE_DIR` or else the platform cache directory, up to date.
     ///
-    /// Files are written under the host name `BATON_HOST`, or else the machine's host name. Fails on a data directory in the old layout, which [`Baton::migrate`] converts. Blocks while another baton process uses the same cache directory.
+    /// Files are written under the host name `BATON_HOST`, or else the machine's host name. Fails on a data directory written in an older format, which [`Baton::migrate`] upgrades, or a newer format. Blocks while another baton process uses the same data or cache directory
     pub fn open() -> Result<Baton> {
-        let (data, cache, lock) = locked_dirs()?;
-        if !migration::old_sessions(&data)?.is_empty() {
-            bail!("{} uses an old layout; run `baton migrate`", data.display());
-        }
+        let (data, cache, locks) = locked_dirs()?;
+        migration::ensure_current_format(&data)?;
         let store = Store::new(data.clone(), host()?);
         let mut index = Index::open(&cache, &data, store.host())?;
         index.refresh(&store)?;
@@ -132,20 +164,16 @@ impl Baton {
             store,
             index,
             cursors,
-            _lock: lock,
+            _locks: locks,
         })
     }
 
-    /// Converts the sessions of a data directory in the old layout, `events.jsonl` and `meta.json`, to the current one in place, and returns how many it converted.
-    ///
-    /// Each old session is removed only once its new session is fully written, so an interrupted migration picks up where it stopped when run again. The index is cleared and rebuilt by the next [`Baton::open`].
-    pub fn migrate() -> Result<usize> {
-        let (data, cache, _lock) = locked_dirs()?;
+    /// Upgrades a data directory written in an older format in place, finishes an interrupted run when run again, and lets the next [`Baton::open`] rebuild the index
+    pub fn migrate() -> Result<Migrated> {
+        let (data, cache, _locks) = locked_dirs()?;
         let store = Store::new(data.clone(), host()?);
-        let migrated = migration::run(&data, &store)?;
-        Index::remove(&cache)?;
 
-        Ok(migrated)
+        migration::migrate(&data, &cache, &store)
     }
 
     /// Updates the index after changes made during this process.
@@ -176,22 +204,24 @@ impl Baton {
         Ok(())
     }
 
-    /// Returns sessions with their latest active registry link.
+    /// Returns each session's latest active registry link for each provider agent
     pub fn registry_sessions(&self, agent: Agent) -> Result<Vec<(String, Link)>> {
-        let mut seen = HashSet::new();
+        let mut indexed = self.index.registry_links(agent)?;
+        indexed.sort_by(|a, b| a.0.cmp(&b.0));
         let mut result = Vec::new();
-        for (id, name) in self.index.registry_links(agent)? {
-            if seen.insert(id.clone()) {
-                let link = self
-                    .store
-                    .link_versions(&id)?
-                    .into_iter()
-                    .find_map(|(candidate, link)| (candidate == name).then_some(link))
-                    .expect("indexed link exists");
-                result.push((id, link));
+        let mut providers = HashSet::new();
+        for session in indexed.chunk_by(|a, b| a.0 == b.0) {
+            let id = &session[0].0;
+            let mut versions: HashMap<_, _> = self.store.link_versions(id)?.into_iter().collect();
+            providers.clear();
+            for (_, name) in session {
+                let link = versions.remove(name).expect("indexed link exists");
+                if providers.insert(link.provider.as_ref().map(|provider| provider.agent)) {
+                    result.push((id.clone(), link));
+                }
             }
         }
-        result.sort_by(|a, b| a.0.cmp(&b.0));
+
         Ok(result)
     }
 
@@ -211,12 +241,13 @@ impl Baton {
         Ok(())
     }
 
-    /// Writes each selected session's active branch to an agent and removes obsolete untouched exports when possible.
+    /// Writes each selected session's active branch to an agent and removes obsolete untouched exports except those in `protected`
     pub fn materialize(
         &self,
         adapter: &(impl Adapter + ?Sized),
         natives: &[NativeSession],
         sessions: Option<&HashSet<String>>,
+        protected: &HashSet<String>,
     ) -> Result<Materialized> {
         let natives: HashMap<&str, &NativeSession> = natives
             .iter()
@@ -244,128 +275,187 @@ impl Baton {
                 (indexed, linked)
             })
             .collect();
-        let results: Vec<_> = work
+        let prepared: Vec<_> = work
             .into_par_iter()
-            .map(|(indexed, linked)| self.materialize_session(adapter, indexed, linked))
+            .map(|(indexed, linked)| {
+                let prepared = self.prepare_materialization(adapter, &indexed, linked, protected);
+
+                (indexed.id, prepared)
+            })
             .collect();
         let mut result = Materialized::default();
-        for session in results {
-            result += session?;
+        let mut errors = Vec::new();
+        let mut pending = Vec::new();
+        for (id, preparation) in prepared {
+            match preparation {
+                Ok(preparation) => pending.push((id, preparation)),
+                Err(error) => {
+                    result.skipped += 1;
+                    result.warnings.push(format!("{id}: {error:#}"));
+                }
+            }
+        }
+        pending
+            .par_iter_mut()
+            .for_each(|(_, preparation)| self.remove_obsolete(adapter, preparation));
+        adapter.flush().with_context(|| {
+            format!("saving {agent} materialization before recording links and removals")
+        })?;
+        for (id, preparation) in pending {
+            if let Some(export) = preparation.export
+                && let Err(error) = self.publish_export(agent, &export)
+            {
+                errors.push(format!("{error:#}"));
+            }
+            for (link, native) in preparation.obsolete {
+                let record = Record {
+                    link: Some(link),
+                    ..Record::default()
+                };
+                if let Err(error) = self.store.record(&id, &record) {
+                    errors.push(format!(
+                        "removed {agent}:{} but could not record its removal in {id}: {error:#}",
+                        native.id
+                    ));
+                }
+            }
+            result += preparation.result;
+        }
+        if !errors.is_empty() {
+            bail!("{}", errors.join("; "));
         }
 
         Ok(result)
     }
 
-    fn materialize_session(
+    fn prepare_materialization<'a>(
         &self,
         adapter: &(impl Adapter + ?Sized),
-        indexed: MaterializationSession,
-        linked: Vec<(&MaterializationLink, &NativeSession)>,
-    ) -> Result<Materialized> {
-        let mut result = Materialized::default();
+        indexed: &MaterializationSession,
+        linked: Vec<(&MaterializationLink, &'a NativeSession)>,
+        protected: &HashSet<String>,
+    ) -> Result<PendingMaterialization<'a>> {
+        let mut pending = PendingMaterialization::default();
         let agent = adapter.agent();
-        let id = indexed.id;
+        let id = &indexed.id;
         if !indexed.replayable {
-            result.skipped += 1;
-            result.warnings.push(format!("{id}: nothing to replay"));
+            pending.result.skipped += 1;
+            pending
+                .result
+                .warnings
+                .push(format!("{id}: nothing to replay"));
 
-            return Ok(result);
+            return Ok(pending);
         }
-        let linked = linked
-            .into_iter()
-            .map(|(link, native)| {
-                let current = self
-                    .cursors
-                    .get(agent, &link.native_id)?
-                    .is_some_and(|cursor| {
-                        cursor.session == id
-                            && cursor.path == native.path
-                            && cursor.stamp == native.stamp
-                            && cursor.event == indexed.leaf
-                    });
-
-                Ok((link, native, current))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let up_to_date = linked.iter().any(|(_, _, current)| *current);
-        if up_to_date
-            && !linked
-                .iter()
-                .any(|(link, _, current)| !current && link.removable)
-        {
-            result.up_to_date += 1;
-
-            return Ok(result);
+        let had_native = !linked.is_empty();
+        let mut up_to_date = false;
+        let mut obsolete = Vec::new();
+        for (link, native) in linked {
+            let current = self
+                .cursors
+                .get(agent, &link.native_id)?
+                .is_some_and(|cursor| {
+                    cursor.session == *id
+                        && cursor.path == native.path
+                        && cursor.stamp == native.stamp
+                        && cursor.event == indexed.leaf
+                });
+            up_to_date |= current;
+            if !current && link.removable && !protected.contains(&native.id) {
+                obsolete.push((link, native));
+            }
         }
-        let session = self.store.load(&id)?;
+        if up_to_date {
+            pending.result.up_to_date += 1;
+            if obsolete.is_empty() {
+                return Ok(pending);
+            }
+        }
+
+        let session = self.store.load(id)?;
         if !up_to_date {
             let path = session.path();
             let leaf = path.last().map(|event| event.id.as_str());
             let events = replay::events(&path);
-            let seed = session_id::exported(&id, self.store.host(), agent, leaf);
-            if let Err(error) = self.write_export(
+            let seed = session_id::exported(id, self.store.host(), agent, leaf);
+            pending.export = Some(self.prepare_export(
                 &session,
                 adapter,
                 materialization_cwd(&session)?,
                 &events,
                 leaf,
                 Some(seed),
-            ) {
-                result.skipped += 1;
-                result.warnings.push(format!("{id}: {error:#}"));
-
-                return Ok(result);
-            }
-            if linked.is_empty() {
-                result.exported += 1;
+            )?);
+            if had_native {
+                pending.result.refreshed += 1;
             } else {
-                result.refreshed += 1;
+                pending.result.exported += 1;
             }
-        } else {
-            result.up_to_date += 1;
         }
-        for (link, native, current) in linked {
-            if current || !link.removable {
-                continue;
-            }
+        for (link, native) in obsolete {
             let link = session
                 .meta
                 .links
                 .iter()
                 .find(|candidate| candidate.is_for(self.store.host(), agent, &link.native_id))
                 .expect("indexed native link exists");
-            let expected = link
-                .exported_digest
-                .as_ref()
-                .expect("removable native link has an export digest");
-            let read = match adapter.read(native, None, &self.store.blobs()) {
-                Ok(read) => read,
-                Err(error) => {
-                    result.warnings.push(format!("{}: {error:#}", native.id));
-                    continue;
-                }
-            };
-            if replay::digest(read.drafts.iter().map(|draft| &draft.body)) != *expected {
-                continue;
-            }
-            match adapter.remove(native) {
-                Ok(()) => {
-                    let mut removed = link.clone();
-                    removed.removed = true;
-                    self.store.record(
-                        &id,
-                        &Record {
-                            link: Some(removed),
-                            ..Record::default()
-                        },
-                    )?;
-                    result.removed += 1;
-                }
-                Err(error) => result.warnings.push(format!("{}: {error:#}", native.id)),
-            }
+            pending.obsolete.push((link.clone(), native));
         }
 
-        Ok(result)
+        Ok(pending)
+    }
+
+    fn remove_obsolete(
+        &self,
+        adapter: &(impl Adapter + ?Sized),
+        pending: &mut PendingMaterialization,
+    ) {
+        let result = &mut pending.result;
+        pending.obsolete.retain_mut(|(link, native)| {
+            let removal = self
+                .untouched_export(adapter, link, native)
+                .and_then(|untouched| {
+                    if untouched {
+                        adapter.remove(native)?;
+                    }
+                    Ok(untouched)
+                });
+            match removal {
+                Ok(true) => {
+                    link.removed = true;
+                    result.removed += 1;
+
+                    true
+                }
+                Ok(false) => false,
+                Err(error) => {
+                    result.warnings.push(format!("{}: {error:#}", native.id));
+                    false
+                }
+            }
+        });
+    }
+
+    /// Checks whether a local export still matches what Baton wrote. The caller must check that the session still owns the link before removing anything
+    pub fn untouched_export(
+        &self,
+        adapter: &(impl Adapter + ?Sized),
+        link: &Link,
+        native: &NativeSession,
+    ) -> Result<bool> {
+        let Some(expected) = &link.exported_digest else {
+            return Ok(false);
+        };
+        if !link.is_for(self.host(), adapter.agent(), &native.id)
+            || link.direction != Direction::Export
+            || link.continued
+            || link.removed
+        {
+            return Ok(false);
+        }
+        let read = adapter.read(native, None, &self.store.blobs())?;
+
+        Ok(replay::digest(read.drafts.iter().map(|draft| &draft.body)) == *expected)
     }
 
     /// Brings a native session into its linked unified session, or into a new one when it has no link yet.
@@ -453,6 +543,7 @@ impl Baton {
             native,
             info,
             progress,
+            continued,
         };
         let Some(session_id) = linked else {
             if drafts.is_empty() {
@@ -540,20 +631,27 @@ impl Baton {
         };
         let path = session.path();
         let events = replay::events(&path);
-        if events.is_empty() {
-            bail!("session {session_id} has nothing to replay");
-        }
-        self.write_export(
+        let pending = self.prepare_export(
             &session,
             adapter,
             cwd,
             &events,
             path.last().map(|event| event.id.as_str()),
             None,
-        )
+        )?;
+        let agent = adapter.agent();
+        adapter.flush().with_context(|| {
+            format!(
+                "saving {agent}:{} before linking it to {session_id}",
+                pending.exported.native.id
+            )
+        })?;
+        self.publish_export(agent, &pending)?;
+
+        Ok(pending.exported)
     }
 
-    fn write_export(
+    fn prepare_export(
         &self,
         session: &Session,
         adapter: &(impl Adapter + ?Sized),
@@ -561,7 +659,10 @@ impl Baton {
         events: &[&Event],
         leaf: Option<&str>,
         seed: Option<Uuid>,
-    ) -> Result<Exported> {
+    ) -> Result<PendingExport> {
+        if events.is_empty() {
+            bail!("session {} has nothing to replay", session.meta.id);
+        }
         let export = Export {
             title: session.meta.title.as_deref(),
             cwd: &cwd,
@@ -569,12 +670,25 @@ impl Baton {
             events,
             seed,
         };
-        let native = adapter.write(&export, &self.store.blobs())?;
-        let read = adapter.read(&native, None, &self.store.blobs())?;
+        let blobs = self.store.blobs();
+        let agent = adapter.agent();
+        let native = adapter.write(&export, &blobs)?;
+        let read = adapter
+            .read(&native, None, &blobs)
+            .with_context(|| format!("reading back {agent}:{} after export", native.id));
+        let read = match read {
+            Ok(read) => read,
+            Err(error) => {
+                return Err(match discard_export(adapter, &native) {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(format!("{cleanup:#}")),
+                });
+            }
+        };
         let exported_digest = replay::digest(read.drafts.iter().map(|draft| &draft.body));
         let link = Link {
             host: self.store.host().to_owned(),
-            agent: adapter.agent(),
+            agent,
             native_id: native.id.clone(),
             provider: None,
             path: native.path.to_string_lossy().into_owned(),
@@ -586,27 +700,42 @@ impl Baton {
             direction: Direction::Export,
         };
         let incoming = Incoming {
-            agent: adapter.agent(),
+            agent,
             native: &native,
             info: read.info,
             progress: read.progress,
+            continued: false,
         };
         let title = incoming
             .title()
             .filter(|title| session.meta.title.as_ref() != Some(title));
         let link = (!session.meta.links.contains(&link)).then_some(link);
-        if title.is_some() || link.is_some() {
-            self.store.record(
-                &session.meta.id,
-                &Record {
-                    title,
-                    link,
-                    ..Record::default()
-                },
-            )?;
+        let record = (title.is_some() || link.is_some()).then_some(Record {
+            title,
+            link,
+            ..Record::default()
+        });
+        let cursor = incoming.cursor(leaf.map(str::to_owned), &session.meta.id);
+
+        Ok(PendingExport {
+            exported: Exported { native, cwd },
+            record,
+            cursor,
+        })
+    }
+
+    fn publish_export(&self, agent: Agent, pending: &PendingExport) -> Result<()> {
+        let native = &pending.exported.native;
+        let session = &pending.cursor.session;
+        if let Some(record) = &pending.record {
+            self.store.record(session, record).with_context(|| {
+                format!("saved {agent}:{} at {} but could not record its link to {session}; preserve any new native work and remove the unlinked export before retrying materialization", native.id, native.path.display())
+            })?;
         }
-        self.save_cursor(&incoming, leaf.map(str::to_owned), &session.meta.id)?;
-        Ok(Exported { native, cwd })
+
+        self.cursors.save(agent, &native.id, &pending.cursor).with_context(|| {
+            format!("linked {agent}:{} to {session} but could not save its cursor; reimport the native session to rebuild the cursor", native.id)
+        })
     }
 
     fn append(
@@ -751,16 +880,30 @@ impl Baton {
             .find(|link| link.is_for(host, incoming.agent, &incoming.native.id))
             .cloned()
             .expect("imports only sync sessions that link the native session");
+        let source_metadata = !incoming.continued && link.direction == Direction::Import;
         link.path = incoming.native.path.to_string_lossy().into_owned();
         link.exported_events = exported;
         let title = incoming
             .title()
             .filter(|title| session.meta.title.as_ref() != Some(title));
         let link = (!session.meta.links.contains(&link)).then_some(link);
-        if title.is_some() || link.is_some() {
+        let cwd = incoming
+            .info
+            .cwd
+            .as_ref()
+            .filter(|cwd| source_metadata && session.meta.cwd.as_ref() != Some(*cwd));
+        let created = incoming
+            .info
+            .created
+            .as_ref()
+            .filter(|created| source_metadata && session.meta.created != **created);
+        if title.is_some() || link.is_some() || cwd.is_some() || created.is_some() {
             let record = Record {
                 title,
                 link,
+                cwd: cwd.cloned(),
+                project: cwd.and_then(|cwd| identify(Path::new(cwd))),
+                created: created.cloned(),
                 ..Record::default()
             };
             self.store.record(&session.meta.id, &record)?;
@@ -769,16 +912,23 @@ impl Baton {
     }
 
     fn save_cursor(&self, incoming: &Incoming, event: Option<String>, session: &str) -> Result<()> {
-        let cursor = Cursor {
-            path: incoming.native.path.clone(),
-            stamp: incoming.native.stamp,
-            progress: incoming.progress.clone(),
-            event,
-            session: session.to_owned(),
-        };
-        self.cursors
-            .save(incoming.agent, &incoming.native.id, &cursor)
+        self.cursors.save(
+            incoming.agent,
+            &incoming.native.id,
+            &incoming.cursor(event, session),
+        )
     }
+}
+
+fn discard_export(adapter: &(impl Adapter + ?Sized), native: &NativeSession) -> Result<()> {
+    adapter.remove(native).with_context(|| {
+        format!(
+            "could not clean up newly written {}:{} at {}",
+            adapter.agent(),
+            native.id,
+            native.path.display()
+        )
+    })
 }
 
 /// Resolves the directory used when materializing a session on this host.
@@ -798,19 +948,29 @@ fn env_dir_or(name: &str, platform_dir: fn(&ProjectDirs) -> &Path) -> Result<Pat
     Ok(platform_dir(&dirs).to_path_buf())
 }
 
-// The data and cache directories, created when missing, and the lock on the cache directory
-fn locked_dirs() -> Result<(PathBuf, PathBuf, File)> {
+fn locked_dirs() -> Result<(PathBuf, PathBuf, [File; 2])> {
     let data = env_dir_or("BATON_HOME", ProjectDirs::data_dir)?;
     let cache = env_dir_or("BATON_CACHE_DIR", ProjectDirs::cache_dir)?;
     fs::create_dir_all(&data).with_context(|| format!("creating {}", data.display()))?;
     fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
+    // Separate names allow a shared directory, and .tmp keeps the data lock out of the synced repository
+    let data_lock = lock_file(&data.join(".lock.tmp"))?;
+    let cache_lock = lock_file(&cache.join("lock"))?;
+
+    Ok((data, cache, [data_lock, cache_lock]))
+}
+
+fn lock_file(path: &Path) -> Result<File> {
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(cache.join("lock"))?;
-    lock.lock()?;
-    Ok((data, cache, lock))
+        .open(path)
+        .with_context(|| format!("opening lock {}", path.display()))?;
+    lock.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+
+    Ok(lock)
 }
 
 // The host name that starts the names of the files this machine writes

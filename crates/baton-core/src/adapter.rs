@@ -50,7 +50,7 @@ pub struct NativeSession {
 pub struct Progress {
     /// Byte offset just past the last complete line that was read.
     pub offset: u64,
-    /// SHA-256 of the bytes just before `offset`; a different hash means the file was rewritten and must be read in full.
+    /// Version-prefixed SHA-256 of all bytes before `offset`; a different hash means the file was rewritten and must be read in full
     pub tail_hash: String,
     /// Native id of the entry the read ended on; new entries have to continue it to be read incrementally.
     pub leaf: Option<String>,
@@ -131,13 +131,18 @@ pub trait Source: Send + Sync {
 ///
 /// `write` and `remove` may run on several threads at once for different sessions, so an adapter guards what its sessions share.
 ///
-/// Reading has to preserve whatever writing produced: reading a written session must give back the written events, as compared by [`replay::digest`](crate::replay::digest), so that a session continued in an agent can flow back into the unified session it was exported from.
+/// A full read immediately after `write`, before `flush`, must give back the written conversation as compared by [`replay::digest`](crate::replay::digest) over the replayable events after the last reset
 pub trait Adapter: Source {
-    /// Writes the events as a new native session without overwriting anything; images are read from `blobs`.
+    /// Writes the events as a new native session without overwriting anything; images are read from `blobs`. An error must not leave a partial session
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession>;
 
-    /// Removes a native session previously written by this adapter.
+    /// Removes a native session previously written by this adapter, including a staged write when rolling back a failed validation
     fn remove(&self, session: &NativeSession) -> Result<()>;
+
+    /// Persists staged changes after the batch's writes, reads and removals. Baton records links and removals only after this succeeds
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// The command that opens a session in the agent, running in `cwd`.
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command;

@@ -3,7 +3,9 @@ mod event;
 mod session;
 mod session_meta;
 
-pub use body::{Assistant, Body, Compaction, Image, Thinking, ToolCall, ToolResult, User};
+pub use body::{
+    Assistant, Body, Compaction, Image, Thinking, ToolCall, ToolResult, User, portable_call_id,
+};
 pub use event::{Draft, Event, Origin};
 pub use session::Session;
 pub(crate) use session_meta::Record;

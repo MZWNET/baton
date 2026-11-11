@@ -2,8 +2,11 @@ name: Check Codebase
 
 on:
   push:
+    branches:
+      - '**'
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -14,6 +17,32 @@ defaults:
     shell: devenv shell -- bash -eo pipefail {0}
 
 jobs:
+  msrv:
+    name: Check MSRV (1.89)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
   check:
     name: Check Codebase (${{ matrix.os }})
     strategy:

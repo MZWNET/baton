@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,6 +15,9 @@ use uuid::Uuid;
 use crate::openhands::parser;
 use crate::openhands::writer::EventWriter;
 use crate::support::{files, identifiers, json, program};
+
+// The exact times of the events baton wrote, which OpenHands ignores and its own naive timestamps cannot carry
+const RECORDED_TIMES: &str = "baton_times.json";
 
 /// Conversations of [OpenHands CLI](https://github.com/OpenHands/OpenHands-CLI): `<conversation uuid hex>/events/event-<index>-<event id>.json` in its conversations directory, one file per event.
 ///
@@ -113,17 +118,18 @@ impl Source for OpenhandsAdapter {
         blobs: &Blobs,
     ) -> Result<NativeRead> {
         let mut created = None;
-        let mut fallback = None;
+        let mut fallback = String::new();
         let mut drafts = Vec::new();
-        for path in event_files(&session.path)? {
+        let recorded = recorded_times(&session.path)?;
+        for (index, path) in event_files(&session.path)?.into_iter().enumerate() {
             let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let event: Value = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
-            let fallback = fallback.get_or_insert_with(|| {
-                created = event["timestamp"].as_str().and_then(parser::timestamp);
-                created.clone().unwrap_or_else(time::now)
-            });
-            drafts.extend(parser::drafts(&event, fallback, blobs)?);
+            if index == 0 {
+                created = parser::time(&event, &recorded)?;
+                fallback = created.clone().unwrap_or_else(time::now);
+            }
+            drafts.extend(parser::drafts(&event, &recorded, &fallback, blobs)?);
         }
         // The workspace is recorded only once OpenHands has run the conversation, and moves to wherever it resumes
         let state = fs::read(session.path.join("base_state.json"))
@@ -143,6 +149,18 @@ impl Source for OpenhandsAdapter {
     }
 }
 
+// The event times baton recorded when writing the conversation, if it did
+fn recorded_times(dir: &Path) -> Result<BTreeMap<String, String>> {
+    let path = dir.join(RECORDED_TIMES);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display()))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 impl Adapter for OpenhandsAdapter {
     // Without `base_state.json` OpenHands builds a fresh state around the events when it resumes them
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
@@ -151,15 +169,20 @@ impl Adapter for OpenhandsAdapter {
         writer.push_events(export.created, export.events)?;
         let dir = self.conversations.join(id.simple().to_string());
         fs::create_dir_all(&self.conversations)?;
-        fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        for (index, event) in writer.finish().iter().enumerate() {
-            let event_id = event["id"].as_str().expect("written events have ids");
-            let path = dir
-                .join("events")
-                .join(format!("event-{index:05}-{event_id}.json"));
-            files::create_new(&path, format!("{event}\n").as_bytes())?;
-        }
-        Ok(OpenhandsAdapter::probe(&dir)?.expect("a written conversation is a conversation"))
+        let (events, times) = writer.finish();
+        files::create_dir_with(&dir, || {
+            for (index, event) in events.iter().enumerate() {
+                let event_id = event["id"].as_str().expect("written events have ids");
+                let path = dir
+                    .join("events")
+                    .join(format!("event-{index:05}-{event_id}.json"));
+                files::create_new(&path, format!("{event}\n").as_bytes())?;
+            }
+            let times = format!("{}\n", serde_json::to_string(&times)?);
+            files::create_new(&dir.join(RECORDED_TIMES), times.as_bytes())?;
+
+            Ok(OpenhandsAdapter::probe(&dir)?.expect("a written conversation is a conversation"))
+        })
     }
 
     fn remove(&self, _session: &NativeSession) -> Result<()> {

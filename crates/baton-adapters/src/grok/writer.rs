@@ -60,8 +60,15 @@ impl<'a> UpdateWriter<'a> {
                         }
                     }
                 }
-                // Grok rebuilds the model context from its calls, so a result without one would answer nothing
-                Unit::ToolResult(event, result) if calls.contains(result.call_id.as_str()) => {
+                Unit::ToolResult(event, result) => {
+                    let synthetic = !calls.contains(result.call_id.as_str());
+                    let id = if synthetic {
+                        let id = format!("baton-synthetic-{}", identifiers::uuid_v4());
+                        self.push(event, json!({"sessionUpdate": "tool_call", "toolCallId": id, "title": "unknown", "kind": "other", "status": "pending", "rawInput": {}, "_meta": {"baton": {"synthetic": true, "call_id": result.call_id}}}));
+                        id
+                    } else {
+                        result.call_id.clone()
+                    };
                     // A text block, even an empty one, keeps the reader from falling back to the raw output
                     let mut content = vec![
                         json!({"type": "content", "content": {"type": "text", "text": result.text}}),
@@ -79,9 +86,13 @@ impl<'a> UpdateWriter<'a> {
                     } else {
                         "completed"
                     };
-                    self.push(event, json!({"sessionUpdate": "tool_call_update", "toolCallId": result.call_id, "status": status, "content": content}));
+                    let mut update = json!({"sessionUpdate": "tool_call_update", "toolCallId": id, "status": status, "content": content});
+                    if synthetic {
+                        update["_meta"] =
+                            json!({"baton": {"synthetic": true, "call_id": result.call_id}});
+                    }
+                    self.push(event, update);
                 }
-                Unit::ToolResult(..) => {}
                 Unit::Compaction(event, summary) => {
                     let content =
                         json!({"type": "text", "text": format!("{SUMMARY_PREFIX}{summary}")});
@@ -103,8 +114,8 @@ impl<'a> UpdateWriter<'a> {
 
     // Grok rebuilds user images from the URI, while ACP requires the data and the media type
     fn image(&self, image: &Image) -> Result<Value> {
-        let data = images::encode(&self.blobs.get(&image.blob)?);
-        let uri = format!("data:{};base64,{data}", image.mime);
+        let uri = images::data_url(self.blobs, image)?;
+        let data = uri.split_once(',').expect("data URLs have a payload").1;
         Ok(json!({"type": "image", "data": data, "mimeType": image.mime, "uri": uri}))
     }
 

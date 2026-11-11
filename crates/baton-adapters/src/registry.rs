@@ -5,12 +5,12 @@ use crate::{
     AntigravityAdapter, AntigravityDesktopAdapter, AntigravityIdeAdapter, ClaudeAdapter,
     CodexAdapter, CopilotAdapter, CursorAdapter, CursorIdeAdapter, DevinAdapter, DshAdapter,
     GrokAdapter, HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpencodeAdapter,
-    OpenhandsAdapter, PiAdapter, QwenAdapter, VibeAdapter,
+    OpenhandsAdapter, PiAdapter, QwenAdapter, RikkahubAdapter, VibeAdapter,
 };
 
 /// The source of `agent`'s sessions at the agent's default location, honoring the agent's own environment overrides such as `CODEX_HOME`.
 ///
-/// Every agent has one; the source is boxed because the agent is usually only known at run time.
+/// Every agent but Paseo, which keeps no sessions of its own, has one; the source is boxed because the agent is usually only known at run time.
 pub fn source(agent: Agent) -> Result<Box<dyn Source>> {
     let source: Box<dyn Source> = match agent {
         Agent::AntigravityDesktop => Box::new(AntigravityDesktopAdapter::new(
@@ -26,7 +26,7 @@ pub fn source(agent: Agent) -> Result<Box<dyn Source>> {
     Ok(source)
 }
 
-/// The adapter that also writes `agent`'s sessions, at the agent's default location; fails for agents baton can only read.
+/// The adapter that also writes `agent`'s sessions, at the agent's default location; fails for agents baton can only read, and for Paseo.
 pub fn adapter(agent: Agent) -> Result<Box<dyn Adapter>> {
     let adapter: Box<dyn Adapter> = match agent {
         Agent::Pi | Agent::Omp => Box::new(PiAdapter::new(agent, PiAdapter::default_root(agent)?)),
@@ -53,9 +53,14 @@ pub fn adapter(agent: Agent) -> Result<Box<dyn Adapter>> {
         }
         Agent::Cursor => Box::new(CursorAdapter::new(CursorAdapter::default_root()?)),
         Agent::Dsh => Box::new(DshAdapter::new(DshAdapter::default_home()?)),
-        Agent::AntigravityDesktop | Agent::AntigravityIde | Agent::CursorIde | Agent::Paseo => {
+        // RikkaHub keeps its conversations on the phone, so only a backup handed to the adapter holds any
+        Agent::Rikkahub => Box::new(RikkahubAdapter::new(None)),
+        Agent::AntigravityDesktop | Agent::AntigravityIde | Agent::CursorIde => {
             bail!("baton can only read {agent} sessions")
         }
+        Agent::Paseo => bail!(
+            "Paseo keeps no sessions of its own; baton reads and writes its agents through the sessions of their providers"
+        ),
     };
     Ok(adapter)
 }

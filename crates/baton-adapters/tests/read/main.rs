@@ -1,5 +1,7 @@
 //! Each file based adapter reads native sessions shaped like the ones its agent writes, branches, compactions and titles included.
 
+mod rediscovery;
+#[path = "../support/mod.rs"]
 mod support;
 
 use std::fs;
@@ -8,9 +10,10 @@ use std::path::{Path, PathBuf};
 use baton_adapters::{
     ClaudeAdapter, CodexAdapter, CopilotAdapter, DevinAdapter, DshAdapter, GrokAdapter,
     HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpenhandsAdapter, Paseo, PiAdapter,
-    QwenAdapter, VibeAdapter,
+    QwenAdapter, RikkahubAdapter, VibeAdapter,
 };
-use baton_core::{Agent, Blobs, Body, Draft, Image, NativeRead, NativeSession, Source};
+use baton_core::{Agent, Blobs, Body, Cursor, Draft, Image, NativeRead, Source};
+use rusqlite::params;
 use serde_json::{Value, json};
 
 // SHA-256 of the image bytes `pixels`, the name blobs store them under
@@ -59,14 +62,8 @@ fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn only(adapter: &dyn Source) -> NativeSession {
-    let mut natives = adapter.discover(None).unwrap();
-    assert_eq!(natives.len(), 1, "expected exactly one session");
-    natives.remove(0)
-}
-
 fn read(adapter: &dyn Source, blobs: &Blobs) -> NativeRead {
-    adapter.read(&only(adapter), None, blobs).unwrap()
+    support::read_session(adapter, blobs).unwrap()
 }
 
 fn message(id: &str, parent: Option<&str>, second: u32, message: Value) -> Value {
@@ -158,9 +155,14 @@ fn pi_reads_the_active_branch_and_keeps_compacted_entries_after_their_summary() 
             ("assistant", "a tiny image"),
         ])
     );
+    let Body::ToolCall(call) = &read.drafts[3].body else {
+        panic!("expected a tool call")
+    };
+    assert_eq!(call.name, "read");
+    assert_eq!(call.input, json!({"path": "a.txt"}));
     assert_eq!(
-        read.drafts[3].body,
-        support::call("call_fc_1", "read", json!({"path": "a.txt"}))
+        read.drafts[4].body,
+        support::result(&call.call_id, "file body", vec![], false)
     );
     assert_eq!(
         read.drafts[8].body,
@@ -186,6 +188,66 @@ fn title_slot(title: &str) -> String {
         )
     };
     record(256 - record(0).len())
+}
+
+#[test]
+fn a_call_without_the_id_its_format_requires_fails_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let session = |name: &str, call: Value| {
+        let messages = [
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [call]}),
+        ];
+        support::pi_session(&dir.path().join(name), &messages)
+    };
+    let with_id = session(
+        "with",
+        json!({"type": "toolCall", "id": "c1", "name": "read", "arguments": {}}),
+    );
+    let without_id = session(
+        "without",
+        json!({"type": "toolCall", "name": "read", "arguments": {}}),
+    );
+    assert!(support::read_session(&with_id, &blobs).is_ok());
+    assert!(support::read_session(&without_id, &blobs).is_err());
+}
+
+#[test]
+fn omp_title_slot_rewrite_with_append_reads_the_updated_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    let header = json!({"type": "session", "version": 3, "id": "session", "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/work"});
+    let first = json!({"type": "message", "id": "a", "parentId": null, "timestamp": "2026-01-01T00:00:01.000Z", "message": {"role": "user", "content": "x".repeat(2048)}});
+    fs::write(
+        &path,
+        format!("{}{header}\n{first}\n", title_slot("old title")),
+    )
+    .unwrap();
+    let adapter = PiAdapter::new(Agent::Omp, dir.path().to_path_buf());
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let session = adapter.discover(Some(&path)).unwrap().remove(0);
+    let original = adapter.read(&session, None, &blobs).unwrap();
+    assert_eq!(original.info.title.as_deref(), Some("old title"));
+    let cursor = Cursor {
+        path: path.clone(),
+        stamp: session.stamp,
+        progress: original.progress,
+        event: None,
+        session: String::new(),
+    };
+    let appended = json!({"type": "message", "id": "b", "parentId": "a", "timestamp": "2026-01-01T00:00:02.000Z", "message": {"role": "user", "content": "next"}});
+    fs::write(
+        &path,
+        format!("{}{header}\n{first}\n{appended}\n", title_slot("new title")),
+    )
+    .unwrap();
+
+    let result = adapter.read(&session, Some(&cursor), &blobs).unwrap();
+    assert!(!result.continued);
+    assert_eq!(result.info.title.as_deref(), Some("new title"));
+    assert_eq!(result.drafts.len(), 2);
+    assert_eq!(result.drafts[1].body.text(), "next");
 }
 
 #[test]
@@ -477,7 +539,7 @@ fn codex_legacy_rollouts_follow_rollbacks_and_index_titles() {
         ]),
     );
     let adapter = CodexAdapter::new(root);
-    let native = only(&adapter);
+    let native = support::only(&adapter, None);
     assert_eq!(native.title.as_deref(), Some("Indexed name"));
     let read = adapter.read(&native, None, &blobs).unwrap();
     assert_eq!(
@@ -530,13 +592,159 @@ fn pixels() -> Image {
 }
 
 #[test]
+fn rikkahub_reads_selected_branches_and_splits_tool_steps_as_the_app_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let backup = dir.path().join("backup.zip");
+    let conversation = "a1b2c3d4-0000-4000-8000-000000000001";
+    let message = |id: &str, role: &str, parts: Value, checkpoint: bool| {
+        json!({
+            "id": id, "role": role, "parts": parts, "annotations": [],
+            "createdAt": "2026-01-01T08:00:00.123", "finishedAt": null,
+            "modelId": null, "modelSnapshot": null, "usage": null,
+            "generationTimeMs": null, "lastUsage": null, "stepCount": null,
+            "translation": null, "isContextCheckpoint": checkpoint
+        })
+    };
+    let tool = |id: &str, name: &str, input: &str, output: Value, approval: &str| {
+        json!({
+            "type": "tool", "toolCallId": id, "toolName": name, "input": input,
+            "output": output, "approvalState": {"type": approval},
+            "startedAt": "2026-01-01T00:00:01Z", "finishedAt": "2026-01-01T00:00:02Z",
+            "metadata": null
+        })
+    };
+    let nodes = [
+        (
+            0,
+            json!([message(
+                "00000000-0000-4000-8000-000000000001",
+                "user",
+                json!([
+                    {"type": "text", "text": "Plan a trip", "metadata": null},
+                    {"type": "image", "url": "file:///data/user/0/me.rerere.rikkahub/files/upload/3b0e6c1a-9d2f-4f5e-8a7b-1c2d3e4f5a6b.png", "metadata": null},
+                    {"type": "document", "url": "file:///data/user/0/me.rerere.rikkahub/files/upload/notes.txt", "fileName": "notes.txt", "mime": "text/plain", "metadata": null}
+                ]),
+                false
+            )]),
+        ),
+        (
+            1,
+            json!([
+                message(
+                    "00000000-0000-4000-8000-000000000002",
+                    "assistant",
+                    json!([{"type": "text", "text": "old answer", "metadata": null}]),
+                    false
+                ),
+                message(
+                    "00000000-0000-4000-8000-000000000003",
+                    "assistant",
+                    json!([
+                        {"type": "reasoning", "reasoning": "weighing options", "createdAt": "2026-01-01T00:00:01Z", "finishedAt": "2026-01-01T00:00:02Z", "reasoningType": "reasoning_text", "metadata": null},
+                        {"type": "text", "text": "Let me check", "metadata": null},
+                        tool("call_a", "search", "{\"q\":\"flights\"}", json!([{"type": "text", "text": "3 flights", "metadata": null}]), "auto"),
+                        tool("call_b", "weather", "", json!([{"type": "text", "text": "sunny", "metadata": null}]), "auto"),
+                        {"type": "text", "text": "Booking now", "metadata": null},
+                        tool("call_c", "book", "{\"flight\":1}", json!([{"type": "text", "text": "booked", "metadata": null}]), "auto"),
+                        tool("call_d", "pay", "{}", json!([]), "pending"),
+                        {"type": "text", "text": "Done", "metadata": null}
+                    ]),
+                    false
+                )
+            ]),
+        ),
+        (
+            0,
+            json!([message(
+                "00000000-0000-4000-8000-000000000004",
+                "user",
+                json!([
+                    {"type": "notice", "title": "Command finished", "text": "exit 0", "metadata": null}
+                ]),
+                false
+            )]),
+        ),
+        (
+            0,
+            json!([message(
+                "00000000-0000-4000-8000-000000000005",
+                "user",
+                json!([
+                    {"type": "text", "text": "Trip summary", "metadata": null}
+                ]),
+                true
+            )]),
+        ),
+        (
+            0,
+            json!([message(
+                "00000000-0000-4000-8000-000000000006",
+                "user",
+                json!([
+                    {"type": "text", "text": "Thanks", "metadata": null}
+                ]),
+                false
+            )]),
+        ),
+    ];
+    support::rikkahub_backup(
+        &backup,
+        |connection| {
+            connection.execute(
+                "INSERT INTO ConversationEntity (id, title, nodes, create_at, update_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![conversation, "Trip plan", "[]", 1767225600000_i64, 1767225900000_i64],
+            ).unwrap();
+            for (index, (select, messages)) in nodes.iter().enumerate() {
+                connection.execute(
+                    "INSERT INTO message_node (id, conversation_id, node_index, messages, select_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![format!("00000000-0000-4000-8001-{index:012}"), conversation, index as i64, messages.to_string(), select],
+                ).unwrap();
+            }
+        },
+        &[("upload/3b0e6c1a-9d2f-4f5e-8a7b-1c2d3e4f5a6b.png", b"pixels")],
+    );
+    let adapter = RikkahubAdapter::new(Some(backup));
+    let read = read(&adapter, &blobs);
+    assert_eq!(
+        kinds(&read.drafts),
+        pairs(&[
+            ("user", "Plan a trip"),
+            ("thinking", "weighing options"),
+            ("assistant", "Let me check"),
+            ("tool_call", r#"search {"q":"flights"}"#),
+            ("tool_call", "weather {}"),
+            ("tool_result", "3 flights"),
+            ("tool_result", "sunny"),
+            ("assistant", "Booking now"),
+            ("tool_call", r#"book {"flight":1}"#),
+            ("tool_result", "booked"),
+            ("tool_call", "pay {}"),
+            ("assistant", "Done"),
+            ("compaction", "Trip summary"),
+            ("user", "Thanks"),
+        ])
+    );
+    assert_eq!(
+        read.drafts[0].body,
+        support::user("Plan a trip", vec![pixels()])
+    );
+    assert_eq!(read.info.title.as_deref(), Some("Trip plan"));
+    assert_eq!(
+        read.info.created.as_deref(),
+        Some("2026-01-01T00:00:00.000Z")
+    );
+    assert_eq!(read.info.cwd, None);
+}
+
+#[test]
 fn hermes_reads_active_rows_across_a_rotated_compression() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let home = dir.path().join("hermes");
     let connection = support::database(
         &home.join("state.db"),
-        include_str!("fixtures/hermes-state.sql"),
+        include_str!("../fixtures/hermes-state.sql"),
     );
     connection
         .execute_batch(
@@ -559,7 +767,7 @@ INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, reaso
         )
         .unwrap();
     let adapter = HermesAdapter::new(home);
-    let native = only(&adapter);
+    let native = support::only(&adapter, None);
     assert_eq!(
         native.id, "20260101_090000_aaaaaa",
         "the continuation of a rotated session and tool sessions are not listed"
@@ -581,9 +789,12 @@ INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, reaso
             ("assistant", "final"),
         ])
     );
+    let Body::ToolCall(call) = &read.drafts[1].body else {
+        panic!("expected a tool call")
+    };
     assert_eq!(
         read.drafts[2].body,
-        support::result("call_1_fc_1", envelope, vec![], true)
+        support::result(&call.call_id, envelope, vec![], true)
     );
     assert_eq!(read.drafts[7].body, support::user("look", vec![pixels()]));
     assert_eq!(read.info.cwd.as_deref(), Some("/workspace/hermes"));
@@ -657,7 +868,7 @@ fn devin_reads_the_main_chain_without_injected_context() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let db = dir.path().join("devin/sessions.db");
-    let connection = support::database(&db, include_str!("fixtures/devin-sessions.sql"));
+    let connection = support::database(&db, include_str!("../fixtures/devin-sessions.sql"));
     connection
         .execute_batch(
             r#"
@@ -678,7 +889,7 @@ INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, cr
         )
         .unwrap();
     let adapter = DevinAdapter::new(db);
-    let native = only(&adapter);
+    let native = support::only(&adapter, None);
     assert_eq!(native.title.as_deref(), Some("Devin fixture"));
     let read = adapter.read(&native, None, &blobs).unwrap();
     assert_eq!(
@@ -786,7 +997,7 @@ fn copilot_reads_its_log_in_line_order_and_keeps_messages_sent_during_a_compacti
         "{}\n",
     );
     let adapter = CopilotAdapter::new(root);
-    let native = only(&adapter);
+    let native = support::only(&adapter, None);
     assert_eq!(native.title.as_deref(), Some("Copilot fixture"));
     let read = adapter.read(&native, None, &blobs).unwrap();
     assert_eq!(
@@ -812,6 +1023,36 @@ fn copilot_reads_its_log_in_line_order_and_keeps_messages_sent_during_a_compacti
     assert_eq!(
         read.info.created.as_deref(),
         Some("2026-01-01T00:00:00.500Z")
+    );
+}
+
+#[test]
+fn grok_rewind_counts_unindexed_messages_by_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let session = dir.path().join("grok/sessions/work/id");
+    let chunk = |id, text| json!({"method": "session/update", "params": {"update": {"sessionUpdate": "user_message_chunk", "messageId": id, "content": {"type": "text", "text": text}}}});
+    let records = [
+        chunk("first", "first"),
+        chunk("first", "continued"),
+        chunk("second", "discarded"),
+        json!({"method": "_x.ai/session/update", "params": {"update": {"sessionUpdate": "rewind_marker", "target_prompt_index": 1}}}),
+        chunk("replacement", "replacement"),
+    ];
+    support::write(&session.join("updates.jsonl"), &support::jsonl(&records));
+    support::write(
+        &session.join("summary.json"),
+        &json!({"info": {"id": "id"}}).to_string(),
+    );
+    let adapter = GrokAdapter::new(dir.path().join("grok"));
+    let native = adapter.discover(None).unwrap().remove(0);
+    let read = adapter.read(&native, None, &blobs).unwrap();
+    assert_eq!(
+        support::bodies(&read.drafts),
+        vec![
+            support::user("first\ncontinued", vec![]),
+            support::user("replacement", vec![])
+        ]
     );
 }
 
@@ -909,7 +1150,7 @@ fn grok_merges_streamed_chunks_and_follows_rewinds() {
     support::write(&subagent.join("updates.jsonl"), "");
     support::write(&subagent.join("summary.json"), &json!({"info": {"id": "96969696-9696-4969-8969-969696969696", "cwd": "/w"}, "session_kind": "subagent"}).to_string());
     let adapter = GrokAdapter::new(root);
-    let native = only(&adapter);
+    let native = support::only(&adapter, None);
     assert_eq!(native.title.as_deref(), Some("Grok fixture"));
     let read = adapter.read(&native, None, &blobs).unwrap();
     assert_eq!(
@@ -975,7 +1216,7 @@ fn openhands_reads_events_in_index_order_up_to_the_first_gap() {
         "{}",
     );
     let adapter = OpenhandsAdapter::new(conversations);
-    let native = only(&adapter);
+    let native = support::only(&adapter, None);
     assert_eq!(native.id, "99e61c51-f6e9-45cc-93b0-22fee3a459f4");
     let read = adapter.read(&native, None, &blobs).unwrap();
     assert_eq!(
@@ -1030,7 +1271,7 @@ fn vibe_reads_messages_from_the_last_compaction_boundary_on_as_vibe_replays_them
                 "total_messages": 9}).to_string(),
     );
     let adapter = VibeAdapter::new(dir.path().join("vibe"));
-    let native = only(&adapter);
+    let native = support::only(&adapter, None);
     assert_eq!(native.title.as_deref(), Some("Vibe fixture"));
     let read = adapter.read(&native, None, &blobs).unwrap();
     assert_eq!(
@@ -1065,6 +1306,84 @@ fn vibe_reads_messages_from_the_last_compaction_boundary_on_as_vibe_replays_them
     assert_eq!(
         read.info.created.as_deref(),
         Some("2026-01-01T09:00:00.734Z")
+    );
+}
+
+#[test]
+fn qwen_responses_without_ids_answer_their_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let session = "44c47f3e-ccfe-4fb7-aa06-0217dc950456";
+    let record = |uuid: &str, parent: Option<&str>, kind: &str, message: Value| json!({"uuid": uuid, "parentUuid": parent, "sessionId": session, "timestamp": "2026-01-01T00:00:00.000Z", "type": kind, "cwd": "/workspace/qwen", "message": message});
+    let records = [
+        record(
+            "u1",
+            None,
+            "user",
+            json!({"role": "user", "parts": [{"text": "go"}]}),
+        ),
+        record(
+            "a1",
+            Some("u1"),
+            "assistant",
+            json!({"role": "model", "parts": [
+                {"functionCall": {"name": "read_file", "args": {}}},
+                {"functionCall": {"id": "explicit", "name": "read_file", "args": {}}},
+                {"functionCall": {"name": "ls", "args": {}}},
+                {"functionCall": {"name": "read_file", "args": {}}},
+            ]}),
+        ),
+        record(
+            "r1",
+            Some("a1"),
+            "tool_result",
+            json!({"role": "user", "parts": [
+                {"functionResponse": {"name": "ls", "response": {"output": "from ls"}}},
+                {"functionResponse": {"name": "read_file", "response": {"output": "from first read_file"}}},
+                {"functionResponse": {"id": "explicit", "name": "read_file", "response": {"output": "from explicit read_file"}}},
+                {"functionResponse": {"name": "read_file", "response": {"output": "from second read_file"}}},
+            ]}),
+        ),
+    ];
+    let root = dir.path().join("qwen");
+    support::write(
+        &root.join(format!("projects/-workspace-qwen/chats/{session}.jsonl")),
+        &support::jsonl(&records),
+    );
+    let qwen = QwenAdapter::new(root);
+    let bodies = support::bodies(&support::read_session(&qwen, &blobs).unwrap().drafts);
+    let calls: Vec<_> = bodies
+        .iter()
+        .filter_map(|body| match body {
+            Body::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .collect();
+    let results: Vec<_> = bodies
+        .iter()
+        .filter_map(|body| match body {
+            Body::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0].call_id, calls[2].call_id);
+    assert_eq!(results[1].call_id, calls[0].call_id);
+    assert_eq!(results[2].call_id, calls[1].call_id);
+    assert_eq!(results[3].call_id, calls[3].call_id);
+    assert_ne!(calls[0].call_id, calls[2].call_id);
+    assert_ne!(calls[0].call_id, calls[3].call_id);
+    assert_ne!(calls[2].call_id, calls[3].call_id);
+    assert!(calls.iter().all(|call| support::portable(&call.call_id)));
+    assert!(
+        results
+            .iter()
+            .all(|result| support::portable(&result.call_id))
+    );
+    assert_eq!(
+        support::bodies(&support::read_session(&qwen, &blobs).unwrap().drafts),
+        bodies
     );
 }
 
@@ -1208,6 +1527,48 @@ fn qwen_reads_the_active_branch_after_a_rewind() {
 }
 
 #[test]
+fn kimi_rejects_blob_paths_outside_the_agent_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("baton-blobs"));
+    let root = dir.path().join("kimi");
+    let session = root.join("sessions/work/session-id");
+    let main = session.join("agents/main");
+    let outside = main.join("secret");
+    support::write(&outside, "secret");
+    support::write(&main.join("blobs/b64hash"), "pixels");
+    let content = json!([
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "imageUrl": {"url": "blobref:image/png;b64hash"}},
+        {"type": "image_url", "imageUrl": {"url": "blobref:image/png;../secret"}},
+        {"type": "image_url", "imageUrl": {"url": format!("blobref:image/png;{}", outside.display())}}
+    ]);
+    support::write(
+        &main.join("wire.jsonl"),
+        &support::jsonl(&[
+            json!({"type": "metadata", "protocol_version": "1.5", "created_at": 1767225600000_i64}),
+            json!({"type": "context.append_message", "agentId": "main", "time": 1767225601000_i64, "message": {"role": "user", "origin": {"kind": "user"}, "content": content}}),
+        ]),
+    );
+    support::write(
+        &session.join("state.json"),
+        &json!({"id": "session-id"}).to_string(),
+    );
+    let adapter = KimiAdapter::new(root);
+    let native = adapter.discover(None).unwrap().remove(0);
+    let read = adapter.read(&native, None, &blobs).unwrap();
+    assert_eq!(
+        support::bodies(&read.drafts),
+        vec![support::user(
+            "look",
+            vec![Image {
+                blob: PIXELS_SHA256.into(),
+                mime: "image/png".into()
+            }]
+        )]
+    );
+}
+
+#[test]
 fn kimi_reads_typed_turns_and_loop_events_and_follows_undo() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
@@ -1328,7 +1689,7 @@ fn kimi_reads_typed_turns_and_loop_events_and_follows_undo() {
         &json!({"id": "session_child", "custom": {"child_session_kind": "child"}}).to_string(),
     );
     let adapter = KimiAdapter::new(root);
-    let native = only(&adapter);
+    let native = support::only(&adapter, None);
     assert_eq!(native.title.as_deref(), Some("Kimi fixture"));
     let read = adapter.read(&native, None, &blobs).unwrap();
     assert_eq!(
@@ -1346,6 +1707,18 @@ fn kimi_reads_typed_turns_and_loop_events_and_follows_undo() {
         ])
     );
     assert_eq!(read.drafts[0].body, support::user("look", vec![pixels()]));
+    let Body::ToolCall(call) = &read.drafts[3].body else {
+        panic!("expected a tool call")
+    };
+    assert_eq!(
+        read.drafts[4].body,
+        support::result(
+            &call.call_id,
+            "a body\n<system>1 line read</system>",
+            vec![],
+            false
+        )
+    );
     assert_eq!(
         read.drafts[8].body,
         support::result("call_2", "exit 1", vec![], true)
@@ -1354,6 +1727,50 @@ fn kimi_reads_typed_turns_and_loop_events_and_follows_undo() {
     assert_eq!(
         read.info.created.as_deref(),
         Some("2026-01-01T09:00:00.000Z")
+    );
+}
+
+#[test]
+fn dsh_reads_attachments_from_the_supplied_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let foreign = dir.path().join("foreign");
+    let configured = dir.path().join("configured");
+    let file = foreign.join("sessions/project/session-id/session.v4.jsonl");
+    support::write(
+        &file,
+        &support::jsonl(&[
+            json!({"type": "session", "version": 4, "id": "session-id", "createdAt": 1767225600000_i64}),
+            json!({"type": "user/message", "seq": 1, "time": 1767225601000_i64, "data": {"id": "user", "role": "user", "source": {"kind": "user"}, "content": [{"type": "text", "text": "look"}, {"type": "image", "attachment": {"attachmentId": format!("sha256:{PIXELS_SHA256}"), "mediaType": "image/png"}}]}, "surfaceOp": "append"}),
+        ]),
+    );
+    let object = format!(
+        "attachments/v1/objects/{}/{PIXELS_SHA256}",
+        &PIXELS_SHA256[..2]
+    );
+    support::write(&foreign.join(&object), "pixels");
+    support::write(&configured.join(&object), "wrong image");
+    let adapter = DshAdapter::new(configured);
+    for path in [&foreign, &file] {
+        let native = adapter.discover(Some(path)).unwrap().remove(0);
+        let read = adapter.read(&native, None, &blobs).unwrap();
+        assert_eq!(
+            support::bodies(&read.drafts),
+            vec![support::user(
+                "look",
+                vec![Image {
+                    blob: PIXELS_SHA256.into(),
+                    mime: "image/png".into()
+                }]
+            )]
+        );
+    }
+    fs::remove_file(foreign.join(object)).unwrap();
+    let native = adapter.discover(Some(&file)).unwrap().remove(0);
+    let read = adapter.read(&native, None, &blobs).unwrap();
+    assert_eq!(
+        support::bodies(&read.drafts),
+        vec![support::user("look", vec![])]
     );
 }
 
@@ -1404,7 +1821,7 @@ fn dsh_reads_the_latest_generation_and_visible_conversation() {
         "pixels",
     );
     let adapter = DshAdapter::new(root);
-    let native = only(&adapter);
+    let native = support::only(&adapter, None);
     assert_eq!(native.id, "session-x");
     assert_eq!(native.path, session.join("session.v4.jsonl"));
     let read = adapter.read(&native, None, &blobs).unwrap();

@@ -52,7 +52,7 @@ pub(super) fn drafts(node: &Node, blobs: &Blobs) -> Result<Vec<Draft>> {
                 .unwrap_or_default();
             for call in calls {
                 bodies.push(Body::ToolCall(ToolCall {
-                    call_id: normalize::call_id(&call["id"]),
+                    call_id: normalize::call_id(&call["id"])?,
                     name: call["name"].as_str().unwrap_or("unknown").to_owned(),
                     input: normalize::arguments(&call["arguments"]),
                 }));
@@ -62,7 +62,7 @@ pub(super) fn drafts(node: &Node, blobs: &Blobs) -> Result<Vec<Draft>> {
         ("tool", None) => {
             let outcome = &metadata["extensions"]["chisel/tool_result_meta"];
             vec![Body::ToolResult(ToolResult {
-                call_id: normalize::call_id(&message["tool_call_id"]),
+                call_id: normalize::call_id(&message["tool_call_id"])?,
                 text: content.text,
                 images: content.images,
                 is_error: outcome["success"] == false,

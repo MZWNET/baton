@@ -25,7 +25,7 @@ enum Command {
         /// Only this agent.
         #[arg(long)]
         agent: Option<Agent>,
-        /// A session file, or an agent home to scan instead of the default one.
+        /// A session file, a RikkaHub backup, or an agent home to scan instead of the default one
         #[arg(long)]
         path: Option<PathBuf>,
     },
@@ -52,6 +52,9 @@ enum Command {
         /// Provider to register in Paseo.
         #[arg(long)]
         provider: Option<Agent>,
+        /// RikkaHub backup to add the session to, created when it does not exist
+        #[arg(long)]
+        backup: Option<PathBuf>,
         /// Project directory of the native session, the session's own by default.
         #[arg(long, value_parser = resolve::directory)]
         cwd: Option<PathBuf>,
@@ -74,6 +77,9 @@ enum Command {
         /// Agent to materialize into; may be repeated.
         #[arg(long = "in", value_name = "AGENT", required = true)]
         agents: Vec<Agent>,
+        /// RikkaHub backup to add the sessions to, created when it does not exist
+        #[arg(long)]
+        backup: Option<PathBuf>,
     },
     /// Convert a data directory written by an older baton to the current layout.
     Migrate,
@@ -94,15 +100,25 @@ impl Cli {
                 id,
                 to,
                 provider,
+                backup,
                 cwd,
-            } => export::run(&mut baton, &id, to, provider, cwd.as_deref()),
+            } => export::run(
+                &mut baton,
+                &id,
+                to,
+                provider,
+                backup.as_deref(),
+                cwd.as_deref(),
+            ),
             Command::Resume {
                 id,
                 agent,
                 provider,
                 cwd,
             } => resume::run(baton, &id, agent, provider, cwd.as_deref()),
-            Command::Materialize { agents } => materialize::run(&mut baton, &agents),
+            Command::Materialize { agents, backup } => {
+                materialize::run(&mut baton, &agents, backup.as_deref())
+            }
             Command::Migrate => unreachable!("migrate runs without opening"),
         }
     }

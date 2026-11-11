@@ -1,239 +1,24 @@
 //! End-to-end runs of the `baton` binary against isolated agent stores: incremental imports, backflow, forks and materialization
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{Value, json};
-use tempfile::TempDir;
+mod migration;
+mod paseo_failures;
+mod storage_recovery;
+mod support;
 
-struct Home {
-    dir: TempDir,
-}
-
-impl Home {
-    fn new() -> Home {
-        let home = Home {
-            dir: tempfile::tempdir().unwrap(),
-        };
-        fs::create_dir_all(home.project()).unwrap();
-        home
-    }
-
-    fn path(&self, relative: &str) -> PathBuf {
-        self.dir.path().join(relative)
-    }
-
-    fn project(&self) -> PathBuf {
-        self.path("project")
-    }
-
-    // Agents keep their stores under HOME on Unix and USERPROFILE on Windows, unless these variables move them
-    const STORE_VARIABLES: [&str; 24] = [
-        "PI_CODING_AGENT_DIR",
-        "CLAUDE_CONFIG_DIR",
-        "CODEX_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CONFIG_HOME",
-        "APPDATA",
-        "LOCALAPPDATA",
-        "HERMES_HOME",
-        "MASTRA_DB_PATH",
-        "MASTRA_APP_DATA_DIR",
-        "MASTRA_RESOURCE_ID",
-        "DEVIN_SESSIONS_DIR",
-        "COPILOT_HOME",
-        "GROK_HOME",
-        "OPENHANDS_CONVERSATIONS_DIR",
-        "OPENHANDS_PERSISTENCE_DIR",
-        "VIBE_HOME",
-        "VIBE_SESSION_LOGGING__SAVE_DIR",
-        "QWEN_HOME",
-        "QWEN_RUNTIME_DIR",
-        "KIMI_CODE_HOME",
-        "CURSOR_CONFIG_DIR",
-        "DSH_HOME",
-        "PASEO_HOME",
-    ];
-
-    fn baton(&self, args: &[&str]) -> String {
-        self.baton_with_env(args, &[])
-    }
-
-    fn baton_with_env(&self, args: &[&str], variables: &[(&str, &std::ffi::OsStr)]) -> String {
-        let output = self.baton_output(args, variables);
-        assert!(
-            output.status.success(),
-            "baton {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap()
-    }
-
-    fn baton_output(
-        &self,
-        args: &[&str],
-        variables: &[(&str, &std::ffi::OsStr)],
-    ) -> std::process::Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_baton"));
-        command
-            .args(args)
-            .current_dir(self.project())
-            .env("HOME", self.dir.path())
-            .env("USERPROFILE", self.dir.path())
-            .env("BATON_HOME", self.path("baton"))
-            .env("BATON_CACHE_DIR", self.path("cache"))
-            .env(
-                "BATON_HOST",
-                format!(
-                    "test-{}",
-                    self.dir.path().file_name().unwrap().to_string_lossy()
-                ),
-            );
-        for variable in Home::STORE_VARIABLES {
-            command.env_remove(variable);
-        }
-        command.env_remove("BATON_PATH_MAP");
-        command.env_remove("BATON_PROJECTS");
-        command.envs(variables.iter().copied());
-        command.output().unwrap()
-    }
-
-    fn sessions(&self) -> Vec<String> {
-        self.baton(&["list"])
-            .lines()
-            .map(|line| line.split_whitespace().next().unwrap().to_owned())
-            .collect()
-    }
-
-    fn event_count(&self, session: &str) -> usize {
-        self.baton(&["list"])
-            .lines()
-            .find_map(|line| {
-                let mut fields = line.split_whitespace();
-                (fields.next()? == session).then(|| fields.nth(2).unwrap().parse().unwrap())
-            })
-            .unwrap()
-    }
-
-    fn pi_file(&self) -> PathBuf {
-        self.path(".pi/agent/sessions/--work--/2026-01-01T00-00-00-000Z_pi-1.jsonl")
-    }
-
-    // Exports into the project directory, where baton runs, and returns the native id
-    fn export(&self, session: &str, agent: &str) -> String {
-        self.baton(&["export", session, "--to", agent, "--cwd", "."])
-            .trim()
-            .to_owned()
-    }
-
-    // Exports only ever go into the project directory, so Claude Code has a single project
-    fn claude_transcript(&self, id: &str) -> PathBuf {
-        let project = fs::read_dir(self.path(".claude/projects"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        project.join(format!("{id}.jsonl"))
-    }
-
-    fn continue_claude(&self, claude_id: &str, question: (&str, &str), answer: (&str, &str)) {
-        let transcript = self.claude_transcript(claude_id);
-        let last = fs::read_to_string(&transcript)
-            .unwrap()
-            .lines()
-            .filter_map(|line| {
-                serde_json::from_str::<Value>(line).ok()?["uuid"]
-                    .as_str()
-                    .map(String::from)
-            })
-            .next_back()
-            .unwrap();
-        let project = self.project();
-        let record = |uuid: &str, parent: &str, kind: &str, content: Value| {
-            json!({"type": kind, "uuid": uuid, "parentUuid": parent, "sessionId": claude_id, "isSidechain": false,
-                   "cwd": project, "timestamp": "2026-01-02T00:00:00.000Z", "message": {"role": kind, "content": content}})
-        };
-        append(
-            &transcript,
-            &[
-                record(question.0, &last, "user", json!(question.1)),
-                record(
-                    answer.0,
-                    question.0,
-                    "assistant",
-                    json!([{"type": "text", "text": answer.1}]),
-                ),
-            ],
-        );
-    }
-
-    fn claude_transcripts(&self) -> Vec<PathBuf> {
-        let projects = self.path(".claude/projects");
-        if !projects.exists() {
-            return Vec::new();
-        }
-        let mut paths: Vec<_> = fs::read_dir(projects)
-            .unwrap()
-            .flat_map(|entry| fs::read_dir(entry.unwrap().path()).unwrap())
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "jsonl")
-            })
-            .collect();
-        paths.sort();
-        paths
-    }
-}
-
-fn jsonl(records: &[Value]) -> String {
-    records.iter().map(|record| format!("{record}\n")).collect()
-}
+use support::{Home, append, claude_session, isolate_git, jsonl};
 
 fn paseo_fixture(home: &Home) -> (String, PathBuf) {
     let native_id = "11111111-1111-4111-8111-111111111111";
-    let native = home.path(&format!(".claude/projects/-work/{native_id}.jsonl"));
-    fs::create_dir_all(native.parent().unwrap()).unwrap();
-    fs::write(&native, jsonl(&[json!({"type": "user", "uuid": "a1", "parentUuid": null, "sessionId": native_id, "cwd": home.project(), "timestamp": "2026-01-01T00:00:00.000Z", "message": {"role": "user", "content": "Paseo question"}})])).unwrap();
+    let native = claude_session(home, native_id);
     let record = home.path(".paseo/agents/work/paseo-1.json");
     fs::create_dir_all(record.parent().unwrap()).unwrap();
     fs::write(record, json!({"id": "paseo-1", "provider": "claude", "cwd": home.project(), "title": "Paseo title", "launchEnv": {"EXAMPLE": "private fixture value"}, "persistence": {"provider": "claude", "sessionId": native_id, "nativeHandle": native_id, "metadata": {"mcpServers": {"example": "private fixture value"}}}}).to_string()).unwrap();
     (native_id.to_owned(), native)
-}
-
-#[cfg(unix)]
-fn fake_paseo(home: &Home, running: bool) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
-
-    let bin = home.path("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let executable = bin.join("paseo");
-    let script = if running {
-        r##"#!/bin/sh
-printf '%s\n' "$*" >> "$HOME/paseo.log"
-case "$1" in
-  ls) echo '[]' ;;
-  import)
-    n=1
-    if [ -f "$HOME/paseo.counter" ]; then n=$(cat "$HOME/paseo.counter"); fi
-    echo $((n + 1)) > "$HOME/paseo.counter"
-    id="restored-$n"
-    mkdir -p "$HOME/.paseo/agents/work"
-    printf '{"id":"%s","provider":"%s","cwd":"%s","title":null,"persistence":{"provider":"%s","sessionId":"%s","nativeHandle":"%s"}}' "$id" "$4" "$6" "$4" "$2" "$2" > "$HOME/.paseo/agents/work/$id.json"
-    printf '{"agentId":"%s","status":"created","provider":"%s","cwd":"%s","title":null}\n' "$id" "$4" "$6"
-    ;;
-  delete) rm "$HOME/.paseo/agents/work/$2.json" ;;
-esac
-"##
-    } else {
-        "#!/bin/sh\nexit 1\n"
-    };
-    fs::write(&executable, script).unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-    let path = std::env::var_os("PATH").unwrap();
-    std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap()
 }
 
 #[test]
@@ -242,7 +27,7 @@ fn paseo_import_fills_a_missing_title_and_is_idempotent() {
     paseo_fixture(&home);
     home.baton(&["import", "--agent", "claude"]);
     home.baton(&["import", "--agent", "paseo"]);
-    let sessions = home.sessions();
+    let sessions = home.sessions(&[]);
     assert_eq!(sessions.len(), 1);
     let session = &sessions[0];
     assert!(
@@ -270,7 +55,7 @@ fn paseo_import_preserves_the_provider_title_and_is_idempotent() {
         &[json!({"type": "custom-title", "customTitle": "Provider title", "sessionId": native_id})],
     );
     home.baton(&["import", "--agent", "claude"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
     assert!(
         home.baton(&["show", &session])
             .contains("title    Provider title")
@@ -294,7 +79,7 @@ fn paseo_import_rescues_a_deleted_provider_session() {
     let home = Home::new();
     paseo_fixture(&home);
     home.baton(&["import", "--agent", "claude"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
     let target = Home::new();
     copy_session_files(&home, &target, &session);
     let (_, native) = paseo_fixture(&target);
@@ -320,9 +105,9 @@ fn paseo_import_rescues_a_deleted_provider_by_another_agents_id() {
         &[session_header, ask("a1", None, 1, "saved conversation")],
     );
     home.baton(&["import", "--agent", "pi"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
     home.baton(&["import", "--agent", "paseo"]);
-    assert_eq!(home.sessions(), vec![session.clone()]);
+    assert_eq!(home.sessions(&[]), vec![session.clone()]);
     assert!(home.baton(&["show", "paseo:paseo-1"]).contains(&session));
     let records = home.path(&format!("baton/sessions/{session}/records"));
     let links: Vec<Value> = fs::read_dir(records)
@@ -346,7 +131,7 @@ fn paseo_materialize_registers_once_and_handles_a_missing_daemon() {
     let source = Home::new();
     paseo_fixture(&source);
     source.baton(&["import", "--agent", "paseo"]);
-    let session = source.sessions().remove(0);
+    let session = source.sessions(&[]).remove(0);
     for running in [true, false] {
         let target = Home::new();
         copy_session_files(&source, &target, &session);
@@ -355,17 +140,9 @@ fn paseo_materialize_registers_once_and_handles_a_missing_daemon() {
             &[header("/other"), ask("a1", None, 1, "unrelated session")],
         );
         target.baton(&["import", "--agent", "pi"]);
-        let path = fake_paseo(&target, running);
-        let args = [("PATH", path.as_os_str())];
-        let output = target.baton_output(&["materialize", "--in", "paseo"], &args);
+        target.install_paseo(running);
+        let output = target.baton_output(&["materialize", "--in", "paseo"], &[]);
         assert!(output.status.success());
-        if running {
-            assert!(
-                output.stderr.is_empty(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
         let transcripts = target.claude_transcripts();
         assert_eq!(transcripts.len(), 1);
         let records = target.path(&format!("baton/sessions/{session}/records"));
@@ -382,7 +159,7 @@ fn paseo_materialize_registers_once_and_handles_a_missing_daemon() {
                     .contains(&session)
             );
             let before = fs::read_dir(&records).unwrap().count();
-            target.baton_with_env(&["materialize", "--in", "paseo"], &args);
+            target.baton(&["materialize", "--in", "paseo"]);
             assert_eq!(fs::read_dir(&records).unwrap().count(), before);
             let log = fs::read_to_string(target.path("paseo.log")).unwrap();
             assert_eq!(
@@ -392,9 +169,6 @@ fn paseo_materialize_registers_once_and_handles_a_missing_daemon() {
                 1
             );
         } else {
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("paseo daemon is not running")
-            );
             assert!(!target.baton(&["list", "--agent", "paseo"]).is_empty());
             let host = format!(
                 "test-{}",
@@ -415,12 +189,11 @@ fn paseo_materialize_replaces_stale_untouched_exports() {
     let source = Home::new();
     let (native_id, native) = paseo_fixture(&source);
     source.baton(&["import", "--agent", "paseo"]);
-    let session = source.sessions().remove(0);
+    let session = source.sessions(&[]).remove(0);
     let target = Home::new();
     copy_session_files(&source, &target, &session);
-    let path = fake_paseo(&target, true);
-    let variables = [("PATH", path.as_os_str())];
-    target.baton_with_env(&["materialize", "--in", "paseo"], &variables);
+    target.install_paseo(true);
+    target.baton(&["materialize", "--in", "paseo"]);
     let old = target.claude_transcripts().remove(0);
     append(
         &native,
@@ -430,7 +203,7 @@ fn paseo_materialize_replaces_stale_untouched_exports() {
     );
     source.baton(&["import", "--agent", "claude"]);
     copy_session_files(&source, &target, &session);
-    target.baton_with_env(&["materialize", "--in", "paseo"], &variables);
+    target.baton(&["materialize", "--in", "paseo"]);
     assert!(!old.exists());
     assert_eq!(target.claude_transcripts().len(), 1);
     assert!(
@@ -455,21 +228,74 @@ fn paseo_materialize_replaces_stale_untouched_exports() {
 #[test]
 fn paseo_export_requires_a_provider() {
     let home = Home::new();
-    let output = Command::new(env!("CARGO_BIN_EXE_baton"))
-        .args(["export", "anything", "--to", "paseo"])
-        .env("BATON_HOME", home.path("baton"))
-        .env("BATON_CACHE_DIR", home.path("cache"))
-        .output()
-        .unwrap();
+    write_pi(&home, &[header("/work"), ask("a1", None, 1, "question")]);
+    home.baton(&["import", "--agent", "pi"]);
+    let session = home.sessions(&[]).remove(0);
+    let output = home.baton_output(&["export", &session, "--to", "paseo"], &[]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--provider is required"));
+    assert_eq!(home.sessions(&[]), vec![session]);
 }
 
-fn append(path: &Path, records: &[Value]) {
-    use std::io::Write;
+#[cfg(unix)]
+#[test]
+fn resume_opens_the_export_in_the_resolved_project_after_unlocking_the_store() {
+    use std::os::unix::fs::PermissionsExt;
 
-    let mut file = OpenOptions::new().append(true).open(path).unwrap();
-    file.write_all(jsonl(records).as_bytes()).unwrap();
+    let home = Home::new();
+    write_pi(
+        &home,
+        &[header("/work"), ask("a1", None, 1, "resume question")],
+    );
+    home.baton(&["import", "--agent", "pi"]);
+    let session = home.sessions(&[]).remove(0);
+    let bin = home.path("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let executable = bin.join("claude");
+    fs::write(
+        &executable,
+        r##"#!/bin/sh
+printf '%s\n' "$2" > "$HOME/resumed-id"
+pwd > "$HOME/resumed-cwd"
+"$BATON_TEST_BINARY" list > "$HOME/resumed-list" &
+child=$!
+(sleep 5; kill "$child" 2>/dev/null) >/dev/null 2>&1 &
+watchdog=$!
+wait "$child"
+status=$?
+kill "$watchdog" 2>/dev/null
+wait "$watchdog" 2>/dev/null
+exit "$status"
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var_os("PATH").unwrap();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited_path)))
+            .unwrap();
+    let binary = std::ffi::OsStr::new(env!("CARGO_BIN_EXE_baton"));
+    home.baton_with_env(
+        &["resume", &session, "--in", "claude", "--cwd", "."],
+        &[("PATH", path.as_os_str()), ("BATON_TEST_BINARY", binary)],
+    );
+
+    let native_id = fs::read_to_string(home.path("resumed-id")).unwrap();
+    let transcript = home.claude_transcript(native_id.trim());
+    assert!(
+        fs::read_to_string(transcript)
+            .unwrap()
+            .contains("resume question")
+    );
+    assert_eq!(
+        fs::canonicalize(fs::read_to_string(home.path("resumed-cwd")).unwrap().trim()).unwrap(),
+        fs::canonicalize(home.project()).unwrap()
+    );
+    assert!(
+        fs::read_to_string(home.path("resumed-list"))
+            .unwrap()
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(session.as_str()))
+    );
 }
 
 fn header(cwd: &str) -> Value {
@@ -499,6 +325,8 @@ fn write_pi(home: &Home, records: &[Value]) {
 }
 
 fn copy_session_files(from: &Home, to: &Home, session: &str) {
+    fs::create_dir_all(to.path("baton")).unwrap();
+    fs::copy(from.path("baton/version"), to.path("baton/version")).unwrap();
     for kind in ["events", "records"] {
         let source = from.path(&format!("baton/sessions/{session}/{kind}"));
         let destination = to.path(&format!("baton/sessions/{session}/{kind}"));
@@ -514,22 +342,15 @@ fn copy_session_files(from: &Home, to: &Home, session: &str) {
 }
 
 fn git_project(path: &Path, remote: &str) {
-    assert!(
-        Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(path)
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        Command::new("git")
-            .args(["remote", "add", "origin", remote])
-            .current_dir(path)
-            .status()
-            .unwrap()
-            .success()
-    );
+    for args in [
+        &["init", "-q"][..],
+        &["remote", "add", "origin", remote][..],
+    ] {
+        let mut command = Command::new("git");
+        command.args(args).current_dir(path);
+        isolate_git(&mut command, &path.join(".isolated-gitconfig"));
+        assert!(command.status().unwrap().success());
+    }
 }
 
 fn transcript_cwd(path: &Path) -> String {
@@ -551,11 +372,11 @@ fn independently_imported_native_sessions_deduplicate_after_file_union() {
     write_pi(&second, &records);
     first.baton(&["import", "--agent", "pi"]);
     second.baton(&["import", "--agent", "pi"]);
-    let id = first.sessions().remove(0);
-    assert_eq!(second.sessions(), vec![id.clone()]);
+    let id = first.sessions(&[]).remove(0);
+    assert_eq!(second.sessions(&[]), vec![id.clone()]);
 
     copy_session_files(&second, &first, &id);
-    assert_eq!(first.sessions(), vec![id.clone()]);
+    assert_eq!(first.sessions(&[]), vec![id.clone()]);
     assert_eq!(first.event_count(&id), 2);
     let shown = first.baton(&["show", &id]);
     assert_eq!(shown.matches("shared question").count(), 1);
@@ -593,8 +414,8 @@ fn independent_continuations_form_active_and_alternate_branches() {
     write_pi(&second, &records);
     first.baton(&["import", "--agent", "pi"]);
     second.baton(&["import", "--agent", "pi"]);
-    let id = first.sessions().remove(0);
-    assert_eq!(second.sessions(), vec![id.clone()]);
+    let id = first.sessions(&[]).remove(0);
+    assert_eq!(second.sessions(&[]), vec![id.clone()]);
     append(
         &first.pi_file(),
         &[ask("a2", Some("a1"), 2, "earlier continuation")],
@@ -649,8 +470,8 @@ fn index_refreshes_when_external_segments_appear_and_disappear() {
     write_pi(&target, &records);
     source.baton(&["import", "--agent", "pi"]);
     target.baton(&["import", "--agent", "pi"]);
-    let id = target.sessions().remove(0);
-    assert_eq!(source.sessions(), vec![id.clone()]);
+    let id = target.sessions(&[]).remove(0);
+    assert_eq!(source.sessions(&[]), vec![id.clone()]);
     assert_eq!(target.event_count(&id), 1);
     assert!(
         target
@@ -742,8 +563,8 @@ fn migration_remaps_fork_parents_and_is_idempotent() {
         fs::write(directory.join("events.jsonl"), jsonl(&values)).unwrap();
     }
 
-    assert!(home.baton(&["migrate"]).contains("2 sessions migrated"));
-    let ids = home.sessions();
+    home.baton(&["migrate"]);
+    let ids = home.sessions(&[]);
     assert_eq!(ids.len(), 2);
     let root = ids
         .iter()
@@ -789,8 +610,8 @@ fn migration_remaps_fork_parents_and_is_idempotent() {
             .collect::<Vec<_>>()
     };
     let before = (files(root), files(fork));
-    assert!(home.baton(&["migrate"]).contains("0 sessions migrated"));
-    assert_eq!(home.sessions().len(), 2);
+    home.baton(&["migrate"]);
+    assert_eq!(home.sessions(&[]).len(), 2);
     assert_eq!((files(root), files(fork)), before);
     assert_eq!(home.event_count(root), 1);
     assert_eq!(home.event_count(fork), 2);
@@ -807,20 +628,21 @@ fn import_reads_appended_lines_once_and_follows_branches() {
             answer("a2", "a1", 2, "first answer"),
         ],
     );
-    assert!(home.baton(&["import"]).contains("1 new"));
+    home.baton(&["import"]);
     assert!(
         fs::read_dir(home.path("baton")).unwrap().all(|entry| {
             let name = entry.unwrap().file_name();
 
-            name == "sessions" || name == "blobs"
+            name == "sessions" || name == "blobs" || name == ".lock.tmp" || name == "version"
         }),
         "machine-local state stays out of BATON_HOME"
     );
-    assert!(
-        home.baton(&["import"])
-            .contains("0 new, 0 updated, 0 forked, 1 unchanged")
-    );
-    let session = home.sessions().remove(0);
+    let lock = fs::metadata(home.path("baton/.lock.tmp")).unwrap();
+    assert!(lock.is_file());
+    assert_eq!(lock.len(), 0);
+    home.baton(&["import"]);
+    let session = home.sessions(&[]).remove(0);
+    assert_eq!(home.event_count(&session), 2);
 
     append(
         &home.pi_file(),
@@ -829,18 +651,15 @@ fn import_reads_appended_lines_once_and_follows_branches() {
             answer("a4", "a3", 4, "second answer"),
         ],
     );
-    let output = home.baton(&["import"]);
-    assert!(
-        output.contains(&format!("update  {session}  +2")),
-        "{output}"
-    );
+    home.baton(&["import"]);
     assert_eq!(home.event_count(&session), 4);
 
     append(
         &home.pi_file(),
         &[ask("b1", Some("a2"), 5, "branch question")],
     );
-    assert!(home.baton(&["import"]).contains("+1"));
+    home.baton(&["import"]);
+    assert_eq!(home.event_count(&session), 5);
     let shown = home.baton(&["show", &session]);
     assert!(
         shown.contains("branch question") && !shown.contains("second question"),
@@ -853,7 +672,7 @@ fn import_reads_appended_lines_once_and_follows_branches() {
         text.replace("\"cwd\":\"/work\"", "\"cwd\":\"/moved\""),
     )
     .unwrap();
-    assert!(home.baton(&["import"]).contains("0 updated"));
+    home.baton(&["import"]);
     assert_eq!(home.event_count(&session), 5);
 }
 
@@ -869,33 +688,26 @@ fn exported_sessions_flow_back_and_a_diverged_source_forks() {
         ],
     );
     home.baton(&["import"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
     let claude_id = home.export(&session, "claude");
-    let output = home.baton(&["import"]);
-    assert!(output.contains("0 new, 0 updated, 0 forked"), "{output}");
+    home.baton(&["import"]);
+    assert_eq!(home.sessions(&[]), vec![session.clone()]);
+    assert_eq!(home.event_count(&session), 2);
 
     home.continue_claude(&claude_id, ("c1", "question two"), ("c2", "answer two"));
-    let output = home.baton(&["import", "--agent", "claude"]);
-    assert!(
-        output.contains(&format!("update  {session}  +2")),
-        "{output}"
-    );
+    home.baton(&["import", "--agent", "claude"]);
+    assert_eq!(home.event_count(&session), 4);
     assert!(home.baton(&["show", &session]).contains("answer two"));
 
     append(
         &home.pi_file(),
         &[ask("a3", Some("a2"), 3, "pi only question")],
     );
-    let output = home.baton(&["import", "--agent", "pi"]);
-    let fork = output
-        .lines()
-        .find_map(|line| line.strip_prefix("fork    "))
-        .unwrap_or_else(|| panic!("expected a fork: {output}"))
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned();
-    let shown = home.baton(&["show", &fork]);
+    home.baton(&["import", "--agent", "pi"]);
+    let sessions = home.sessions(&[]);
+    assert_eq!(sessions.len(), 2);
+    let fork = sessions.iter().find(|id| *id != &session).unwrap();
+    let shown = home.baton(&["show", fork]);
     assert!(
         shown.contains(&format!("forked   from {session}")),
         "{shown}"
@@ -905,10 +717,8 @@ fn exported_sessions_flow_back_and_a_diverged_source_forks() {
             && shown.contains("answer one")
             && !shown.contains("answer two")
     );
-    assert!(
-        home.baton(&["import"])
-            .contains("0 new, 0 updated, 0 forked")
-    );
+    home.baton(&["import"]);
+    assert_eq!(home.sessions(&[]).len(), 2);
     assert!(
         home.baton(&["show", &format!("claude:{}", &claude_id[..8])])
             .contains(&session)
@@ -927,7 +737,7 @@ fn two_continued_exports_of_one_session_update_it_once_and_fork_once() {
         ],
     );
     home.baton(&["import"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
     let first = home.export(&session, "claude");
     let second = home.export(&session, "claude");
     home.continue_claude(&first, ("f1", "first continuation"), ("f2", "first answer"));
@@ -937,8 +747,28 @@ fn two_continued_exports_of_one_session_update_it_once_and_fork_once() {
         ("s2", "second answer"),
     );
 
-    let output = home.baton(&["import", "--agent", "claude"]);
-    assert!(output.contains("0 new, 1 updated, 1 forked"), "{output}");
+    home.baton(&["import", "--agent", "claude"]);
+    let sessions = home.sessions(&[]);
+    assert_eq!(sessions.len(), 2);
+    let shown: Vec<_> = sessions
+        .iter()
+        .map(|id| home.baton(&["show", id]))
+        .collect();
+    assert!(
+        shown
+            .iter()
+            .any(|text| text.contains("first continuation") && text.contains("first answer"))
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|text| text.contains("second continuation") && text.contains("second answer"))
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|text| text.contains(&format!("forked   from {session}")))
+    );
 }
 
 #[test]
@@ -946,7 +776,7 @@ fn exports_record_the_absolute_project_directory() {
     let home = Home::new();
     write_pi(&home, &[header("/work"), ask("a1", None, 1, "question")]);
     home.baton(&["import"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
     let claude_id = home.export(&session, "claude");
     let text = fs::read_to_string(home.claude_transcript(&claude_id)).unwrap();
     let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
@@ -965,7 +795,7 @@ fn materialize_recreates_a_wiped_export_without_new_records() {
         &[header("/work"), ask("a1", None, 1, "materialized question")],
     );
     home.baton(&["import", "--agent", "pi"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
 
     home.baton(&["materialize", "--in", "claude"]);
     let first = home.claude_transcripts();
@@ -1010,7 +840,7 @@ fn materialize_refreshes_untouched_export_after_cross_host_union() {
     write_pi(&second, &records);
     first.baton(&["import", "--agent", "pi"]);
     second.baton(&["import", "--agent", "pi"]);
-    let session = first.sessions().remove(0);
+    let session = first.sessions(&[]).remove(0);
     first.baton(&["materialize", "--in", "claude"]);
     let stale = first.claude_transcripts().remove(0);
 
@@ -1049,7 +879,7 @@ fn materialize_preserves_continued_exports_and_imported_originals() {
         fs::write(path, jsonl(&[record("a1", None, "original question")])).unwrap();
         home.baton(&["import", "--agent", "claude"]);
     }
-    let session = first.sessions().remove(0);
+    let session = first.sessions(&[]).remove(0);
     let original = first.path(&format!(".claude/projects/-work/{native_id}.jsonl"));
     let exported_id = first.export(&session, "claude");
     let continued = first
@@ -1123,7 +953,7 @@ fn project_identity_and_path_mapping_choose_materialization_directory() {
         ],
     );
     source.baton(&["import", "--agent", "pi"]);
-    let session = source.sessions().remove(0);
+    let session = source.sessions(&[]).remove(0);
     for destination in [&matching, &mapped, &recorded] {
         copy_session_files(&source, destination, &session);
     }
@@ -1179,14 +1009,11 @@ fn an_emptied_export_leaves_its_session_alone() {
         ],
     );
     home.baton(&["import"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
     let claude_id = home.export(&session, "claude");
     fs::write(home.claude_transcript(&claude_id), "").unwrap();
-    let output = home.baton(&["import"]);
-    assert!(
-        output.contains("0 new, 0 updated, 0 forked, 2 unchanged"),
-        "{output}"
-    );
+    home.baton(&["import"]);
+    assert_eq!(home.sessions(&[]), vec![session.clone()]);
     assert_eq!(home.event_count(&session), 2);
 }
 
@@ -1234,26 +1061,23 @@ fn exports_import_back_unchanged_with_and_without_cursors() {
         ],
     );
     home.baton(&["import"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
     for agent in ["pi", "omp", "claude", "codex"] {
         home.export(&session, agent);
     }
-    let output = home.baton(&["import"]);
-    assert!(
-        output.contains("0 new, 0 updated, 0 forked, 5 unchanged"),
-        "{output}"
-    );
+    let count = home.event_count(&session);
+    home.baton(&["import"]);
+    assert_eq!(home.sessions(&[]), vec![session.clone()]);
+    assert_eq!(home.event_count(&session), count);
     let listed = home.baton(&["list", "--agent", "codex"]);
     assert!(
         listed.contains(&session) && listed.contains("Round trip"),
         "{listed}"
     );
     fs::remove_dir_all(home.path("cache")).unwrap();
-    let output = home.baton(&["import"]);
-    assert!(
-        output.contains("0 new, 0 updated, 0 forked, 5 unchanged"),
-        "{output}"
-    );
+    home.baton(&["import"]);
+    assert_eq!(home.sessions(&[]), vec![session.clone()]);
+    assert_eq!(home.event_count(&session), count);
 }
 
 #[test]
@@ -1268,7 +1092,7 @@ fn sessions_filter_by_agent_and_resolve_by_prefix_or_native_id() {
         ],
     );
     home.baton(&["import"]);
-    let session = home.sessions().remove(0);
+    let session = home.sessions(&[]).remove(0);
     assert!(home.baton(&["list", "--agent", "pi"]).contains(&session));
     assert!(!home.baton(&["list", "--agent", "codex"]).contains(&session));
     assert!(

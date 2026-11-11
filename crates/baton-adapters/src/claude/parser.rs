@@ -48,7 +48,7 @@ impl<'a> TranscriptParser<'a> {
                 match content {
                     Value::Array(blocks) => {
                         for block in blocks {
-                            bodies.extend(assistant_block(block));
+                            bodies.extend(assistant_block(block)?);
                         }
                     }
                     other => bodies.extend(other.as_str().and_then(normalize::assistant)),
@@ -85,7 +85,7 @@ impl<'a> TranscriptParser<'a> {
                     texts.clear();
                     let result = self.result_content(&block["content"])?;
                     bodies.push(Body::ToolResult(ToolResult {
-                        call_id: normalize::call_id(&block["tool_use_id"]),
+                        call_id: normalize::call_id(&block["tool_use_id"])?,
                         text: result.text,
                         images: result.images,
                         is_error: block["is_error"] == true,
@@ -197,9 +197,9 @@ impl Parser for TranscriptParser<'_> {
     }
 }
 
-fn assistant_block(block: &Value) -> Option<Body> {
-    match block["type"].as_str()? {
-        "text" => normalize::assistant(block["text"].as_str()?),
+fn assistant_block(block: &Value) -> Result<Option<Body>> {
+    let body = match block["type"].as_str().unwrap_or_default() {
+        "text" => block["text"].as_str().and_then(normalize::assistant),
         "thinking" => Some(Body::Thinking(Thinking {
             text: block["thinking"].as_str().unwrap_or_default().to_owned(),
             signature: json::string(&block["signature"]),
@@ -209,12 +209,13 @@ fn assistant_block(block: &Value) -> Option<Body> {
             signature: json::string(&block["data"]),
         })),
         "tool_use" => Some(Body::ToolCall(ToolCall {
-            call_id: normalize::call_id(&block["id"]),
+            call_id: normalize::call_id(&block["id"])?,
             name: block["name"].as_str().unwrap_or("unknown").to_owned(),
             input: normalize::tool_input(block["input"].clone()),
         })),
         _ => None,
-    }
+    };
+    Ok(body)
 }
 
 fn text_of(content: &Value) -> Option<String> {

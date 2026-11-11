@@ -46,7 +46,7 @@ const CLI: i64 = 17;
 
 /// Conversations of [Antigravity CLI](https://antigravity.google/docs/cli/): `conversations/<uuid>.db` under `~/.gemini/antigravity-cli`, a SQLite database of protobuf steps per conversation, listed in `conversation_summaries.db`.
 ///
-/// The step format is not published; the adapter follows what agy 1.1.16 writes, and keeps images and the mark of a compaction summary in a protobuf field of its own that Antigravity ignores. Subagent conversations stay out.
+/// The step format is not published; the adapter follows what agy 1.1.16 writes. Subagent conversations stay out.
 pub struct AntigravityAdapter {
     root: PathBuf,
 }
@@ -159,14 +159,24 @@ impl Source for AntigravityAdapter {
     fn discover(&self, path: Option<&Path>) -> Result<Vec<NativeSession>> {
         let (root, dbs) = parser::databases(&self.root, path)?;
         let summaries = AntigravityAdapter::summaries(root)?;
+        let summary_db = root.join("conversation_summaries.db");
+        let summary_stamp = summary_db
+            .is_file()
+            .then(|| sqlite::stamp(&summary_db))
+            .transpose()?;
         let mut sessions = Vec::new();
         for (db, id) in dbs {
             let row = summaries.get(&id);
             if row.is_some_and(|row| !row.top_level) {
                 continue;
             }
+            let mut stamp = sqlite::stamp(&db)?;
+            if let Some(summary) = summary_stamp {
+                stamp.size = stamp.size.wrapping_add(summary.size);
+                stamp.mtime = stamp.mtime.wrapping_add(summary.mtime);
+            }
             sessions.push(NativeSession {
-                stamp: sqlite::stamp(&db)?,
+                stamp,
                 title: row.and_then(|row| row.title.clone()),
                 path: db,
                 id,

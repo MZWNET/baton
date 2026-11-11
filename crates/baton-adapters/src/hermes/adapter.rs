@@ -5,8 +5,7 @@ use std::process::Command;
 
 use anyhow::{Result, bail};
 use baton_core::{
-    Adapter, Agent, Blobs, Cursor, Export, Info, NativeRead, NativeSession, Progress, Source,
-    Stamp, time,
+    Adapter, Agent, Blobs, Cursor, Export, Info, NativeRead, NativeSession, Progress, Source, time,
 };
 use chrono::Local;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -138,21 +137,7 @@ impl Source for HermesAdapter {
                 continuations.entry(parent).or_insert(child);
             }
         }
-        let mut stats = HashMap::new();
-        {
-            let mut statement = snapshot.prepare("SELECT session_id, COUNT(*) FILTER (WHERE active = 1), COALESCE(MAX(id), 0) FROM messages WHERE session_id IS NOT NULL GROUP BY session_id")?;
-            let rows = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (id, active, newest) = row?;
-                stats.insert(id, (active, newest));
-            }
-        }
+        let stamp = sqlite::stamp(&db)?;
         let mut titles = HashMap::new();
         {
             let mut statement = snapshot.prepare("SELECT id, title FROM sessions")?;
@@ -168,13 +153,8 @@ impl Source for HermesAdapter {
         for id in ids {
             let mut seen = HashSet::new();
             let mut current = id.as_str();
-            let mut stamp = Stamp { size: 0, mtime: 0 };
             let mut title = None;
             while seen.insert(current) {
-                if let Some(&(active, newest)) = stats.get(current) {
-                    stamp.size += active as u64;
-                    stamp.mtime = stamp.mtime.max(newest);
-                }
                 if let Some(Some(found)) = titles.get(current)
                     && !found.is_empty()
                 {
@@ -287,7 +267,6 @@ impl Adapter for HermesAdapter {
                 title,
             ],
         )?;
-        let mut newest = 0;
         {
             let mut insert = transaction.prepare(
                 "INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, tool_name, finish_reason,
@@ -315,9 +294,10 @@ impl Adapter for HermesAdapter {
                     !archived,
                     archived,
                 ])?;
-                newest = transaction.last_insert_rowid();
                 if index + 1 == first_active {
-                    let marker = json!({"_baton_compacted_through": newest}).to_string();
+                    let marker =
+                        json!({"_baton_compacted_through": transaction.last_insert_rowid()})
+                            .to_string();
                     transaction.execute(
                         "UPDATE sessions SET model_config = ?2 WHERE id = ?1",
                         params![id, marker],
@@ -326,13 +306,11 @@ impl Adapter for HermesAdapter {
             }
         }
         transaction.commit()?;
+        let stamp = sqlite::stamp(&db)?;
         Ok(NativeSession {
             id,
             path: db,
-            stamp: Stamp {
-                size: active as u64,
-                mtime: newest,
-            },
+            stamp,
             title: None,
         })
     }

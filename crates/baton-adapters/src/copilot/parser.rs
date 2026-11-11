@@ -103,7 +103,7 @@ impl<'a> EventParser<'a> {
                     .unwrap_or_default();
                 for request in requests {
                     bodies.push(Body::ToolCall(ToolCall {
-                        call_id: normalize::call_id(&request["toolCallId"]),
+                        call_id: normalize::call_id(&request["toolCallId"])?,
                         name: request["name"].as_str().unwrap_or("unknown").to_owned(),
                         input: normalize::tool_input(request["arguments"].clone()),
                     }));
@@ -127,7 +127,7 @@ impl<'a> EventParser<'a> {
                     }
                 }
                 vec![Body::ToolResult(ToolResult {
-                    call_id: normalize::call_id(&data["toolCallId"]),
+                    call_id: normalize::call_id(&data["toolCallId"])?,
                     text: text.to_owned(),
                     images: attached,
                     is_error: data["success"] == false,

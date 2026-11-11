@@ -1,11 +1,11 @@
 use anyhow::Result;
-use baton_core::{Blobs, Event, Image, ToolCall, time};
+use baton_core::{Blobs, Event, ToolCall, time};
 use serde_json::Value;
 
 use crate::antigravity::parser::{BATON_FIELD, DONE, ERROR, GENERIC, PLANNER_RESPONSE, USER_INPUT};
-use crate::support::identifiers;
 use crate::support::protobuf::Encoder;
 use crate::support::unit::{self, Unit};
+use crate::support::{identifiers, images};
 
 // A row of the `steps` table; its metadata goes both into a column of its own and into the step
 pub(super) struct Step {
@@ -26,9 +26,16 @@ pub(super) fn steps(events: &[&Event], blobs: &Blobs) -> Result<Vec<Step>> {
     for unit in unit::units(events) {
         match unit {
             Unit::User(event, user) => {
-                let input = Encoder::default().string(2, &user.text);
-                let baton = images(&user.images, blobs)?;
-                writer.push(event, USER_INPUT, DONE, None, input, baton);
+                let mut input = Encoder::default().string(2, &user.text);
+                for image in &user.images {
+                    input = input.message(
+                        5,
+                        Encoder::default()
+                            .string(1, &images::encode(&blobs.get(&image.blob)?))
+                            .string(2, &image.mime),
+                    );
+                }
+                writer.push(event, USER_INPUT, DONE, None, input, Encoder::default());
             }
             Unit::Assistant(run) => {
                 for reply in unit::replies(&run) {
@@ -68,10 +75,25 @@ pub(super) fn steps(events: &[&Event], blobs: &Blobs) -> Result<Vec<Step>> {
                             generic.message(1, Encoder::default().string(1, key).string(2, &value));
                     }
                 }
-                let generic = generic.message(2, Encoder::default().string(1, &result.text));
+                let mut output = Encoder::default().string(1, &result.text);
+                for image in &result.images {
+                    output = output.message(
+                        4,
+                        Encoder::default()
+                            .string(1, &image.mime)
+                            .bytes(2, &blobs.get(&image.blob)?),
+                    );
+                }
+                let generic = generic.message(2, output);
                 let status = if result.is_error { ERROR } else { DONE };
-                let baton = images(&result.images, blobs)?;
-                writer.push(event, GENERIC, status, Some(answered), generic, baton);
+                writer.push(
+                    event,
+                    GENERIC,
+                    status,
+                    Some(answered),
+                    generic,
+                    Encoder::default(),
+                );
             }
             // Antigravity has no compaction record, so a summary is a marked user input that agy sees after the full history
             Unit::Compaction(event, summary) => {
@@ -106,19 +128,6 @@ fn tool_call(call: &ToolCall) -> Encoder {
         .string(1, &call.call_id)
         .string(2, &call.name)
         .string(3, &call.input.to_string())
-}
-
-// Images go into baton's private field, as Antigravity keeps none of its own in a step
-fn images(attached: &[Image], blobs: &Blobs) -> Result<Encoder> {
-    let mut baton = Encoder::default();
-    for image in attached {
-        let bytes = blobs.get(&image.blob)?;
-        baton = baton.message(
-            1,
-            Encoder::default().string(1, &image.mime).bytes(2, &bytes),
-        );
-    }
-    Ok(baton)
 }
 
 struct StepWriter {

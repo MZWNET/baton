@@ -1,11 +1,23 @@
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use baton_adapters::{Paseo, PaseoAgent};
-use baton_core::{Adapter, Agent, Baton, Direction, Exported};
+use baton_adapters::{Paseo, PaseoAgent, RikkahubAdapter};
+use baton_core::{Adapter, Agent, Baton, Direction, Exported, SessionMeta};
 
+use super::import;
 use crate::resolve;
+
+// RikkaHub keeps its conversations on the phone, so baton writes them into a backup exported from the app
+pub(crate) fn adapter(agent: Agent, backup: Option<&Path>) -> Result<Box<dyn Adapter>> {
+    match (agent, backup) {
+        (Agent::Rikkahub, Some(backup)) => {
+            Ok(Box::new(RikkahubAdapter::new(Some(backup.to_path_buf()))))
+        }
+        (Agent::Rikkahub, None) => bail!("--backup is required with rikkahub"),
+        (_, Some(_)) => bail!("--backup is only valid with rikkahub"),
+        (_, None) => baton_adapters::adapter(agent),
+    }
+}
 
 fn paseo_provider(agent: Agent, provider: Option<Agent>) -> Result<Option<Agent>> {
     match (agent, provider) {
@@ -19,72 +31,56 @@ fn paseo_provider(agent: Agent, provider: Option<Agent>) -> Result<Option<Agent>
     }
 }
 
-pub(crate) type Registrations = HashMap<(Agent, String), PaseoAgent>;
+// The Paseo provider and the adapter writing the export, checked before resolving the session, which may import it
+pub(crate) fn destination(
+    agent: Agent,
+    provider: Option<Agent>,
+    backup: Option<&Path>,
+) -> Result<(Option<Agent>, Box<dyn Adapter>)> {
+    let provider = paseo_provider(agent, provider)?;
+    let adapter = adapter(provider.unwrap_or(agent), backup)?;
 
-pub(crate) fn discover_registrations(paseo: &Paseo) -> Result<Registrations> {
-    let mut registrations = HashMap::new();
-    for agent in paseo.discover()? {
-        registrations
-            .entry((agent.provider, agent.handle.clone()))
-            .or_insert(agent);
-    }
-
-    Ok(registrations)
+    Ok((provider, adapter))
 }
 
+// Links the session to the Paseo agent of its exported provider session, registering one when Paseo has none, and returns the agent id
 pub(crate) fn register(
     baton: &Baton,
     paseo: &Paseo,
-    registrations: &mut Registrations,
-    session: &str,
+    registrations: &[PaseoAgent],
+    session: &SessionMeta,
     provider: Agent,
     exported: &Exported,
-    title: Option<&str>,
 ) -> Result<String> {
     let handle = Paseo::handle(provider, &exported.native);
-    let key = (provider, handle);
-    let (agent, direction) = if let Some(agent) = registrations.get(&key) {
-        (agent.clone(), Direction::Import)
-    } else {
-        let id = paseo.register(provider, &exported.native, &exported.cwd, title)?;
-        let agent = paseo.record(&id)?;
-        registrations.insert((agent.provider, agent.handle.clone()), agent.clone());
-        (agent, Direction::Export)
+    let created;
+    let (registration, direction) = match registrations
+        .iter()
+        .find(|registration| registration.provider == provider && registration.handle == handle)
+    {
+        Some(registration) => (registration, Direction::Import),
+        None => {
+            let id = paseo.register(
+                provider,
+                &exported.native,
+                &exported.cwd,
+                session.title.as_deref(),
+            )?;
+            created = paseo.record(&id)?;
+            (&created, Direction::Export)
+        }
     };
-    baton.record_link(
+    import::link_registration(
+        baton,
+        paseo,
         session,
-        paseo.link(baton.host(), &agent, exported.native.id.clone(), direction),
+        registration,
+        exported.native.id.clone(),
+        direction,
         None,
     )?;
 
-    Ok(agent.id)
-}
-
-pub(crate) struct ExportedSession {
-    pub session: String,
-    pub provider: Option<Agent>,
-    pub adapter: Box<dyn Adapter>,
-    pub exported: Exported,
-}
-
-pub(crate) fn export_session(
-    baton: &mut Baton,
-    query: &str,
-    agent: Agent,
-    provider: Option<Agent>,
-    cwd: Option<&Path>,
-) -> Result<ExportedSession> {
-    let provider = paseo_provider(agent, provider)?;
-    let session = resolve::session_id(baton, query)?;
-    let adapter = baton_adapters::adapter(provider.unwrap_or(agent))?;
-    let exported = baton.export(&session, adapter.as_ref(), cwd)?;
-
-    Ok(ExportedSession {
-        session,
-        provider,
-        adapter,
-        exported,
-    })
+    Ok(registration.id.clone())
 }
 
 pub(crate) fn run(
@@ -92,38 +88,35 @@ pub(crate) fn run(
     query: &str,
     agent: Agent,
     provider: Option<Agent>,
+    backup: Option<&Path>,
     cwd: Option<&Path>,
 ) -> Result<()> {
-    let ExportedSession {
-        session,
-        provider,
-        exported,
-        ..
-    } = export_session(baton, query, agent, provider, cwd)?;
-    if let Some(provider) = provider {
-        let paseo = Paseo::new(Paseo::default_home()?);
-        if paseo.available() {
-            let title = baton.store.load(&session)?.meta.title;
-            let mut registrations = discover_registrations(&paseo)?;
-            println!(
-                "{}",
-                register(
-                    baton,
-                    &paseo,
-                    &mut registrations,
-                    &session,
-                    provider,
-                    &exported,
-                    title.as_deref(),
-                )?
-            );
-        } else {
-            eprintln!("baton: paseo daemon is not running; skipping registration");
-            println!("{}", exported.native.id);
-        }
-    } else {
+    let (provider, adapter) = destination(agent, provider, backup)?;
+    let session = resolve::session_id(baton, query)?;
+    let exported = baton.export(&session, adapter.as_ref(), cwd)?;
+    let Some(provider) = provider else {
         println!("{}", exported.native.id);
+        return Ok(());
+    };
+    let paseo = Paseo::new(Paseo::default_home()?);
+    if !paseo.available() {
+        eprintln!("baton: paseo daemon is not running; skipping registration");
+        println!("{}", exported.native.id);
+        return Ok(());
     }
+    let registrations = paseo.discover()?;
+    let session = baton.store.load(&session)?;
+    println!(
+        "{}",
+        register(
+            baton,
+            &paseo,
+            &registrations,
+            &session.meta,
+            provider,
+            &exported,
+        )?
+    );
 
     Ok(())
 }

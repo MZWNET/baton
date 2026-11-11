@@ -1,6 +1,7 @@
 // Rules every reader applies, so that a session reads back the same from any agent it was written to
 
-use baton_core::{Assistant, Body, Image, User};
+use anyhow::{Result, bail};
+use baton_core::{Assistant, Body, Image, User, portable_call_id};
 use serde_json::{Value, json};
 
 pub(crate) struct Content {
@@ -28,21 +29,12 @@ pub(crate) fn assistant(text: &str) -> Option<Body> {
     }))
 }
 
-// Every provider accepts these characters, so a call keeps its id in every native format
-pub(crate) fn call_id(value: &Value) -> String {
-    let id: String = value
-        .as_str()
-        .unwrap_or_default()
-        .chars()
-        .map(|char| {
-            if char.is_ascii_alphanumeric() || char == '_' || char == '-' {
-                char
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if id.is_empty() { "call".into() } else { id }
+// These formats require ids to pair calls with their results
+pub(crate) fn call_id(value: &Value) -> Result<String> {
+    match value.as_str() {
+        Some(id) if !id.is_empty() => Ok(portable_call_id(id)),
+        _ => bail!("a tool call or result has no id"),
+    }
 }
 
 // Tool arguments as an object, the only shape every format can store

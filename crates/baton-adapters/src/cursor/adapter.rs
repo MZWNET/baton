@@ -195,23 +195,6 @@ impl Adapter for CursorAdapter {
         });
         let dir = self.root.join("chats").join(bucket(&cwd)).join(&id);
         let store = dir.join("store.db");
-        sqlite::publish_new(&store, |connection| {
-            connection.execute_batch(SCHEMA)?;
-            let transaction = connection.transaction()?;
-            {
-                let mut insert =
-                    transaction.prepare("INSERT INTO blobs (id, data) VALUES (?1, ?2)")?;
-                for (blob, data) in &graph.blobs {
-                    insert.execute(params![blob, data])?;
-                }
-            }
-            transaction.execute(
-                "INSERT INTO meta (key, value) VALUES ('0', ?1)",
-                [base16ct::lower::encode_string(meta.to_string().as_bytes())],
-            )?;
-            transaction.commit()?;
-            Ok(())
-        })?;
         let mut sidecar = json!({
             "schemaVersion": 1,
             "createdAtMs": created,
@@ -222,10 +205,31 @@ impl Adapter for CursorAdapter {
         if let Some(title) = export.title {
             sidecar["title"] = json!(title);
         }
-        files::create_new(&dir.join("meta.json"), sidecar.to_string().as_bytes())?;
+        fs::create_dir_all(dir.parent().expect("session directories have a parent"))?;
+        let stamp = files::create_dir_with(&dir, || {
+            files::create_new(&dir.join("meta.json"), sidecar.to_string().as_bytes())?;
+            sqlite::publish_new(&store, |connection| {
+                connection.execute_batch(SCHEMA)?;
+                let transaction = connection.transaction()?;
+                {
+                    let mut insert =
+                        transaction.prepare("INSERT INTO blobs (id, data) VALUES (?1, ?2)")?;
+                    for (blob, data) in &graph.blobs {
+                        insert.execute(params![blob, data])?;
+                    }
+                }
+                transaction.execute(
+                    "INSERT INTO meta (key, value) VALUES ('0', ?1)",
+                    [base16ct::lower::encode_string(meta.to_string().as_bytes())],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })?;
+            sqlite::stamp(&store)
+        })?;
         Ok(NativeSession {
             id,
-            stamp: sqlite::stamp(&store)?,
+            stamp,
             path: store,
             title: None,
         })

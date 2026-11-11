@@ -80,7 +80,7 @@ pub(in crate::opencode) fn parse(bundle: &Value, blobs: &Blobs) -> Result<Native
                         }
                         "tool" => {
                             if tool_order::synthetic_call_id(&part["state"]).is_none() {
-                                drafts.push(draft(tool_call(part), &part["id"]));
+                                drafts.push(draft(tool_call(part)?, &part["id"]));
                             }
                             if let Some(result) = tool_result(blobs, part)? {
                                 results.push(draft(result, &part["id"]));
@@ -117,12 +117,12 @@ pub(in crate::opencode) fn named(title: Option<String>) -> Option<String> {
     title.filter(|title| !title.is_empty() && !title.starts_with(UNNAMED))
 }
 
-fn tool_call(part: &Value) -> Body {
-    Body::ToolCall(ToolCall {
-        call_id: normalize::call_id(&part["callID"]),
+fn tool_call(part: &Value) -> Result<Body> {
+    Ok(Body::ToolCall(ToolCall {
+        call_id: normalize::call_id(&part["callID"])?,
         name: part["tool"].as_str().unwrap_or("unknown").to_owned(),
         input: normalize::tool_input(part["state"]["input"].clone()),
-    })
+    }))
 }
 
 // Pending and running calls have no result yet
@@ -154,8 +154,10 @@ fn tool_result(blobs: &Blobs, part: &Value) -> Result<Option<Body>> {
         _ => return Ok(None),
     };
     Ok(Some(Body::ToolResult(ToolResult {
-        call_id: tool_order::synthetic_call_id(state)
-            .map_or_else(|| normalize::call_id(&part["callID"]), str::to_owned),
+        call_id: tool_order::synthetic_call_id(state).map_or_else(
+            || normalize::call_id(&part["callID"]),
+            |id| Ok(id.to_owned()),
+        )?,
         text: text.unwrap_or_default().to_owned(),
         images: attached,
         is_error,

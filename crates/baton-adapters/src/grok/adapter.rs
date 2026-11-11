@@ -141,10 +141,8 @@ impl Adapter for GrokAdapter {
             files::publish(&sidecar, cwd.as_bytes())?;
         }
         let dir = bucket.join(&id);
-        fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let updates = dir.join("updates.jsonl");
         let lines = writer.lines();
-        files::create_new(&updates, writer.finish().as_bytes())?;
         let updated = export
             .events
             .last()
@@ -165,10 +163,15 @@ impl Adapter for GrokAdapter {
             summary["generated_title"] = json!(title);
             summary["title_is_manual"] = json!(true);
         }
-        files::create_new(&dir.join("summary.json"), summary.to_string().as_bytes())?;
+        let stamp = files::create_dir_with(&dir, || {
+            files::create_new(&updates, writer.finish().as_bytes())?;
+            let stamp = Stamp::of(&updates)?;
+            files::create_new(&dir.join("summary.json"), summary.to_string().as_bytes())?;
+            Ok(stamp)
+        })?;
         Ok(NativeSession {
             id,
-            stamp: Stamp::of(&updates)?,
+            stamp,
             path: updates,
             title: None,
         })

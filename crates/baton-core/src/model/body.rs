@@ -79,6 +79,19 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+/// Keeps nonempty ids of ASCII letters, digits, `_` and `-`, and replaces any other id with `call_` and 32 hex digits of its SHA-256, since replacing characters can make two ids equal
+pub fn portable_call_id(id: &str) -> String {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        id.to_owned()
+    } else {
+        format!("call_{}", &crate::hash::sha256_hex(id.as_bytes())[..32])
+    }
+}
+
 /// A summary that replaces everything before it in the model's context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Compaction {

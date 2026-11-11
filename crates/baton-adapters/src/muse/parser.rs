@@ -28,9 +28,9 @@ impl<'a> LogParser<'a> {
     }
 
     // Records mirrored from other streams belong to those streams
-    fn bodies(&mut self, envelope: &Value) -> Vec<Body> {
+    fn bodies(&mut self, envelope: &Value) -> Result<Vec<Body>> {
         if envelope["stream"]["id"] != self.session {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if self.info.created.is_none() {
             self.info.created = envelope["recorded_at"]
@@ -38,8 +38,8 @@ impl<'a> LogParser<'a> {
                 .and_then(|micros| time::from_unix_millis(micros / 1000));
         }
         let payload = &envelope["payload"];
-        match envelope["payload_type"].as_str().unwrap_or_default() {
-            "runtime.session" if payload["kind"] == "run" => self.run_event(&payload["event"]),
+        let bodies = match envelope["payload_type"].as_str().unwrap_or_default() {
+            "runtime.session" if payload["kind"] == "run" => self.run_event(&payload["event"])?,
             "runtime.session.metadata" | "runtime.session.route_facts" => {
                 let record = &payload["record"];
                 if self.info.cwd.is_none() {
@@ -56,11 +56,12 @@ impl<'a> LogParser<'a> {
             }
             "run.model.configured" => self.model(&payload["record"]["model_id"]),
             _ => Vec::new(),
-        }
+        };
+        Ok(bodies)
     }
 
-    fn run_event(&mut self, event: &Value) -> Vec<Body> {
-        match event["kind"].as_str().unwrap_or_default() {
+    fn run_event(&mut self, event: &Value) -> Result<Vec<Body>> {
+        let bodies = match event["kind"].as_str().unwrap_or_default() {
             "started" => prompt(event["prompt"].as_str().unwrap_or_default()),
             "assistant_message_committed" => event["text"]
                 .as_str()
@@ -80,7 +81,7 @@ impl<'a> LogParser<'a> {
                         &call["id"]
                     };
                     bodies.push(Body::ToolCall(ToolCall {
-                        call_id: normalize::call_id(id),
+                        call_id: normalize::call_id(id)?,
                         name: call["name"].as_str().unwrap_or("unknown").to_owned(),
                         input: normalize::arguments(&call["args"]),
                     }));
@@ -92,9 +93,9 @@ impl<'a> LogParser<'a> {
                     .as_array()
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                results.iter().map(result).collect()
+                results.iter().map(result).collect::<Result<_>>()?
             }
-            "tool_result_committed" | "tool_result" => vec![result(event)],
+            "tool_result_committed" | "tool_result" => vec![result(event)?],
             "reasoning_summary_committed" | "reasoning_committed" => {
                 let thinking = Thinking {
                     text: event["text"].as_str().unwrap_or_default().to_owned(),
@@ -110,7 +111,8 @@ impl<'a> LogParser<'a> {
             // Muse keeps no summary of its own compactions in the log, so the history stays in force
             "context_compaction_installed" => vec![Body::Meta(json!({"type": "compaction"}))],
             _ => Vec::new(),
-        }
+        };
+        Ok(bodies)
     }
 
     fn model(&mut self, model: &Value) -> Vec<Body> {
@@ -137,7 +139,7 @@ fn prompt(text: &str) -> Vec<Body> {
     normalize::user(markers::decode(text)).into_iter().collect()
 }
 
-fn result(entry: &Value) -> Body {
+fn result(entry: &Value) -> Result<Body> {
     let text = ["text", "output", "result"]
         .iter()
         .find_map(|key| entry[key].as_str())
@@ -148,12 +150,12 @@ fn result(entry: &Value) -> Body {
         &entry["call_id"]
     };
     let (content, is_error) = markers::decode_result(text);
-    Body::ToolResult(ToolResult {
-        call_id: normalize::call_id(id),
+    Ok(Body::ToolResult(ToolResult {
+        call_id: normalize::call_id(id)?,
         is_error: is_error || text.starts_with(FAILED),
         text: content.text,
         images: content.images,
-    })
+    }))
 }
 
 impl Parser for LogParser<'_> {
@@ -180,7 +182,7 @@ impl Parser for LogParser<'_> {
                 .as_i64()
                 .and_then(|micros| time::from_unix_millis(micros / 1000))
                 .unwrap_or(fallback);
-            for body in self.bodies(envelope) {
+            for body in self.bodies(envelope)? {
                 drafts.push(Draft {
                     timestamp: timestamp.clone(),
                     native_entry_id: json::string(&envelope["id"]),

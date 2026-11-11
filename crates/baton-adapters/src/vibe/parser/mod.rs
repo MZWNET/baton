@@ -1,3 +1,6 @@
+pub(super) mod legacy;
+pub(super) mod unified;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -14,8 +17,8 @@ const ERROR_OPEN: &str = "<tool_error>";
 const ERROR_CLOSE: &str = "</tool_error>";
 const CANCELLED_OPEN: &str = "<user_cancellation>";
 const CANCELLED_CLOSE: &str = "</user_cancellation>";
-// The envelope older Vibe versions wrapped a compaction summary in
-const SUMMARY_TAGS: [&str; 4] = [
+// The envelope Vibe wraps a compaction summary in, which older versions logged as one message
+pub(super) const SUMMARY_TAGS: [&str; 4] = [
     "<previous_user_messages>",
     "</previous_user_messages>",
     "<compaction_summary>",
@@ -96,7 +99,7 @@ impl<'a> MessageParser<'a> {
                     bodies.push(Body::ToolCall(unit::decode_function_call(
                         call,
                         &call["id"],
-                    )));
+                    )?));
                 }
                 bodies
             }
@@ -109,7 +112,7 @@ impl<'a> MessageParser<'a> {
                 vec![Body::ToolResult(if marker.is_object() {
                     self.baton_result(message, content, marker)?
                 } else {
-                    native_result(message, content, result["cancelled"] == true)
+                    native_result(message, content, result["cancelled"] == true)?
                 })]
             }
             _ => Vec::new(),
@@ -138,7 +141,7 @@ impl<'a> MessageParser<'a> {
             }
         }
         Ok(ToolResult {
-            call_id: normalize::call_id(&message["tool_call_id"]),
+            call_id: normalize::call_id(&message["tool_call_id"])?,
             text,
             images: attached,
             is_error,
@@ -165,19 +168,19 @@ impl<'a> MessageParser<'a> {
 }
 
 // Vibe wraps a whole failed or cancelled result in a tag that tells the model what happened
-fn native_result(message: &Value, content: String, cancelled: bool) -> ToolResult {
+fn native_result(message: &Value, content: String, cancelled: bool) -> Result<ToolResult> {
     let (text, wrapped) = match unwrapped(&content, ERROR_OPEN, ERROR_CLOSE)
         .or_else(|| unwrapped(&content, CANCELLED_OPEN, CANCELLED_CLOSE))
     {
         Some(text) => (text.to_owned(), true),
         None => (content, false),
     };
-    ToolResult {
-        call_id: normalize::call_id(&message["tool_call_id"]),
+    Ok(ToolResult {
+        call_id: normalize::call_id(&message["tool_call_id"])?,
         text,
         images: Vec::new(),
         is_error: wrapped || cancelled,
-    }
+    })
 }
 
 fn unwrapped<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {

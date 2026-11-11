@@ -112,13 +112,13 @@ impl<'a> JournalWriter<'a> {
         } else {
             "stop"
         };
-        // The placeholder model makes pi fall back to the configured model instead of restoring a foreign one
+        // Oh My Pi will not open a session whose model it cannot restore but ignores `<synthetic>`, and pi falls back from unknown models, so both use the configured model
         let message = json!({
             "role": "assistant",
             "content": blocks,
             "api": "baton",
             "provider": "baton",
-            "model": "baton",
+            "model": "<synthetic>",
             "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
                       "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
             "stopReason": stop,

@@ -1,20 +1,26 @@
 //! Every adapter baton writes reads back what it wrote, except what its format cannot keep
 
+mod publication;
+#[path = "../support/mod.rs"]
 mod support;
+mod vibe_continuation;
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use baton_adapters::{
     AntigravityAdapter, ClaudeAdapter, CodexAdapter, CopilotAdapter, CursorAdapter, DevinAdapter,
     DshAdapter, GrokAdapter, HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter,
-    OpenhandsAdapter, PiAdapter, QwenAdapter, VibeAdapter,
+    OpenhandsAdapter, PiAdapter, QwenAdapter, RikkahubAdapter, VibeAdapter,
 };
 use baton_core::{Adapter, Agent, Blobs, Body, Event, Export, Image, Source, replay};
 use rusqlite::Connection;
 use serde_json::json;
 
 const CREATED: &str = "2026-01-01T00:00:00.000Z";
+const SETTINGS: &[u8] =
+    br#"{"assistantId":"5f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","launchCount":3}"#;
 
 fn writable_adapter(agent: Agent, root: &Path) -> Option<Box<dyn Adapter>> {
     Some(match agent {
@@ -24,17 +30,21 @@ fn writable_adapter(agent: Agent, root: &Path) -> Option<Box<dyn Adapter>> {
         Agent::Mastracode => Box::new(MastracodeAdapter::new(root.join("mastra.db"))),
         // Hermes and Devin only write into a database their agent created
         Agent::Hermes => {
-            support::database(
-                &root.join("state.db"),
-                include_str!("fixtures/hermes-state.sql"),
-            );
+            if !root.join("state.db").exists() {
+                support::database(
+                    &root.join("state.db"),
+                    include_str!("../fixtures/hermes-state.sql"),
+                );
+            }
             Box::new(HermesAdapter::new(root.to_path_buf()))
         }
         Agent::Devin => {
-            support::database(
-                &root.join("sessions.db"),
-                include_str!("fixtures/devin-sessions.sql"),
-            );
+            if !root.join("sessions.db").exists() {
+                support::database(
+                    &root.join("sessions.db"),
+                    include_str!("../fixtures/devin-sessions.sql"),
+                );
+            }
             Box::new(DevinAdapter::new(root.join("sessions.db")))
         }
         Agent::Copilot => Box::new(CopilotAdapter::new(root.to_path_buf())),
@@ -47,6 +57,10 @@ fn writable_adapter(agent: Agent, root: &Path) -> Option<Box<dyn Adapter>> {
         Agent::Muse => Box::new(MuseAdapter::new(root.to_path_buf())),
         Agent::Antigravity => Box::new(AntigravityAdapter::new(root.to_path_buf())),
         Agent::Cursor => Box::new(CursorAdapter::new(root.to_path_buf())),
+        Agent::Rikkahub => {
+            fs::create_dir_all(root).unwrap();
+            Box::new(RikkahubAdapter::new(Some(root.join("backup.zip"))))
+        }
         // Tests cannot assume their CLIs are installed; src/opencode/tests.rs round-trips their formats
         Agent::Opencode | Agent::Kilo => return None,
         // Baton only reads these agents
@@ -68,8 +82,9 @@ fn sample(blobs: &Blobs) -> Vec<Event> {
         support::assistant("let me check"),
         support::call("call_1", "read", json!({"path": "a.txt"})),
         support::call("call_2", "bash", json!({"command": "ls", "env": {"A": 1}})),
-        support::result("call_1", "file body", vec![image], false),
         support::result("call_2", "permission denied", vec![], true),
+        support::result("call_1", "file body", vec![image], false),
+        support::result("orphan", "isolated result", vec![], false),
         support::assistant("done"),
         support::meta(json!({"type": "model", "model": "x"})),
         support::compaction("summary so far"),
@@ -92,7 +107,7 @@ struct Back {
     file: PathBuf,
 }
 
-fn round_trip(adapter: &dyn Adapter, blobs: &Blobs) -> Back {
+fn round_trip(agent: Agent, root: &Path, blobs: &Blobs) -> Back {
     let events = sample(blobs);
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
@@ -103,7 +118,14 @@ fn round_trip(adapter: &dyn Adapter, blobs: &Blobs) -> Back {
         events: &replayed,
         seed: None,
     };
+    let adapter = writable_adapter(agent, root).unwrap();
     let written = adapter.write(&export, blobs).unwrap();
+    let before_flush = adapter
+        .read(&written, None, blobs)
+        .unwrap_or_else(|error| panic!("{agent} read before flush failed: {error:#}"));
+    adapter.flush().unwrap();
+    drop(adapter);
+    let adapter = writable_adapter(agent, root).unwrap();
     let native = adapter
         .discover(None)
         .unwrap()
@@ -111,6 +133,12 @@ fn round_trip(adapter: &dyn Adapter, blobs: &Blobs) -> Back {
         .find(|native| native.id == written.id)
         .expect("a written session is discoverable");
     let read = adapter.read(&native, None, blobs).unwrap();
+    assert_eq!(
+        support::bodies(&before_flush.drafts),
+        support::bodies(&read.drafts),
+        "{agent}"
+    );
+
     Back {
         expected: replayed.iter().map(|event| event.body.clone()).collect(),
         read: support::bodies(&read.drafts),
@@ -153,17 +181,65 @@ fn seeded_exports_have_the_same_native_id_and_path_in_fresh_stores() {
 }
 
 #[test]
+fn ids_that_differ_natively_keep_their_own_results_through_an_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let pi = support::pi_session(
+        &dir.path().join("pi"),
+        &[
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [
+                {"type": "toolCall", "id": "a|b", "name": "read", "arguments": {}},
+                {"type": "toolCall", "id": "a_b", "name": "bash", "arguments": {}},
+                {"type": "toolCall", "id": "a.b", "name": "grep", "arguments": {}},
+            ]}),
+            json!({"role": "toolResult", "toolCallId": "a_b", "content": "from bash"}),
+            json!({"role": "toolResult", "toolCallId": "a.b", "content": "from grep"}),
+            json!({"role": "toolResult", "toolCallId": "a|b", "content": "from read"}),
+        ],
+    );
+    let read = support::read_session(&pi, &blobs).unwrap();
+    let bodies = support::bodies(&read.drafts);
+    let ids = support::ids(&bodies);
+    assert_eq!(ids["bash"], "a_b");
+    assert_eq!(ids["from bash"], ids["bash"]);
+    assert_eq!(ids["from grep"], ids["grep"]);
+    assert_eq!(ids["from read"], ids["read"]);
+    assert_ne!(ids["read"], ids["bash"]);
+    assert_ne!(ids["grep"], ids["bash"]);
+    assert_ne!(ids["read"], ids["grep"]);
+    assert!(ids.values().all(|id| support::portable(id)), "{ids:?}");
+
+    let events = Event::chain(read.drafts, None, Agent::Pi, "pi-session");
+    let path: Vec<&Event> = events.iter().collect();
+    let replayed = replay::events(&path);
+    let export = Export {
+        title: None,
+        cwd: Path::new("/workspace/demo"),
+        created: CREATED,
+        events: &replayed,
+        seed: None,
+    };
+    let claude = ClaudeAdapter::new(dir.path().join("claude"));
+    claude.write(&export, &blobs).unwrap();
+    let back = support::read_session(&claude, &blobs).unwrap();
+    assert_eq!(support::bodies(&back.drafts), bodies);
+}
+
+#[test]
 fn every_writable_agent_reads_back_what_it_wrote() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     for agent in Agent::ALL {
-        let Some(adapter) = writable_adapter(agent, &dir.path().join(agent.name())) else {
+        let root = dir.path().join(agent.name());
+        let Some(adapter) = writable_adapter(agent, &root) else {
             continue;
         };
-        let back = round_trip(adapter.as_ref(), &blobs);
+        drop(adapter);
+        let back = round_trip(agent, &root, &blobs);
         let keeps_error_flags = !matches!(agent, Agent::Codex | Agent::Hermes);
         let keeps_title = !matches!(agent, Agent::Openhands | Agent::Muse);
-        let keeps_cwd = !matches!(agent, Agent::Openhands);
+        let keeps_cwd = !matches!(agent, Agent::Openhands | Agent::Rikkahub);
         if keeps_error_flags {
             assert_eq!(back.read, back.expected, "{agent}");
         } else {
@@ -188,10 +264,203 @@ fn every_writable_agent_reads_back_what_it_wrote() {
 }
 
 #[test]
+fn rikkahub_adds_sessions_to_a_backup_and_keeps_the_rest_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let backup = dir.path().join("backup.zip");
+    support::rikkahub_backup(
+        &backup,
+        |connection| {
+            connection.execute(
+                "INSERT INTO ConversationEntity (id, title, nodes, create_at, update_at) VALUES ('00000000-0000-4000-8000-000000000001', 'Earlier', '[]', 1, 2)",
+                [],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO memory_consolidation (conversation_id, consolidated_at) VALUES ('00000000-0000-4000-8000-000000000001', 3)",
+                [],
+            ).unwrap();
+        },
+        &[
+            ("settings.json", SETTINGS),
+            ("upload/kept.png", b"kept"),
+            ("fonts/font.ttf", b"font"),
+        ],
+    );
+    let back = round_trip(Agent::Rikkahub, dir.path(), &blobs);
+
+    let entries = support::zip_entries(&backup);
+    let names: HashSet<_> = entries.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names.len(),
+        entries.len(),
+        "RikkaHub refuses backups with duplicate entries"
+    );
+    assert_eq!(
+        entries.len(),
+        5,
+        "the sample attaches one image twice, which the backup stores once"
+    );
+    let blob = blobs.put(b"pixels").unwrap();
+    let upload = format!("upload/{blob}.png");
+    for (name, expected) in [
+        ("settings.json", SETTINGS),
+        ("upload/kept.png", b"kept".as_slice()),
+        ("fonts/font.ttf", b"font".as_slice()),
+        (upload.as_str(), b"pixels".as_slice()),
+    ] {
+        assert_eq!(
+            entries
+                .iter()
+                .find(|(entry, _)| entry == name)
+                .unwrap()
+                .1
+                .as_slice(),
+            expected
+        );
+    }
+    let database = packed_database(dir.path(), &entries);
+    let assistant_id: String = database
+        .query_row(
+            "SELECT assistant_id FROM ConversationEntity WHERE title = 'Round trip'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        assistant_id, "5f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "RikkaHub lists conversations under the assistant selected in its settings"
+    );
+    let earlier: (String, i64) = database.query_row(
+        "SELECT title, consolidated_at FROM ConversationEntity JOIN memory_consolidation ON id = conversation_id WHERE id = '00000000-0000-4000-8000-000000000001'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(earlier, ("Earlier".to_owned(), 3));
+    assert_eq!(
+        replay::digest(&reread(backup, &blobs)),
+        replay::digest(&back.expected)
+    );
+}
+
+#[test]
+fn rikkahub_removes_a_conversation_without_deleting_a_shared_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let backup = dir.path().join("backup.zip");
+    support::rikkahub_backup(&backup, |_| {}, &[]);
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let image = Image {
+        blob: blobs.put(b"shared pixels").unwrap(),
+        mime: "image/png".into(),
+    };
+    let body = support::user("shared image", vec![image.clone()]);
+    let events = Event::chain([support::draft(body.clone())], None, Agent::Pi, "source");
+    let path: Vec<&Event> = events.iter().collect();
+    let replayed = replay::events(&path);
+    let export = Export {
+        title: Some("Shared image"),
+        cwd: Path::new("/work/demo"),
+        created: CREATED,
+        events: &replayed,
+        seed: None,
+    };
+    let adapter = RikkahubAdapter::new(Some(backup.clone()));
+    let removed = adapter.write(&export, &blobs).unwrap();
+    let kept = adapter.write(&export, &blobs).unwrap();
+    adapter.flush().unwrap();
+    adapter.remove(&removed).unwrap();
+    adapter.flush().unwrap();
+    drop(adapter);
+
+    let adapter = RikkahubAdapter::new(Some(backup.clone()));
+    let sessions = adapter.discover(None).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, kept.id);
+    let restored_blobs = Blobs::new(dir.path().join("restored-blobs"));
+    let read = adapter.read(&sessions[0], None, &restored_blobs).unwrap();
+    assert_eq!(support::bodies(&read.drafts), vec![body]);
+    assert_eq!(restored_blobs.get(&image.blob).unwrap(), b"shared pixels");
+    let upload = format!("upload/{}.png", image.blob);
+    let entries = support::zip_entries(&backup);
+    assert!(
+        entries
+            .iter()
+            .any(|(name, bytes)| name == &upload && bytes == b"shared pixels")
+    );
+}
+
+#[test]
+fn rikkahub_creates_a_missing_backup_that_restores_without_touching_the_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let backup = dir.path().join("backup.zip");
+    let back = round_trip(Agent::Rikkahub, dir.path(), &blobs);
+
+    let entries = support::zip_entries(&backup);
+    let names: HashSet<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+    let upload = format!("upload/{}.png", blobs.put(b"pixels").unwrap());
+    assert_eq!(
+        names,
+        HashSet::from(["rikka_hub.db", upload.as_str()]),
+        "restoring a backup without settings.json keeps the app's settings"
+    );
+    let database = packed_database(dir.path(), &entries);
+    let version: i64 = database
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let identity: String = database
+        .query_row(
+            "SELECT identity_hash FROM room_master_table WHERE id = 42",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        (version, identity.as_str()),
+        (32, "c64deeb13766eaf6528a2f4f6965c836"),
+        "the app only opens a database whose schema version it can identify"
+    );
+    let assistant_id: String = database
+        .query_row("SELECT assistant_id FROM ConversationEntity", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        assistant_id, "0950e2dc-9bd5-4801-afa3-aa887aa36b4e",
+        "without settings, the sessions go to the app's built-in assistant"
+    );
+    assert_eq!(
+        replay::digest(&reread(backup, &blobs)),
+        replay::digest(&back.expected)
+    );
+}
+
+// The database packed in a backup, opened from a copy
+fn packed_database(dir: &Path, entries: &[(String, Vec<u8>)]) -> Connection {
+    let (_, bytes) = entries
+        .iter()
+        .find(|(name, _)| name == "rikka_hub.db")
+        .unwrap();
+    let db = dir.join("packed.db");
+    fs::write(&db, bytes).unwrap();
+    Connection::open(db).unwrap()
+}
+
+// The one conversation of a packed backup, as a new adapter reads it
+fn reread(backup: PathBuf, blobs: &Blobs) -> Vec<Body> {
+    let adapter = RikkahubAdapter::new(Some(backup));
+    let natives = adapter.discover(None).unwrap();
+    let native = natives
+        .iter()
+        .find(|native| native.title.as_deref() == Some("Round trip"))
+        .unwrap();
+    support::bodies(&adapter.read(native, None, blobs).unwrap().drafts)
+}
+
+#[test]
 fn pi_buckets_sessions_by_the_escaped_project_path() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    round_trip(&PiAdapter::new(Agent::Pi, dir.path().join("pi")), &blobs);
+    round_trip(Agent::Pi, &dir.path().join("pi"), &blobs);
     assert!(
         dir.path().join("pi/sessions/--work-demo--").is_dir(),
         "pi buckets sessions by the escaped project path"
@@ -203,7 +472,7 @@ fn omp_writes_a_title_slot_and_blob_files_without_pi_claiming_its_journal() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("omp");
-    let back = round_trip(&PiAdapter::new(Agent::Omp, root.clone()), &blobs);
+    let back = round_trip(Agent::Omp, &root, &blobs);
     let text = fs::read_to_string(&back.file).unwrap();
     assert_eq!(
         text.find('\n'),
@@ -229,7 +498,7 @@ fn claude_names_project_directories_after_the_dashed_path() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("claude");
-    round_trip(&ClaudeAdapter::new(root.clone()), &blobs);
+    round_trip(Agent::Claude, &root, &blobs);
     assert!(
         root.join("projects/-work-demo").is_dir(),
         "Claude Code names project directories after the dashed path"
@@ -245,7 +514,7 @@ fn codex_writes_the_configured_provider_and_indexes_the_title() {
         &root.join("config.toml"),
         "model = \"m\"\nmodel_provider = \"custom\" # local proxy\n\n[model_providers.custom]\nmodel_provider = \"nested\"\n",
     );
-    let back = round_trip(&CodexAdapter::new(root.clone()), &blobs);
+    let back = round_trip(Agent::Codex, &root, &blobs);
     let rollout = fs::read_to_string(&back.file).unwrap();
     assert!(
         rollout.contains(r#""model_provider":"custom""#),
@@ -288,9 +557,8 @@ fn hermes_replays_from_the_last_summary() {
     let blobs = Blobs::new(dir.path().join("blobs"));
     let home = dir.path().join("hermes");
     let db = home.join("state.db");
-    support::database(&db, include_str!("fixtures/hermes-state.sql"));
-    let adapter = HermesAdapter::new(home);
-    round_trip(&adapter, &blobs);
+    support::database(&db, include_str!("../fixtures/hermes-state.sql"));
+    round_trip(Agent::Hermes, &home, &blobs);
     let connection = Connection::open(&db).unwrap();
     let mut statement = connection
         .prepare("SELECT content FROM messages WHERE active = 1 ORDER BY id")
@@ -318,11 +586,10 @@ fn hermes_leaves_out_a_title_another_session_holds() {
     let home = dir.path().join("hermes");
     support::database(
         &home.join("state.db"),
-        include_str!("fixtures/hermes-state.sql"),
+        include_str!("../fixtures/hermes-state.sql"),
     );
-    let adapter = HermesAdapter::new(home);
-    round_trip(&adapter, &blobs);
-    let again = round_trip(&adapter, &blobs);
+    round_trip(Agent::Hermes, &home, &blobs);
+    let again = round_trip(Agent::Hermes, &home, &blobs);
     assert_eq!(replay::digest(&again.read), replay::digest(&again.expected));
     assert_eq!(
         again.title, None,
@@ -335,7 +602,7 @@ fn mastracode_files_threads_under_the_project_resource_id() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let db = dir.path().join("mastracode/mastra.db");
-    round_trip(&MastracodeAdapter::new(db.clone()), &blobs);
+    round_trip(Agent::Mastracode, db.parent().unwrap(), &blobs);
     let connection = Connection::open(&db).unwrap();
     let resource: String = connection
         .query_row("SELECT \"resourceId\" FROM mastra_threads", [], |row| {
@@ -359,8 +626,8 @@ fn devin_indexes_user_input_and_replies_for_search() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let db = dir.path().join("devin/sessions.db");
-    support::database(&db, include_str!("fixtures/devin-sessions.sql"));
-    round_trip(&DevinAdapter::new(db.clone()), &blobs);
+    support::database(&db, include_str!("../fixtures/devin-sessions.sql"));
+    round_trip(Agent::Devin, db.parent().unwrap(), &blobs);
     let connection = Connection::open(&db).unwrap();
     let searchable: i64 = connection
         .query_row("SELECT count(*) FROM message_search", [], |row| row.get(0))
@@ -375,7 +642,7 @@ fn devin_indexes_user_input_and_replies_for_search() {
 fn copilot_writes_the_title_in_its_workspace_file() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let back = round_trip(&CopilotAdapter::new(dir.path().join("copilot")), &blobs);
+    let back = round_trip(Agent::Copilot, &dir.path().join("copilot"), &blobs);
     let workspace = fs::read_to_string(back.file.with_file_name("workspace.yaml")).unwrap();
     assert!(
         workspace.contains("name: \"Round trip\"\nuser_named: true\n"),
@@ -384,11 +651,50 @@ fn copilot_writes_the_title_in_its_workspace_file() {
 }
 
 #[test]
+fn grok_preserves_orphan_results_and_later_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let image = Image {
+        blob: blobs.put(b"pixels").unwrap(),
+        mime: "image/png".into(),
+    };
+    let bodies = vec![
+        support::user("look", vec![image.clone()]),
+        support::result("missing", "orphan", vec![image.clone()], true),
+        support::result("late", "before call", vec![], false),
+        support::call("late", "read", json!({"path": "a"})),
+        support::result("late", "after call", vec![], false),
+    ];
+    let events = Event::chain(
+        bodies.clone().into_iter().map(support::draft),
+        None,
+        Agent::Pi,
+        "source",
+    );
+    let path: Vec<&Event> = events.iter().collect();
+    let adapter = GrokAdapter::new(dir.path().join("grok"));
+    let native = adapter
+        .write(
+            &Export {
+                title: None,
+                cwd: Path::new("/work"),
+                created: CREATED,
+                events: &path,
+                seed: None,
+            },
+            &blobs,
+        )
+        .unwrap();
+    let read = adapter.read(&native, None, &blobs).unwrap();
+    assert_eq!(support::bodies(&read.drafts), bodies);
+}
+
+#[test]
 fn grok_buckets_sessions_by_the_encoded_working_directory() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("grok");
-    round_trip(&GrokAdapter::new(root.clone()), &blobs);
+    round_trip(Agent::Grok, &root, &blobs);
     assert!(
         root.join("sessions/%2Fwork%2Fdemo").is_dir(),
         "Grok buckets sessions by the percent-encoded working directory"
@@ -399,10 +705,7 @@ fn grok_buckets_sessions_by_the_encoded_working_directory() {
 fn openhands_writes_a_system_prompt_and_naive_local_timestamps() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let back = round_trip(
-        &OpenhandsAdapter::new(dir.path().join("conversations")),
-        &blobs,
-    );
+    let back = round_trip(Agent::Openhands, &dir.path().join("conversations"), &blobs);
     let first = fs::read_dir(back.file.join("events"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -420,10 +723,65 @@ fn openhands_writes_a_system_prompt_and_naive_local_timestamps() {
 }
 
 #[test]
+fn openhands_preserves_timestamps_in_the_repeated_dst_hour() {
+    const CHILD: &str = "BATON_OPENHANDS_DST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        support::run_in_child(
+            "openhands_preserves_timestamps_in_the_repeated_dst_hour",
+            None,
+            |command| {
+                command.env(CHILD, "1").env("TZ", "EST5EDT,M3.2.0,M11.1.0");
+            },
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let bodies = vec![support::user("first", vec![]), support::assistant("second")];
+    let timestamps = ["2026-11-01T05:30:00.000Z", "2026-11-01T06:10:00.000Z"];
+    let drafts = bodies
+        .iter()
+        .cloned()
+        .zip(timestamps)
+        .map(|(body, timestamp)| {
+            let mut draft = support::draft(body);
+            draft.timestamp = timestamp.into();
+
+            draft
+        });
+    let events = Event::chain(drafts, None, Agent::Pi, "source");
+    let path: Vec<&Event> = events.iter().collect();
+    let replayed = replay::events(&path);
+    let adapter = OpenhandsAdapter::new(dir.path().join("conversations"));
+    let native = adapter
+        .write(
+            &Export {
+                title: None,
+                cwd: Path::new("/work"),
+                created: timestamps[0],
+                events: &replayed,
+                seed: None,
+            },
+            &blobs,
+        )
+        .unwrap();
+    let read = adapter.read(&native, None, &blobs).unwrap();
+    assert_eq!(support::bodies(&read.drafts), bodies);
+    assert_eq!(
+        read.drafts
+            .iter()
+            .map(|draft| draft.timestamp.as_str())
+            .collect::<Vec<_>>(),
+        timestamps
+    );
+}
+
+#[test]
 fn vibe_writes_the_message_count_in_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let back = round_trip(&VibeAdapter::new(dir.path().join("vibe")), &blobs);
+    let back = round_trip(Agent::Vibe, &dir.path().join("vibe"), &blobs);
     let lines = fs::read_to_string(&back.file).unwrap().lines().count();
     let meta: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(back.file.with_file_name("meta.json")).unwrap())
@@ -444,8 +802,8 @@ fn vibe_answers_calls_whose_results_come_later_with_lines_it_reads_past() {
         support::call("call_x", "read", json!({"path": "x"})),
         support::assistant("second"),
         support::call("call_y", "read", json!({"path": "y"})),
-        support::result("call_x", "x body", vec![], false),
         support::result("call_y", "y body", vec![], true),
+        support::result("call_x", "x body", vec![], false),
         support::result("orphan", "no call", vec![], false),
         support::user("next", vec![]),
         support::call("call_z", "read", json!({"path": "z"})),
@@ -465,9 +823,19 @@ fn vibe_answers_calls_whose_results_come_later_with_lines_it_reads_past() {
         events: &replayed,
         seed: None,
     };
-    let adapter = VibeAdapter::new(dir.path().join("vibe"));
+    let root = dir.path().join("vibe");
+    let adapter = VibeAdapter::new(root.clone());
     let written = adapter.write(&export, &blobs).unwrap();
-    let read = adapter.read(&written, None, &blobs).unwrap();
+    adapter.flush().unwrap();
+    drop(adapter);
+    let adapter = VibeAdapter::new(root);
+    let native = adapter
+        .discover(None)
+        .unwrap()
+        .into_iter()
+        .find(|native| native.id == written.id)
+        .unwrap();
+    let read = adapter.read(&native, None, &blobs).unwrap();
     let expected: Vec<Body> = replayed.iter().map(|event| event.body.clone()).collect();
     assert_eq!(support::bodies(&read.drafts), expected);
 }
@@ -477,7 +845,7 @@ fn qwen_names_project_directories_after_the_dashed_path() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("qwen");
-    round_trip(&QwenAdapter::new(root.clone()), &blobs);
+    round_trip(Agent::Qwen, &root, &blobs);
     assert!(
         root.join("projects/-work-demo/chats").is_dir(),
         "Qwen Code names project directories after the dashed path"
@@ -488,11 +856,11 @@ fn qwen_names_project_directories_after_the_dashed_path() {
 fn kimi_records_the_count_replaced_by_the_last_summary() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let back = round_trip(&KimiAdapter::new(dir.path().join("kimi")), &blobs);
+    let back = round_trip(Agent::Kimi, &dir.path().join("kimi"), &blobs);
     let wire = fs::read_to_string(&back.file).unwrap();
     assert!(
-        wire.contains(r#""compactedCount":6"#),
-        "the summary replaces the six messages before it in Kimi's context: {wire}"
+        wire.contains(r#""compactedCount":7"#),
+        "the summary replaces the seven messages before it in Kimi's context: {wire}"
     );
 }
 
@@ -501,7 +869,7 @@ fn dsh_writes_its_session_file_in_the_project_bucket() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("dsh");
-    let back = round_trip(&DshAdapter::new(root.clone()), &blobs);
+    let back = round_trip(Agent::Dsh, &root, &blobs);
     assert_eq!(back.file.file_name().unwrap(), "session.v4.jsonl.zstd");
     assert_eq!(
         back.file.parent().and_then(|dir| dir.parent()),
@@ -513,7 +881,7 @@ fn dsh_writes_its_session_file_in_the_project_bucket() {
 fn muse_writes_gapless_sequence_numbers() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
-    let back = round_trip(&MuseAdapter::new(dir.path().join("muse")), &blobs);
+    let back = round_trip(Agent::Muse, &dir.path().join("muse"), &blobs);
     let log = fs::read_to_string(&back.file).unwrap();
     let sequences: Vec<u64> = log
         .lines()
@@ -535,7 +903,7 @@ fn antigravity_lists_the_conversation_in_its_summary_database() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("antigravity-cli");
-    round_trip(&AntigravityAdapter::new(root.clone()), &blobs);
+    round_trip(Agent::Antigravity, &root, &blobs);
     let summaries = Connection::open(root.join("conversation_summaries.db")).unwrap();
     let (steps, uris): (i64, String) = summaries
         .query_row(
@@ -544,7 +912,7 @@ fn antigravity_lists_the_conversation_in_its_summary_database() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(steps, 9, "agy lists a conversation with its step count");
+    assert_eq!(steps, 10, "agy lists a conversation with its step count");
     assert_eq!(uris, r#"["file:///work/demo"]"#);
 }
 
@@ -553,7 +921,7 @@ fn cursor_buckets_chats_by_the_md5_of_their_directory() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
     let root = dir.path().join("cursor");
-    let back = round_trip(&CursorAdapter::new(root.clone()), &blobs);
+    let back = round_trip(Agent::Cursor, &root, &blobs);
     assert_eq!(
         back.file.parent().and_then(|dir| dir.parent()),
         Some(

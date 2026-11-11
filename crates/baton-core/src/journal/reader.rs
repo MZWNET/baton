@@ -1,16 +1,16 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::iter;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::journal::tree::Tree;
 use crate::journal::{Line, Parser};
-use crate::{Cursor, NativeRead, Progress, hash};
+use crate::{Cursor, NativeRead, Progress};
 
-// Bytes before the cursor offset that must be unchanged for an incremental read
-const TAIL_WINDOW: usize = 1024;
+const HASH_VERSION: &str = "v1:";
 
 /// One complete line of a JSON Lines file.
 pub struct JsonLine<'a> {
@@ -68,22 +68,33 @@ fn read_tail<P: Parser>(
     progress: &Progress,
     mut parser: P,
 ) -> Result<Option<NativeRead>> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let window_start = progress.offset.saturating_sub(TAIL_WINDOW as u64);
+    if !progress.tail_hash.starts_with(HASH_VERSION) {
+        return Ok(None);
+    }
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    file.seek(SeekFrom::Start(window_start))?;
+    let mut prefix = (&mut file).take(progress.offset);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 32 * 1024];
+    loop {
+        let count = prefix.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if prefix.limit() != 0 || prefix_hash(&hasher) != progress.tail_hash {
+        return Ok(None);
+    }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    let known = (progress.offset - window_start) as usize;
-    if bytes.len() <= known || hash_tail(&bytes[..known]) != progress.tail_hash {
+    if bytes.is_empty() {
         return Ok(None);
     }
     let mut leaf = progress.leaf.clone();
     let mut drafts = Vec::new();
-    let mut end = known;
-    for line in lines(&bytes[known..]) {
-        end = known + line.end;
+    let mut end = 0;
+    for line in lines(&bytes) {
+        end = line.end;
         let Ok(value) = serde_json::from_slice(line.bytes) else {
             continue;
         };
@@ -101,13 +112,14 @@ fn read_tail<P: Parser>(
             Line::Restart => return Ok(None),
         }
     }
+    hasher.update(&bytes[..end]);
     Ok(Some(NativeRead {
         info: parser.finish(),
         drafts,
         continued: true,
         progress: Progress {
-            offset: window_start + end as u64,
-            tail_hash: hash_tail(&bytes[..end]),
+            offset: progress.offset + end as u64,
+            tail_hash: prefix_hash(&hasher),
             leaf,
         },
     }))
@@ -126,7 +138,7 @@ fn read_full<P: Parser>(path: &Path, mut parser: P) -> Result<NativeRead> {
     };
     let mut tree = Tree::default();
     let mut end = 0u64;
-    let mut tail = Vec::with_capacity(TAIL_WINDOW);
+    let mut hasher = Sha256::new();
     let mut line = Vec::new();
     while reader.read_until(b'\n', &mut line)? != 0 {
         if !compressed && line.last() != Some(&b'\n') {
@@ -134,14 +146,7 @@ fn read_full<P: Parser>(path: &Path, mut parser: P) -> Result<NativeRead> {
         }
         let start = end;
         end += line.len() as u64;
-        if line.len() >= TAIL_WINDOW {
-            tail.clear();
-            tail.extend_from_slice(&line[line.len() - TAIL_WINDOW..]);
-        } else {
-            let excess = (tail.len() + line.len()).saturating_sub(TAIL_WINDOW);
-            tail.drain(..excess);
-            tail.extend_from_slice(&line);
-        }
+        hasher.update(&line);
         let bytes = line.strip_suffix(b"\n").unwrap_or(&line);
         if let Ok(value) = serde_json::from_slice(bytes)
             && let Line::Node(node) = parser.line(start, value)?
@@ -157,15 +162,17 @@ fn read_full<P: Parser>(path: &Path, mut parser: P) -> Result<NativeRead> {
         continued: false,
         progress: Progress {
             offset: end,
-            tail_hash: hash::sha256_hex(&tail),
+            tail_hash: prefix_hash(&hasher),
             leaf: active.leaf,
         },
     })
 }
 
-fn hash_tail(bytes: &[u8]) -> String {
-    let start = bytes.len().saturating_sub(TAIL_WINDOW);
-    hash::sha256_hex(&bytes[start..])
+fn prefix_hash(hasher: &Sha256) -> String {
+    format!(
+        "{HASH_VERSION}{}",
+        base16ct::lower::encode_string(&hasher.clone().finalize())
+    )
 }
 
 #[cfg(test)]
@@ -184,11 +191,12 @@ mod tests {
     impl Parser for Echo {
         fn line(&mut self, _offset: u64, value: Value) -> Result<Line> {
             let id: String = value["id"].as_str().unwrap().into();
+            let text = value["text"].as_str().unwrap_or(&id).to_owned();
             Ok(Line::Node(Node {
                 drafts: vec![Draft {
                     timestamp: "2026-01-01T00:00:00.000Z".into(),
                     native_entry_id: None,
-                    body: Body::Assistant(Assistant { text: id.clone() }),
+                    body: Body::Assistant(Assistant { text }),
                 }],
                 id,
                 parent: value["parent"].as_str().map(Into::into),
@@ -290,5 +298,72 @@ mod tests {
         .unwrap();
         let rewritten = read(&path, Some(&cursor(&path, first.progress)), |_| Echo).unwrap();
         assert!(!rewritten.continued, "a rewritten prefix is read in full");
+    }
+
+    #[test]
+    fn rewriting_early_history_before_an_append_reads_the_whole_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let first_line = json!({"id": "a", "text": "old", "zpadding": "x".repeat(2048)});
+        let second_line = json!({"id": "b", "parent": "a"});
+        fs::write(&path, format!("{first_line}\n{second_line}\n")).unwrap();
+        let first = read(&path, None, |_| Echo).unwrap();
+
+        let rewritten = json!({"id": "a", "text": "new", "zpadding": "x".repeat(2048)});
+        let appended = json!({"id": "c", "parent": "b"});
+        fs::write(&path, format!("{rewritten}\n{second_line}\n{appended}\n")).unwrap();
+        let result = read(&path, Some(&cursor(&path, first.progress)), |_| Echo).unwrap();
+        assert!(!result.continued);
+        assert_eq!(texts(&result), ["new", "b", "c"]);
+    }
+
+    #[test]
+    fn old_cursor_reads_in_full_before_resuming_incrementally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        fs::write(&path, "{\"id\":\"a\"}\n").unwrap();
+        let mut progress = read(&path, None, |_| Echo).unwrap().progress;
+        progress.tail_hash = "old-unversioned-hash".into();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"id\":\"b\",\"parent\":\"a\"}\n")
+            .unwrap();
+
+        let result = read(&path, Some(&cursor(&path, progress)), |_| Echo).unwrap();
+        assert!(!result.continued);
+        assert_eq!(texts(&result), ["a", "b"]);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"id\":\"c\",\"parent\":\"b\"}\n")
+            .unwrap();
+        let resumed = read(&path, Some(&cursor(&path, result.progress)), |_| Echo).unwrap();
+        assert!(resumed.continued);
+        assert_eq!(texts(&resumed), ["c"]);
+    }
+
+    #[test]
+    fn incomplete_append_is_consumed_only_after_its_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        fs::write(&path, "{\"id\":\"a\"}\n").unwrap();
+        let first = read(&path, None, |_| Echo).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"id\":\"b\",\"parent\":\"a\"}").unwrap();
+
+        let partial = read(&path, Some(&cursor(&path, first.progress.clone())), |_| {
+            Echo
+        })
+        .unwrap();
+        assert!(partial.continued);
+        assert!(partial.drafts.is_empty());
+        assert_eq!(partial.progress.offset, first.progress.offset);
+        file.write_all(b"\n").unwrap();
+        let complete = read(&path, Some(&cursor(&path, partial.progress)), |_| Echo).unwrap();
+        assert!(complete.continued);
+        assert_eq!(texts(&complete), ["b"]);
     }
 }

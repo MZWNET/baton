@@ -1,7 +1,8 @@
 use anyhow::Result;
 use baton_core::journal::{Line, Node, Parser};
 use baton_core::{
-    Blobs, Body, Compaction, Draft, Image, Info, Thinking, ToolCall, ToolResult, time,
+    Blobs, Body, Compaction, Draft, Image, Info, Thinking, ToolCall, ToolResult, portable_call_id,
+    time,
 };
 use serde_json::{Value, json};
 
@@ -28,7 +29,7 @@ impl<'a> RecordParser<'a> {
         }
     }
 
-    fn bodies(&mut self, record: &Value) -> Result<Vec<Body>> {
+    fn bodies(&mut self, record: &Value, record_id: &str) -> Result<Vec<Body>> {
         let parts = record["message"]["parts"]
             .as_array()
             .map(Vec::as_slice)
@@ -51,13 +52,13 @@ impl<'a> RecordParser<'a> {
                     bodies.push(Body::Meta(json!({"type": "model", "model": model})));
                     self.model = Some(model);
                 }
-                for part in parts {
-                    bodies.extend(assistant_part(part));
+                for (position, part) in parts.iter().enumerate() {
+                    bodies.extend(assistant_part(part, record_id, parts[..position].iter()));
                 }
                 bodies
             }
             ("tool_result", _) => self.results(record, parts)?,
-            ("system", Some("chat_compression")) => compaction(&record["systemPayload"]),
+            ("system", Some("chat_compression")) => compaction(&record["systemPayload"], record_id),
             ("system", Some("custom_title")) => {
                 self.info.title = json::string(&record["systemPayload"]["customTitle"])
                     .or(self.info.title.take());
@@ -95,8 +96,9 @@ impl<'a> RecordParser<'a> {
     // A record holds one result per function response; older files put a result's images in sibling parts
     fn results(&self, record: &Value, parts: &[Value]) -> Result<Vec<Body>> {
         let status = record["toolCallResult"]["status"].as_str();
+        let parent_id = record["parentUuid"].as_str().unwrap_or_default();
         let mut results: Vec<ToolResult> = Vec::new();
-        for part in parts {
+        for (position, part) in parts.iter().enumerate() {
             let response = &part["functionResponse"];
             if response.is_null() {
                 if let Some(result) = results.last_mut() {
@@ -132,7 +134,12 @@ impl<'a> RecordParser<'a> {
                 None => reply["error"].is_string() && reply["output"].is_null(),
             };
             results.push(ToolResult {
-                call_id: normalize::call_id(&response["id"]),
+                call_id: call_id(
+                    response,
+                    parent_id,
+                    "functionResponse",
+                    parts[..position].iter(),
+                ),
                 text,
                 images: attached,
                 is_error,
@@ -160,7 +167,11 @@ fn texts(parts: &[Value]) -> String {
     texts.join("\n")
 }
 
-fn assistant_part(part: &Value) -> Option<Body> {
+fn assistant_part<'a>(
+    part: &Value,
+    record_id: &str,
+    earlier: impl Iterator<Item = &'a Value>,
+) -> Option<Body> {
     if let Some(text) = part["text"].as_str() {
         if part["thought"] == true {
             return Some(Body::Thinking(Thinking {
@@ -175,14 +186,37 @@ fn assistant_part(part: &Value) -> Option<Body> {
         return None;
     }
     Some(Body::ToolCall(ToolCall {
-        call_id: normalize::call_id(&call["id"]),
+        call_id: call_id(call, record_id, "functionCall", earlier),
         name: call["name"].as_str().unwrap_or("unknown").to_owned(),
         input: normalize::tool_input(call["args"].clone()),
     }))
 }
 
+fn call_id<'a>(
+    call: &Value,
+    record_id: &str,
+    field: &str,
+    earlier: impl Iterator<Item = &'a Value>,
+) -> String {
+    match call["id"].as_str().filter(|id| !id.is_empty()) {
+        Some(id) => portable_call_id(id),
+        None => {
+            let name = call["name"].as_str().unwrap_or("unknown");
+            let index = earlier
+                .map(|part| &part[field])
+                .filter(|previous| {
+                    !previous.is_null()
+                        && previous["name"].as_str().unwrap_or("unknown") == name
+                        && previous["id"].as_str().is_none_or(str::is_empty)
+                })
+                .count();
+            portable_call_id(&format!("{record_id}-{name}-{index}"))
+        }
+    }
+}
+
 // Qwen resumes a compressed chat from its compressed history: the summary as a user turn, then the model's reply and the calls it still waits on
-fn compaction(payload: &Value) -> Vec<Body> {
+fn compaction(payload: &Value, record_id: &str) -> Vec<Body> {
     let history = payload["compressedHistory"]
         .as_array()
         .map(Vec::as_slice)
@@ -204,16 +238,22 @@ fn compaction(payload: &Value) -> Vec<Body> {
     } else {
         Body::Compaction(Compaction { summary })
     }];
-    for content in history.iter().filter(|content| content["role"] == "model") {
-        let parts = content["parts"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        for part in parts {
-            if !part["functionCall"].is_null() {
-                bodies.extend(assistant_part(part));
-            }
-        }
+    let calls = history
+        .iter()
+        .filter(|content| content["role"] == "model")
+        .flat_map(|content| {
+            content["parts"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        })
+        .filter(|part| !part["functionCall"].is_null());
+    for (position, part) in calls.clone().enumerate() {
+        bodies.extend(assistant_part(
+            part,
+            record_id,
+            calls.clone().take(position),
+        ));
     }
     bodies
 }
@@ -239,7 +279,7 @@ impl Parser for RecordParser<'_> {
             self.info.created = Some(timestamp.clone());
         }
         let mut drafts = Vec::new();
-        for body in self.bodies(&record)? {
+        for body in self.bodies(&record, &id)? {
             drafts.push(Draft {
                 timestamp: timestamp.clone(),
                 native_entry_id: Some(id.clone()),

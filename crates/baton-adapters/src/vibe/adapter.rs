@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -5,20 +6,19 @@ use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 use baton_core::{
-    Adapter, Agent, Blobs, Cursor, Export, Info, NativeRead, NativeSession, Source, Stamp, journal,
-    time,
+    Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp, time,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::support::{files, identifiers, json, program};
 use crate::vibe::fingerprint::fingerprint;
-use crate::vibe::parser::MessageParser;
+use crate::vibe::parser::{legacy, unified};
 use crate::vibe::writer;
 
-/// Sessions of [Mistral Vibe](https://github.com/mistralai/mistral-vibe): a folder per session in its session log directory, holding `messages.jsonl` and `meta.json`.
+/// Sessions of [Mistral Vibe](https://github.com/mistralai/mistral-vibe): a folder per session in its session log directory, holding `messages.jsonl` and `meta.json`, and the sessions of Vibe 3's Unified store in its `unified` subdirectory
 ///
-/// Vibe 3 imports such a folder into a store of its own when it resumes it, so a session continued there does not flow back.
+/// baton writes folders, which Vibe 3 imports into its store when it resumes them. A session continued there keeps the folder's id and reads as the folder's conversation followed by what Vibe 3 added
 pub struct VibeAdapter {
     sessions: PathBuf,
     sessions_lock: Mutex<()>,
@@ -45,25 +45,6 @@ impl VibeAdapter {
         Ok(home.join("logs").join("session"))
     }
 
-    fn probe(dir: &Path) -> Result<Option<NativeSession>> {
-        let messages = dir.join("messages.jsonl");
-        if !messages.is_file() {
-            return Ok(None);
-        }
-        let Some(meta) = meta(dir) else {
-            return Ok(None);
-        };
-        let Some(id) = json::string(&meta["session_id"]) else {
-            return Ok(None);
-        };
-        Ok(Some(NativeSession {
-            id,
-            stamp: Stamp::of(&messages)?,
-            path: messages,
-            title: json::string(&meta["title"]),
-        }))
-    }
-
     // Vibe resumes the folder whose name ends in the first eight characters of the id, so those have to be unique
     fn unused_id(&self, seed: Option<Uuid>) -> Result<String> {
         let names: Vec<String> = files::read_dir(&self.sessions)?
@@ -86,10 +67,6 @@ impl VibeAdapter {
     }
 }
 
-fn meta(dir: &Path) -> Option<Value> {
-    serde_json::from_slice(&fs::read(dir.join("meta.json")).ok()?).ok()
-}
-
 impl Source for VibeAdapter {
     fn agent(&self) -> Agent {
         Agent::Vibe
@@ -97,15 +74,36 @@ impl Source for VibeAdapter {
 
     fn discover(&self, path: Option<&Path>) -> Result<Vec<NativeSession>> {
         let root = path.unwrap_or(&self.sessions);
-        if root.join("meta.json").is_file() {
-            return Ok(VibeAdapter::probe(root)?.into_iter().collect());
+        let absolute;
+        let root = if root.is_file() {
+            absolute = std::path::absolute(root)?;
+            absolute.parent().expect("a file lies in a session folder")
+        } else {
+            root
+        };
+        // Vibe 3 writes a `meta.json` into its own session folders too, and a read looks for the imported folder beside the store, which a relative path may not reach
+        if root.join("CURRENT").is_file() {
+            let dir = std::path::absolute(root)?;
+            let current = dir.join("CURRENT");
+            let store = dir.parent().expect("a session folder lies in its store");
+            let mut sessions = unified_sessions(store)?;
+            sessions.retain(|session| session.path == current);
+            return Ok(sessions);
         }
+        if root.join("meta.json").is_file() {
+            return Ok(probe_legacy(root)?.into_iter().collect());
+        }
+        let unified_sessions = unified_sessions(&root.join("unified"))?;
         let mut sessions = Vec::new();
         for dir in files::read_dir(root)? {
-            if let Some(session) = VibeAdapter::probe(&dir)? {
+            // A session Vibe 3 imported from a folder takes the folder's place
+            if let Some(session) = probe_legacy(&dir)?
+                && !unified_sessions.iter().any(|other| other.id == session.id)
+            {
                 sessions.push(session);
             }
         }
+        sessions.extend(unified_sessions);
         Ok(sessions)
     }
 
@@ -115,29 +113,11 @@ impl Source for VibeAdapter {
         cursor: Option<&Cursor>,
         blobs: &Blobs,
     ) -> Result<NativeRead> {
-        let dir = session
-            .path
-            .parent()
-            .expect("message logs live in a session folder");
-        let meta =
-            meta(dir).with_context(|| format!("reading {}", dir.join("meta.json").display()))?;
-        let created = meta["start_time"].as_str().and_then(time::normalize);
-        let saved = meta["end_time"].as_str().and_then(time::normalize);
-        let started = created.clone().unwrap_or_else(time::now);
-        // Messages have no timestamps, and lines read after a cursor came with the last save
-        let mut read = journal::read(&session.path, cursor, |leaf| {
-            let timestamp = match leaf {
-                Some(_) => saved.clone().unwrap_or_else(|| started.clone()),
-                None => started.clone(),
-            };
-            MessageParser::new(blobs, dir, leaf, timestamp)
-        })?;
-        read.info = Info {
-            cwd: json::string(&meta["environment"]["working_directory"]),
-            title: json::string(&meta["title"]),
-            created,
-        };
-        Ok(read)
+        if session_id(&session.path).is_some() {
+            unified::read(&session.path, blobs)
+        } else {
+            legacy::read(&session.path, cursor, blobs)
+        }
     }
 }
 
@@ -201,6 +181,9 @@ impl Adapter for VibeAdapter {
     }
 
     fn remove(&self, session: &NativeSession) -> Result<()> {
+        if let Some(id) = session_id(&session.path) {
+            bail!("Vibe session {id} lives in Vibe's own store, which baton leaves to Vibe");
+        }
         let dir = session
             .path
             .parent()
@@ -210,10 +193,72 @@ impl Adapter for VibeAdapter {
         files::remove_empty_dir(dir)
     }
 
-    // Vibe runs a resumed session in the directory it starts in
+    // Vibe runs a resumed session in the directory it starts in, and resumes a session of its store under the id Vibe gave it
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {
+        let id = session_id(&session.path).unwrap_or(&session.id);
         let mut command = program::command("vibe");
-        command.arg("--resume").arg(&session.id).current_dir(cwd);
+        command.arg("--resume").arg(id).current_dir(cwd);
         command
     }
+}
+
+fn session_id(path: &Path) -> Option<&str> {
+    if path.file_name()? != "CURRENT" {
+        return None;
+    }
+
+    path.parent()?.file_name()?.to_str()
+}
+
+fn probe_legacy(dir: &Path) -> Result<Option<NativeSession>> {
+    let messages = dir.join("messages.jsonl");
+    if !messages.is_file() {
+        return Ok(None);
+    }
+    let Some(meta) = legacy::meta(dir) else {
+        return Ok(None);
+    };
+    let Some(id) = json::string(&meta["session_id"]) else {
+        return Ok(None);
+    };
+
+    Ok(Some(NativeSession {
+        id,
+        stamp: Stamp::of(&messages)?,
+        path: messages,
+        title: json::string(&meta["title"]),
+    }))
+}
+
+fn unified_sessions(root: &Path) -> Result<Vec<NativeSession>> {
+    let mut generations = Vec::new();
+    for dir in files::read_dir(root)? {
+        // The store keeps a catalog beside the session folders, and passes over a session it cannot load
+        let Ok(generation) = unified::Generation::open(&dir) else {
+            continue;
+        };
+        // A subagent's session resumes only through its parent's
+        if generation.runtime["identity"]["kind"] != "subagent" {
+            generations.push(generation);
+        }
+    }
+    // Of several imports of one legacy folder, Vibe resumes the earliest
+    generations.sort_by(|a, b| a.import_order().cmp(&b.import_order()));
+    let mut claimed = HashSet::new();
+
+    generations
+        .iter()
+        .map(|generation| {
+            let id = match generation.legacy_id() {
+                Some(legacy) if claimed.insert(legacy) => legacy,
+                _ => generation.session_id.as_str(),
+            };
+            Ok(NativeSession {
+                id: id.to_owned(),
+                stamp: generation.stamp()?,
+                path: generation.session_dir.join("CURRENT"),
+                title: None,
+            })
+        })
+        .collect()
 }

@@ -1,7 +1,8 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use baton_core::journal::{Line, Node, Parser};
 use baton_core::{
     Blobs, Body, Compaction, Draft, Image, Info, Thinking, ToolCall, ToolResult, time,
@@ -75,7 +76,7 @@ impl<'a> WireParser<'a> {
                 }
                 for call in parts(&message["toolCalls"]) {
                     bodies.push(Body::ToolCall(ToolCall {
-                        call_id: normalize::call_id(&call["id"]),
+                        call_id: normalize::call_id(&call["id"])?,
                         name: call["name"].as_str().unwrap_or("unknown").to_owned(),
                         input: normalize::arguments(&call["arguments"]),
                     }));
@@ -89,7 +90,7 @@ impl<'a> WireParser<'a> {
                     content,
                     &message["note"],
                     message["isError"] == true,
-                )]
+                )?]
             }
             _ => Vec::new(),
         };
@@ -100,7 +101,7 @@ impl<'a> WireParser<'a> {
         let bodies = match event["type"].as_str().unwrap_or_default() {
             "content.part" => assistant_part(&event["part"]).into_iter().collect(),
             "tool.call" => vec![Body::ToolCall(ToolCall {
-                call_id: normalize::call_id(&event["toolCallId"]),
+                call_id: normalize::call_id(&event["toolCallId"])?,
                 name: event["name"].as_str().unwrap_or("unknown").to_owned(),
                 input: normalize::tool_input(event["args"].clone()),
             })],
@@ -119,7 +120,7 @@ impl<'a> WireParser<'a> {
                     content,
                     note,
                     event["result"]["isError"] == true,
-                )]
+                )?]
             }
             _ => Vec::new(),
         };
@@ -147,9 +148,19 @@ impl<'a> WireParser<'a> {
         else {
             return images::from_data_url(self.blobs, url);
         };
-        match fs::read(self.blob_dir.join(hash)) {
+        if hash.is_empty()
+            || matches!(hash, "." | "..")
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Ok(None);
+        }
+        let path = self.blob_dir.join(hash);
+        match fs::read(&path) {
             Ok(bytes) => images::store(self.blobs, mime, &bytes).map(Some),
-            Err(_) => Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
         }
     }
 
@@ -192,17 +203,17 @@ fn assistant_part(part: &Value) -> Option<Body> {
 }
 
 // The model sees a tool's note after its output
-fn result(call_id: &Value, mut content: Content, note: &Value, is_error: bool) -> Body {
+fn result(call_id: &Value, mut content: Content, note: &Value, is_error: bool) -> Result<Body> {
     if let Some(note) = json::string(note) {
         content.text.push('\n');
         content.text.push_str(&note);
     }
-    Body::ToolResult(ToolResult {
-        call_id: normalize::call_id(call_id),
+    Ok(Body::ToolResult(ToolResult {
+        call_id: normalize::call_id(call_id)?,
         text: content.text,
         images: content.images,
         is_error,
-    })
+    }))
 }
 
 impl Parser for WireParser<'_> {

@@ -79,6 +79,9 @@ pub(super) fn drafts(bytes: &[u8], fallback: &str, blobs: &Blobs) -> Result<Vec<
             }
             (true, "tool_call") => {
                 reader.flush();
+                if meta["baton"]["synthetic"] == true {
+                    continue;
+                }
                 let id = update["toolCallId"].as_str().unwrap_or_default();
                 let input = match &update["rawInput"] {
                     Value::Null => late_inputs.get(id).copied().cloned().unwrap_or(Value::Null),
@@ -89,7 +92,7 @@ pub(super) fn drafts(bytes: &[u8], fallback: &str, blobs: &Blobs) -> Result<Vec<
                     .or(update["title"].as_str())
                     .unwrap_or("unknown");
                 let call = Body::ToolCall(ToolCall {
-                    call_id: normalize::call_id(&update["toolCallId"]),
+                    call_id: normalize::call_id(&update["toolCallId"])?,
                     name: name.to_owned(),
                     input: normalize::tool_input(input),
                 });
@@ -161,11 +164,16 @@ fn rewound(bytes: &[u8]) -> Vec<Value> {
         {
             let index = update["_meta"]["promptIndex"].clone();
             marked |= !index.is_null();
-            if prompt.as_ref() != Some(&index) {
+            let key = if index.is_null() {
+                json!([index, update["messageId"]])
+            } else {
+                index.clone()
+            };
+            if prompt.as_ref() != Some(&key) {
                 if !marked || !index.is_null() {
                     prompt_starts.push(kept.len());
                 }
-                prompt = Some(index);
+                prompt = Some(key);
             }
         } else {
             prompt = None;
@@ -286,8 +294,13 @@ impl Reader<'_> {
         } else {
             texts.join("\n")
         };
+        let call_id = if update["_meta"]["baton"]["synthetic"] == true {
+            normalize::call_id(&update["_meta"]["baton"]["call_id"])?
+        } else {
+            normalize::call_id(&update["toolCallId"])?
+        };
         Ok(Body::ToolResult(ToolResult {
-            call_id: normalize::call_id(&update["toolCallId"]),
+            call_id,
             text,
             images: attached,
             is_error: update["status"] == "failed",

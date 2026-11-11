@@ -101,14 +101,14 @@ impl<'a> JournalParser<'a> {
                 let blocks = content.as_array().map(Vec::as_slice).unwrap_or_default();
                 let mut bodies = Vec::new();
                 for block in blocks {
-                    bodies.extend(assistant_block(block));
+                    bodies.extend(assistant_block(block)?);
                 }
                 bodies
             }
             "toolResult" => {
                 let content = self.content(content)?;
                 vec![Body::ToolResult(ToolResult {
-                    call_id: normalize::call_id(&message["toolCallId"]),
+                    call_id: normalize::call_id(&message["toolCallId"])?,
                     text: content.text,
                     images: content.images,
                     is_error: message["isError"] == true,
@@ -210,24 +210,25 @@ impl Parser for JournalParser<'_> {
     }
 }
 
-fn assistant_block(block: &Value) -> Option<Body> {
-    match block["type"].as_str()? {
-        "text" => normalize::assistant(block["text"].as_str()?),
+fn assistant_block(block: &Value) -> Result<Option<Body>> {
+    let body = match block["type"].as_str().unwrap_or_default() {
+        "text" => block["text"].as_str().and_then(normalize::assistant),
         "thinking" => {
             let text = block["thinking"].as_str().unwrap_or_default().to_owned();
             let signature = json::string(&block["thinkingSignature"]);
             if text.is_empty() && signature.is_none() {
-                return None;
+                return Ok(None);
             }
             Some(Body::Thinking(Thinking { text, signature }))
         }
         "toolCall" => Some(Body::ToolCall(ToolCall {
-            call_id: normalize::call_id(&block["id"]),
+            call_id: normalize::call_id(&block["id"])?,
             name: block["name"].as_str().unwrap_or("unknown").to_owned(),
             input: normalize::tool_input(block["arguments"].clone()),
         })),
         _ => None,
-    }
+    };
+    Ok(body)
 }
 
 fn meta(value: Value) -> Vec<Body> {

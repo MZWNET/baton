@@ -21,8 +21,8 @@ pub use agent::Agent;
 pub use cache::{Index, SessionSummary};
 pub use model::{
     Assistant, Body, Compaction, Direction, Draft, Event, ForkPoint, Image, Link, NativeRef,
-    Origin, Session, SessionMeta, Thinking, ToolCall, ToolResult, User,
+    Origin, Session, SessionMeta, Thinking, ToolCall, ToolResult, User, portable_call_id,
 };
 pub use project::Project;
 pub use storage::{Blobs, Store};
-pub use sync::{Baton, Exported, ImportOutcome, Materialized, materialization_cwd};
+pub use sync::{Baton, Exported, ImportOutcome, Materialized, Migrated, materialization_cwd};

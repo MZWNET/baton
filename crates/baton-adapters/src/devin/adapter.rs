@@ -4,8 +4,7 @@ use std::process::Command;
 
 use anyhow::{Result, bail};
 use baton_core::{
-    Adapter, Agent, Blobs, Cursor, Export, Info, NativeRead, NativeSession, Progress, Source,
-    Stamp, time,
+    Adapter, Agent, Blobs, Cursor, Export, Info, NativeRead, NativeSession, Progress, Source, time,
 };
 use rusqlite::{TransactionBehavior, params};
 
@@ -64,22 +63,17 @@ impl Source for DevinAdapter {
             return Ok(Vec::new());
         }
         let connection = sqlite::open_read_only(&db)?;
-        // Hidden sessions belong to helper agents such as the summarizer; node rows only ever grow, while the activity time also covers renames
+        // Hidden sessions belong to helper agents such as the summarizer
         let mut statement = connection.prepare(
-            "SELECT s.id, s.title, s.last_activity_at,
-                    (SELECT MAX(m.row_id) FROM message_nodes m WHERE m.session_id = s.id)
-             FROM sessions s WHERE s.hidden = 0 AND s.main_chain_id IS NOT NULL",
+            "SELECT s.id, s.title FROM sessions s WHERE s.hidden = 0 AND s.main_chain_id IS NOT NULL",
         )?;
+        let stamp = sqlite::stamp(&db)?;
         let rows = statement.query_map([], |row| {
             let title: Option<String> = row.get(1)?;
-            let newest: Option<i64> = row.get(3)?;
             Ok(NativeSession {
                 id: row.get(0)?,
                 path: db.clone(),
-                stamp: Stamp {
-                    size: newest.unwrap_or_default() as u64,
-                    mtime: row.get(2)?,
-                },
+                stamp,
                 title: title.filter(|title| !title.trim().is_empty()),
             })
         })?;
@@ -158,7 +152,6 @@ impl Adapter for DevinAdapter {
                 nodes.len() as i64 - 1,
             ],
         )?;
-        let mut newest = 0;
         {
             let mut insert = transaction.prepare(
                 "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, created_at)
@@ -172,17 +165,13 @@ impl Adapter for DevinAdapter {
                     node.chat_message.to_string(),
                     node.created,
                 ])?;
-                newest = transaction.last_insert_rowid();
             }
         }
         transaction.commit()?;
         Ok(NativeSession {
             id,
             path: self.db.clone(),
-            stamp: Stamp {
-                size: newest as u64,
-                mtime: activity,
-            },
+            stamp: sqlite::stamp(&self.db)?,
             title: None,
         })
     }

@@ -20,6 +20,7 @@ mod paseo;
 mod pi;
 mod qwen;
 mod registry;
+mod rikkahub;
 mod support;
 mod vibe;
 
@@ -41,4 +42,5 @@ pub use paseo::{Paseo, PaseoAgent};
 pub use pi::PiAdapter;
 pub use qwen::QwenAdapter;
 pub use registry::{adapter, source};
+pub use rikkahub::RikkahubAdapter;
 pub use vibe::VibeAdapter;

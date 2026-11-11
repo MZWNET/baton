@@ -1,12 +1,18 @@
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use baton_core::{Blobs, Body, Compaction, Draft, Image, Thinking, ToolCall, ToolResult, time};
-use chrono::{Local, NaiveDateTime, TimeZone};
 use serde_json::{Value, json};
 
 use crate::support::normalize::{self, Content};
-use crate::support::{images, json};
+use crate::support::{images, json, local_time};
 
-pub(super) fn drafts(event: &Value, fallback: &str, blobs: &Blobs) -> Result<Vec<Draft>> {
+pub(super) fn drafts(
+    event: &Value,
+    recorded: &BTreeMap<String, String>,
+    fallback: &str,
+    blobs: &Blobs,
+) -> Result<Vec<Draft>> {
     let bodies = match event["kind"].as_str().unwrap_or_default() {
         "MessageEvent" => {
             let message = &event["llm_message"];
@@ -31,7 +37,7 @@ pub(super) fn drafts(event: &Value, fallback: &str, blobs: &Blobs) -> Result<Vec
                 bodies.extend(block["text"].as_str().and_then(normalize::assistant));
             }
             bodies.push(Body::ToolCall(ToolCall {
-                call_id: normalize::call_id(&event["tool_call_id"]),
+                call_id: normalize::call_id(&event["tool_call_id"])?,
                 name: event["tool_name"].as_str().unwrap_or("unknown").to_owned(),
                 input: normalize::arguments(&event["tool_call"]["arguments"]),
             }));
@@ -45,7 +51,7 @@ pub(super) fn drafts(event: &Value, fallback: &str, blobs: &Blobs) -> Result<Vec
                 content.text,
                 content.images,
                 observation["is_error"] == true,
-            )]
+            )?]
         }
         // Both stand in for a result the model saw
         "UserRejectObservation" => {
@@ -55,11 +61,11 @@ pub(super) fn drafts(event: &Value, fallback: &str, blobs: &Blobs) -> Result<Vec
                 format!("Action rejected: {reason}"),
                 Vec::new(),
                 true,
-            )]
+            )?]
         }
         "AgentErrorEvent" => {
             let error = event["error"].as_str().unwrap_or_default().to_owned();
-            vec![result(event, error, Vec::new(), true)]
+            vec![result(event, error, Vec::new(), true)?]
         }
         "Condensation" => vec![match json::string(&event["summary"]) {
             Some(summary) => Body::Compaction(Compaction { summary }),
@@ -67,10 +73,7 @@ pub(super) fn drafts(event: &Value, fallback: &str, blobs: &Blobs) -> Result<Vec
         }],
         _ => Vec::new(),
     };
-    let timestamp = event["timestamp"]
-        .as_str()
-        .and_then(timestamp)
-        .unwrap_or_else(|| fallback.to_owned());
+    let timestamp = time(event, recorded)?.unwrap_or_else(|| fallback.to_owned());
     let mut drafts = Vec::with_capacity(bodies.len());
     for body in bodies {
         drafts.push(Draft {
@@ -82,14 +85,23 @@ pub(super) fn drafts(event: &Value, fallback: &str, blobs: &Blobs) -> Result<Vec
     Ok(drafts)
 }
 
-// OpenHands stamps events with the naive local time
-pub(super) fn timestamp(value: &str) -> Option<String> {
-    if let Some(normalized) = time::normalize(value) {
-        return Some(normalized);
+// The exact time baton recorded when it wrote the event, or else the naive local time OpenHands stamps events with
+pub(super) fn time(event: &Value, recorded: &BTreeMap<String, String>) -> Result<Option<String>> {
+    if let Some(time) = json::string(&event["id"]).and_then(|id| recorded.get(&id)) {
+        return Ok(Some(time.clone()));
     }
-    let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
-    let local = Local.from_local_datetime(&naive).earliest()?;
-    time::from_unix_millis(local.timestamp_millis())
+    let Some(value) = event["timestamp"].as_str() else {
+        return Ok(None);
+    };
+
+    Ok(Some(timestamp(value)?))
+}
+
+pub(super) fn timestamp(value: &str) -> Result<String> {
+    match time::normalize(value) {
+        Some(normalized) => Ok(normalized),
+        None => local_time::parse(value),
+    }
 }
 
 fn items(value: &Value) -> &[Value] {
@@ -112,13 +124,13 @@ fn content(blocks: &[Value], blobs: &Blobs) -> Result<Content> {
     })
 }
 
-fn result(event: &Value, text: String, images: Vec<Image>, is_error: bool) -> Body {
-    Body::ToolResult(ToolResult {
-        call_id: normalize::call_id(&event["tool_call_id"]),
+fn result(event: &Value, text: String, images: Vec<Image>, is_error: bool) -> Result<Body> {
+    Ok(Body::ToolResult(ToolResult {
+        call_id: normalize::call_id(&event["tool_call_id"])?,
         text,
         images,
         is_error,
-    })
+    }))
 }
 
 fn thinking(blocks: &Value, reasoning: &Value) -> Vec<Body> {

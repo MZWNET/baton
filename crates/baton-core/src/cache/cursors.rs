@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -32,6 +33,21 @@ impl Cursors {
     pub(crate) fn open(cache: &Path, data: &Path) -> Result<Cursors> {
         let db = database::open(&cache.join("state.db"), data, SCHEMA, &["cursors"])?;
         Ok(Cursors { db: Mutex::new(db) })
+    }
+
+    pub(crate) fn remap_events(&self, ids: &HashMap<String, String>) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let transaction = db.transaction()?;
+        {
+            let mut update =
+                transaction.prepare("UPDATE cursors SET event = ?1 WHERE event = ?2")?;
+            for (old, new) in ids {
+                update.execute(params![new, old])?;
+            }
+        }
+        transaction.commit()?;
+
+        Ok(())
     }
 
     pub(crate) fn get(&self, agent: Agent, native_id: &str) -> Result<Option<Cursor>> {

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use baton_core::{
     Adapter, Agent, Blobs, Cursor, Export, NativeRead, NativeSession, Source, Stamp, journal, time,
 };
@@ -88,6 +88,21 @@ impl CodexAdapter {
             }
         }
         Ok(titles)
+    }
+
+    fn lock_index(&self) -> Result<File> {
+        fs::create_dir_all(&self.root)?;
+        let path = self.root.join("session_index.jsonl.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        lock.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(lock)
     }
 
     // Codex refuses to resume a rollout recorded for another provider than the configured one
@@ -196,16 +211,25 @@ impl Adapter for CodexAdapter {
         let mut writer = RolloutWriter::new(blobs);
         writer.push_meta(&id, created, export.cwd, &self.provider()?);
         writer.push_events(export.events)?;
+        let _index = export.title.map(|_| self.index_lock.lock().unwrap());
+        let _lock = if export.title.is_some() {
+            Some(self.lock_index()?)
+        } else {
+            None
+        };
+        // A seeded export recreated after losing only its rollout is already indexed
+        let title = if let Some(title) = export.title {
+            (CodexAdapter::titles(&self.root)?
+                .get(&id)
+                .map(String::as_str)
+                != Some(title))
+            .then_some(title)
+        } else {
+            None
+        };
         files::create_new(&path, writer.finish().as_bytes())?;
-        {
-            let _index = self.index_lock.lock().unwrap();
-            // A seeded export recreated after losing only its rollout is already indexed
-            if let Some(title) = export.title
-                && CodexAdapter::titles(&self.root)?
-                    .get(&id)
-                    .map(String::as_str)
-                    != Some(title)
-            {
+        let result = (|| {
+            if let Some(title) = title {
                 let row = format!(
                     "{}\n",
                     json!({"id": id, "thread_name": title, "updated_at": time::now()})
@@ -216,36 +240,63 @@ impl Adapter for CodexAdapter {
                     .open(self.root.join("session_index.jsonl"))?;
                 index.write_all(row.as_bytes())?;
             }
-        }
+            Stamp::of(&path)
+        })();
+        let stamp = match result {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                files::remove_file(&path)
+                    .with_context(|| format!("cleaning {} after {error:#}", path.display()))?;
+                return Err(error);
+            }
+        };
         Ok(NativeSession {
             id,
-            stamp: Stamp::of(&path)?,
+            stamp,
             path,
             title: None,
         })
     }
 
     fn remove(&self, session: &NativeSession) -> Result<()> {
+        use std::io::Write;
+
         let _index = self.index_lock.lock().unwrap();
+        let _lock = self.lock_index()?;
         let index = self.root.join("session_index.jsonl");
-        let bytes = match fs::read(&index) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        let scratch = match fs::read(&index) {
+            Ok(bytes) => {
+                let mut retained = Vec::with_capacity(bytes.len());
+                for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+                    let content = line.strip_suffix(b"\n").unwrap_or(line);
+                    if content.iter().all(u8::is_ascii_whitespace) {
+                        retained.extend_from_slice(line);
+                        continue;
+                    }
+                    let row: Value = serde_json::from_slice(content)?;
+                    if row["id"].as_str() != Some(session.id.as_str()) {
+                        retained.extend_from_slice(line);
+                    }
+                }
+                if retained.len() != bytes.len() {
+                    let mut scratch = tempfile::NamedTempFile::new_in(&self.root)?;
+                    scratch
+                        .as_file()
+                        .set_permissions(fs::metadata(&index)?.permissions())?;
+                    scratch.write_all(&retained)?;
+                    Some(scratch)
+                } else {
+                    None
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        for line in bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            let row: Value = serde_json::from_slice(line)?;
-            if row["id"].as_str() == Some(session.id.as_str()) {
-                bail!(
-                    "cannot safely remove Codex session {} from the shared title index",
-                    session.id
-                );
-            }
+        files::remove_file(&session.path)?;
+        if let Some(scratch) = scratch {
+            scratch.persist(&index)?;
         }
-        files::remove_file(&session.path)
+        Ok(())
     }
 
     fn resume_command(&self, session: &NativeSession, cwd: &Path) -> Command {

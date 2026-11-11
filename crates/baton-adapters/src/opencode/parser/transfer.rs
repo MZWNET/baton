@@ -63,7 +63,7 @@ pub(in crate::opencode) fn parse(data: &Value, blobs: &Blobs) -> Result<NativeRe
                         "tool" => {
                             if tool_order::synthetic_call_id(&block["state"]).is_none() {
                                 bodies.push(Body::ToolCall(ToolCall {
-                                    call_id: normalize::call_id(&block["id"]),
+                                    call_id: normalize::call_id(&block["id"])?,
                                     name: block["name"].as_str().unwrap_or("unknown").to_owned(),
                                     input: normalize::tool_input(block["state"]["input"].clone()),
                                 }));
@@ -143,7 +143,7 @@ fn tool_result(blobs: &Blobs, tool: &Value) -> Result<Option<Body>> {
     };
     Ok(Some(Body::ToolResult(ToolResult {
         call_id: tool_order::synthetic_call_id(state)
-            .map_or_else(|| normalize::call_id(&tool["id"]), str::to_owned),
+            .map_or_else(|| normalize::call_id(&tool["id"]), |id| Ok(id.to_owned()))?,
         text,
         images: attached,
         is_error,

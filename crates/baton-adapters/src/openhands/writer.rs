@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
-use baton_core::{Blobs, Event, Image, time};
-use chrono::{DateTime, Local, NaiveDateTime, TimeDelta};
+use baton_core::{Blobs, Event, Image};
+use chrono::{NaiveDateTime, TimeDelta};
 use serde_json::{Value, json};
 
 use crate::support::unit::{self, Segment, Unit};
-use crate::support::{identifiers, images};
+use crate::support::{identifiers, images, local_time};
 
 // OpenHands rebuilds the model's system message from the first event, so it is what the resumed model reads instead of OpenHands' own prompt
 const SYSTEM_PROMPT: &str = "This conversation was imported from another coding agent. Its earlier tool calls are history and were not run here.";
@@ -16,6 +16,8 @@ pub(super) struct EventWriter<'a> {
     blobs: &'a Blobs,
     events: Vec<Value>,
     clock: Option<NaiveDateTime>,
+    // The exact time of each event, which the native timestamps cannot hold
+    times: BTreeMap<String, String>,
     // Every event after the system prompt, which a summary makes the model forget
     forgotten: Vec<String>,
     actions: HashMap<&'a str, (String, &'a str)>,
@@ -27,6 +29,7 @@ impl<'a> EventWriter<'a> {
             blobs,
             events: Vec::new(),
             clock: None,
+            times: BTreeMap::new(),
             forgotten: Vec::new(),
             actions: HashMap::new(),
         }
@@ -35,18 +38,18 @@ impl<'a> EventWriter<'a> {
     pub(super) fn push_events(&mut self, created: &str, events: &[&'a Event]) -> Result<()> {
         // OpenHands refuses a conversation whose first messages come without a system prompt
         let prompt = json!({"system_prompt": {"type": "text", "text": SYSTEM_PROMPT}, "tools": []});
-        self.push(created, "SystemPromptEvent", "agent", prompt);
+        self.push(created, "SystemPromptEvent", "agent", prompt)?;
         for unit in unit::units(events) {
             match unit {
                 Unit::User(event, user) => {
                     let text = (!user.text.is_empty()).then_some(user.text.as_str());
                     let content = self.content(text, &user.images)?;
                     let message = json!({"llm_message": {"role": "user", "content": content}});
-                    self.push_forgettable(&event.timestamp, "MessageEvent", "user", message);
+                    self.push_forgettable(&event.timestamp, "MessageEvent", "user", message)?;
                 }
                 Unit::Assistant(run) => {
                     for segment in unit::segments(&run) {
-                        self.push_segment(segment);
+                        self.push_segment(segment)?;
                     }
                 }
                 Unit::ToolResult(event, result) => {
@@ -64,7 +67,7 @@ impl<'a> EventWriter<'a> {
                         "ObservationEvent",
                         "environment",
                         observation,
-                    );
+                    )?;
                 }
                 Unit::Compaction(event, summary) => {
                     // The summary goes right after the system prompt, in place of every event before it
@@ -75,7 +78,7 @@ impl<'a> EventWriter<'a> {
                         "Condensation",
                         "environment",
                         condensation,
-                    );
+                    )?;
                     self.forgotten.push(format!("{id}-summary"));
                 }
             }
@@ -83,12 +86,12 @@ impl<'a> EventWriter<'a> {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> Vec<Value> {
-        self.events
+    pub(super) fn finish(self) -> (Vec<Value>, BTreeMap<String, String>) {
+        (self.events, self.times)
     }
 
     // Calls of one segment share the response they came in, and only the first carries the text before them
-    fn push_segment(&mut self, segment: Segment<'a>) {
+    fn push_segment(&mut self, segment: Segment<'a>) -> Result<()> {
         if segment.calls.is_empty() {
             let content: Vec<Value> = segment
                 .texts
@@ -96,8 +99,8 @@ impl<'a> EventWriter<'a> {
                 .map(|text| json!({"type": "text", "text": text}))
                 .collect();
             let message = json!({"llm_message": {"role": "assistant", "content": content}, "llm_response_id": identifiers::uuid_v4()});
-            self.push_forgettable(&segment.event.timestamp, "MessageEvent", "agent", message);
-            return;
+            self.push_forgettable(&segment.event.timestamp, "MessageEvent", "agent", message)?;
+            return Ok(());
         }
         let response = identifiers::uuid_v4();
         let mut thought: Vec<Value> = segment
@@ -113,9 +116,11 @@ impl<'a> EventWriter<'a> {
             });
             thought.clear();
             let id =
-                self.push_forgettable(&segment.event.timestamp, "ActionEvent", "agent", action);
+                self.push_forgettable(&segment.event.timestamp, "ActionEvent", "agent", action)?;
             self.actions.insert(&call.call_id, (id, &call.name));
         }
+
+        Ok(())
     }
 
     fn content(&self, text: Option<&str>, attached: &[Image]) -> Result<Vec<Value>> {
@@ -137,29 +142,33 @@ impl<'a> EventWriter<'a> {
         kind: &str,
         source: &str,
         fields: Value,
-    ) -> String {
-        let id = self.push(timestamp, kind, source, fields);
+    ) -> Result<String> {
+        let id = self.push(timestamp, kind, source, fields)?;
         self.forgotten.push(id.clone());
-        id
+        Ok(id)
     }
 
     // Timestamps are naive local times that never repeat, which the conversation list sorts by
-    fn push(&mut self, timestamp: &str, kind: &str, source: &str, mut fields: Value) -> String {
-        let local = DateTime::from_timestamp_millis(time::unix_millis(timestamp))
-            .unwrap_or_default()
-            .with_timezone(&Local)
-            .naive_local();
+    fn push(
+        &mut self,
+        timestamp: &str,
+        kind: &str,
+        source: &str,
+        mut fields: Value,
+    ) -> Result<String> {
+        let local = local_time::naive(timestamp)?;
         let stamp = match self.clock {
             Some(last) if local <= last => last + TimeDelta::microseconds(1),
             _ => local,
         };
         self.clock = Some(stamp);
         let id = identifiers::uuid_v4();
+        self.times.insert(id.clone(), timestamp.to_owned());
         fields["id"] = json!(id);
         fields["timestamp"] = json!(stamp.format("%Y-%m-%dT%H:%M:%S%.6f").to_string());
         fields["source"] = json!(source);
         fields["kind"] = json!(kind);
         self.events.push(fields);
-        id
+        Ok(id)
     }
 }

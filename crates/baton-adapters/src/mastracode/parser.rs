@@ -44,7 +44,7 @@ pub(super) fn drafts(row: &Row, blobs: &Blobs) -> Result<Vec<Draft>> {
         (_, Some("tool_result")) => {
             let content = self::content(parts, blobs)?;
             vec![Body::ToolResult(ToolResult {
-                call_id: normalize::call_id(&marker["callId"]),
+                call_id: normalize::call_id(&marker["callId"])?,
                 text: content.text,
                 images: content.images,
                 is_error: marker["isError"] == true,
@@ -88,7 +88,7 @@ fn assistant(parts: &[Value], result_order: &Value, blobs: &Blobs) -> Result<Vec
                 "reasoning" => bodies.extend(thinking(part)),
                 "tool-invocation" => {
                     let invocation = &part["toolInvocation"];
-                    bodies.push(call(invocation));
+                    bodies.push(call(invocation)?);
                     if let Some(result) = invocation_result(part, invocation, blobs)? {
                         results.push((
                             invocation["toolCallId"].as_str().unwrap_or_default(),
@@ -96,10 +96,10 @@ fn assistant(parts: &[Value], result_order: &Value, blobs: &Blobs) -> Result<Vec
                         ));
                     }
                 }
-                "tool-call" => bodies.push(call(part)),
+                "tool-call" => bodies.push(call(part)?),
                 "tool-result" => {
                     let content = result_content(&part["result"], blobs)?;
-                    let result = tool_result(part, content, part["isError"] == true);
+                    let result = tool_result(part, content, part["isError"] == true)?;
                     results.push((part["toolCallId"].as_str().unwrap_or_default(), result));
                 }
                 _ => {}
@@ -113,24 +113,24 @@ fn assistant(parts: &[Value], result_order: &Value, blobs: &Blobs) -> Result<Vec
     Ok(bodies)
 }
 
-fn call(invocation: &Value) -> Body {
-    Body::ToolCall(ToolCall {
-        call_id: normalize::call_id(&invocation["toolCallId"]),
+fn call(invocation: &Value) -> Result<Body> {
+    Ok(Body::ToolCall(ToolCall {
+        call_id: normalize::call_id(&invocation["toolCallId"])?,
         name: invocation["toolName"]
             .as_str()
             .unwrap_or("unknown")
             .to_owned(),
         input: normalize::tool_input(invocation["args"].clone()),
-    })
+    }))
 }
 
-fn tool_result(invocation: &Value, content: Content, is_error: bool) -> Body {
-    Body::ToolResult(ToolResult {
-        call_id: normalize::call_id(&invocation["toolCallId"]),
+fn tool_result(invocation: &Value, content: Content, is_error: bool) -> Result<Body> {
+    Ok(Body::ToolResult(ToolResult {
+        call_id: normalize::call_id(&invocation["toolCallId"])?,
         text: content.text,
         images: content.images,
         is_error,
-    })
+    }))
 }
 
 // Pending calls have no result yet; a completed one is replayed from the output the model saw when MastraCode kept it
@@ -154,7 +154,7 @@ fn invocation_result(part: &Value, invocation: &Value, blobs: &Blobs) -> Result<
         }
         _ => return Ok(None),
     };
-    Ok(Some(tool_result(invocation, content, is_error)))
+    tool_result(invocation, content, is_error).map(Some)
 }
 
 fn model_output(output: &Value, blobs: &Blobs) -> Result<Content> {

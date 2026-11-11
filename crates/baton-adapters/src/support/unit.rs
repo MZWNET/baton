@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use anyhow::Result;
 use baton_core::{Body, Event, ToolCall, ToolResult, User};
 use serde_json::{Value, json};
 
@@ -15,13 +16,13 @@ pub(crate) fn calls_by_id<'a>(events: &[&'a Event]) -> HashMap<&'a str, &'a Tool
         .collect()
 }
 
-pub(crate) fn decode_function_call(call: &Value, id: &Value) -> ToolCall {
+pub(crate) fn decode_function_call(call: &Value, id: &Value) -> Result<ToolCall> {
     let function = &call["function"];
-    ToolCall {
-        call_id: normalize::call_id(id),
+    Ok(ToolCall {
+        call_id: normalize::call_id(id)?,
         name: function["name"].as_str().unwrap_or("unknown").to_owned(),
         input: normalize::arguments(&function["arguments"]),
-    }
+    })
 }
 
 pub(crate) fn encode_function_call(call: &ToolCall) -> Value {

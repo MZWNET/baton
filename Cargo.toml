@@ -18,6 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 hostname = "0.4"
+jiff = "0.2"
 md-5 = { version = "0.11", default-features = false }
 rayon = "1"
 rusqlite = { version = "0.41", features = ["bundled"] }
@@ -27,6 +28,7 @@ sha2 = { version = "0.11", default-features = false }
 tempfile = "3"
 uuid = { version = "1", features = ["v4", "v5", "v7"] }
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zstd = { version = "0.14", default-features = false }
 
 [workspace.lints.rust]

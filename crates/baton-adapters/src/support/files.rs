@@ -108,14 +108,26 @@ pub(crate) fn dashed(path: &str) -> String {
 pub(crate) fn create_new(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
-    fs::create_dir_all(
-        path.parent()
-            .expect("native session paths have a directory"),
-    )?;
-    let mut file =
-        File::create_new(path).with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(bytes)?;
+    let dir = path
+        .parent()
+        .expect("native session paths have a directory");
+    fs::create_dir_all(dir)?;
+    let mut scratch = tempfile::NamedTempFile::new_in(dir)?;
+    scratch.write_all(bytes)?;
+    fs::hard_link(scratch.path(), path).with_context(|| format!("creating {}", path.display()))?;
     Ok(())
+}
+
+pub(crate) fn create_dir_with<T>(dir: &Path, write: impl FnOnce() -> Result<T>) -> Result<T> {
+    fs::create_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
+    match write() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            fs::remove_dir_all(dir)
+                .with_context(|| format!("cleaning {} after {error:#}", dir.display()))?;
+            Err(error)
+        }
+    }
 }
 
 // For files whose names determine their content

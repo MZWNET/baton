@@ -67,7 +67,13 @@ fn normalize_remote(remote: &str) -> Option<String> {
     if host.is_empty() || path.is_empty() {
         return None;
     }
-    Some(format!("{host}/{path}").to_lowercase())
+    let host = host.to_lowercase();
+    let path = if host == "github.com" {
+        path.to_lowercase()
+    } else {
+        path.to_owned()
+    };
+    Some(format!("{host}/{path}"))
 }
 
 fn inspect(cwd: &Path) -> Option<Project> {
@@ -113,8 +119,10 @@ pub fn identify(cwd: &Path) -> Option<Project> {
 }
 
 fn same_repository(a: &Project, b: &Project) -> bool {
-    matches!((&a.remote, &b.remote), (Some(a), Some(b)) if a == b)
-        || matches!((&a.root, &b.root), (Some(a), Some(b)) if a == b)
+    match (&a.remote, &b.remote) {
+        (Some(a), Some(b)) => a == b,
+        _ => matches!((&a.root, &b.root), (Some(a), Some(b)) if a == b),
+    }
 }
 
 fn scan(path: &Path, depth: usize, checkouts: &mut Vec<(PathBuf, Project)>) {
@@ -144,35 +152,16 @@ fn scan(path: &Path, depth: usize, checkouts: &mut Vec<(PathBuf, Project)>) {
     }
 }
 
-struct Checkouts {
-    paths: Vec<(PathBuf, Project)>,
-    remotes: HashMap<String, usize>,
-    roots: HashMap<String, usize>,
-}
-
-fn checkouts() -> &'static Checkouts {
-    static CHECKOUTS: LazyLock<Checkouts> = LazyLock::new(|| {
+pub(crate) fn checkouts() -> &'static [(PathBuf, Project)] {
+    static CHECKOUTS: LazyLock<Vec<(PathBuf, Project)>> = LazyLock::new(|| {
         let mut checkouts = Vec::new();
         if let Some(roots) = env::var_os("BATON_PROJECTS") {
             for root in env::split_paths(&roots) {
                 scan(&root, 0, &mut checkouts);
             }
         }
-        let mut remotes = HashMap::new();
-        let mut roots = HashMap::new();
-        for (index, (_, project)) in checkouts.iter().enumerate() {
-            if let Some(remote) = &project.remote {
-                remotes.entry(remote.clone()).or_insert(index);
-            }
-            if let Some(root) = &project.root {
-                roots.entry(root.clone()).or_insert(index);
-            }
-        }
-        Checkouts {
-            paths: checkouts,
-            remotes,
-            roots,
-        }
+
+        checkouts
     });
     &CHECKOUTS
 }
@@ -215,23 +204,23 @@ fn map_path(cwd: &Path) -> Option<PathBuf> {
 /// Resolves a recorded project and directory to a directory on this machine.
 pub fn resolve(project: Option<&Project>, cwd: Option<&str>) -> Option<PathBuf> {
     if let Some(project) = project {
-        let checkout = project
-            .remote
-            .as_ref()
-            .and_then(|remote| checkouts().remotes.get(remote))
-            .or_else(|| {
-                project
-                    .root
-                    .as_ref()
-                    .and_then(|root| checkouts().roots.get(root))
-            });
-        if let Some(index) = checkout {
-            let checkout = &checkouts().paths[*index].0;
-            return Some(if project.path.is_empty() {
-                checkout.clone()
-            } else {
-                checkout.join(&project.path)
-            });
+        let remote_matches = checkouts().iter().filter(|(_, candidate)| {
+            matches!((&project.remote, &candidate.remote), (Some(a), Some(b)) if a == b)
+        });
+        let root_matches = checkouts().iter().filter(|(_, candidate)| {
+            (project.remote.is_none() || candidate.remote.is_none())
+                && same_repository(project, candidate)
+        });
+        if let Some(path) = remote_matches
+            .chain(root_matches)
+            // Joining an empty path would add a trailing separator
+            .map(|(checkout, _)| match project.path.as_str() {
+                "" => checkout.clone(),
+                path => checkout.join(path),
+            })
+            .find(|path| path.is_dir())
+        {
+            return Some(path);
         }
     }
     let cwd = Path::new(cwd?);
@@ -260,14 +249,163 @@ pub(crate) fn matches(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_remote;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::{identify, normalize_remote, resolve};
+
+    fn isolate_git(command: &mut Command, global_config: &Path) {
+        command
+            .env("GIT_CONFIG_GLOBAL", global_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        for variable in [
+            "GIT_CONFIG",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            command.env_remove(variable);
+        }
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        isolate_git(&mut command, &cwd.join("nonexistent-gitconfig"));
+        let output = command.current_dir(cwd).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn project_resolution() {
+        if let Some(root) = std::env::var_os("BATON_TEST_PROJECT_ROOT") {
+            let root = Path::new(&root);
+            let source = root.join("source");
+            let checkouts = root.join("checkouts");
+            let recorded = root.join("recorded");
+            let mapped = root.join("mapped");
+            let project = identify(&source).unwrap();
+            assert_eq!(project.remote.as_deref(), Some("example.com/Team/Project"));
+
+            let mut nested = project.clone();
+            nested.path = "nested".into();
+            assert_eq!(
+                resolve(Some(&nested), None),
+                Some(checkouts.join("c-match/nested"))
+            );
+
+            let mut other_case = project.clone();
+            other_case.remote = Some("example.com/team/project".into());
+            assert_eq!(
+                resolve(Some(&other_case), None),
+                Some(checkouts.join("a-other"))
+            );
+
+            let mut different = project.clone();
+            different.remote = Some("example.com/TEAM/PROJECT".into());
+            assert_eq!(
+                resolve(Some(&different), recorded.to_str()),
+                Some(recorded.clone())
+            );
+
+            let mut without_remote = project.clone();
+            without_remote.remote = None;
+            assert_eq!(
+                resolve(Some(&without_remote), None),
+                Some(checkouts.join("a-other"))
+            );
+
+            let mut missing = project;
+            missing.path = "missing".into();
+            let old_cwd = root.join("old/missing");
+            assert_eq!(
+                resolve(Some(&missing), old_cwd.to_str()),
+                Some(mapped.join("missing"))
+            );
+
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("source");
+        let checkouts = root.join("checkouts");
+        let recorded = root.join("recorded");
+        let mapped = root.join("mapped");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&checkouts).unwrap();
+        fs::create_dir_all(&recorded).unwrap();
+        fs::create_dir_all(mapped.join("missing")).unwrap();
+        git(&source, &["init"]);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        for (name, remote) in [
+            ("a-other", "https://EXAMPLE.com/team/project.git"),
+            ("b-match", "git@EXAMPLE.com:Team/Project.git"),
+            ("c-match", "ssh://git@example.com:22/Team/Project.git"),
+        ] {
+            git(&checkouts, &["clone", source.to_str().unwrap(), name]);
+            git(
+                &checkouts.join(name),
+                &["remote", "set-url", "origin", remote],
+            );
+        }
+        fs::create_dir_all(checkouts.join("c-match/nested")).unwrap();
+        git(
+            &source,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://EXAMPLE.com/Team/Project.git",
+            ],
+        );
+        let path_map = format!("{}={}", root.join("old").display(), mapped.display());
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        isolate_git(&mut command, &root.join("nonexistent-gitconfig"));
+        let output = command
+            .args(["--exact", "project::tests::project_resolution"])
+            .env("BATON_TEST_PROJECT_ROOT", root)
+            .env("BATON_PROJECTS", &checkouts)
+            .env("BATON_PATH_MAP", path_map)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"));
+    }
 
     #[test]
     fn remote_normalization() {
         for remote in [
             "git@github.com:MZWNET/baton.git",
-            "https://github.com/MZWNET/baton",
-            "ssh://git@github.com:22/MZWNET/baton.git",
+            "https://GITHUB.COM/MZWNET/baton",
+            "ssh://git@github.com:22/MZWNET/baton.git/",
         ] {
             assert_eq!(
                 normalize_remote(remote).as_deref(),
