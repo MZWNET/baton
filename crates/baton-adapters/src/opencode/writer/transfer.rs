@@ -1,10 +1,12 @@
 use anyhow::Result;
+use baton_core::replay::Model;
 use baton_core::{Blobs, Body, Event, Export, Image, ToolResult, time};
 use serde_json::{Value, json};
 
 use crate::opencode::ascending_ids::AscendingIds;
 use crate::opencode::tool_order::{self, Placement, ToolOrder};
 use crate::support::images;
+use crate::support::model::provider_and_id;
 use crate::support::unit::{self, Unit};
 
 // OpenCode 2 drops assistant messages without a completion time on import
@@ -50,7 +52,12 @@ pub(in crate::opencode) fn write(
                         _ => {}
                     }
                 }
-                messages.push(assistant(&mut ids, millis, content));
+                messages.push(assistant(
+                    &mut ids,
+                    millis,
+                    content,
+                    export.models.at(run[0]),
+                ));
                 calls.assistant(&run);
             }
             Unit::ToolResult(event, result) => match calls.result(result) {
@@ -69,7 +76,12 @@ pub(in crate::opencode) fn write(
                     let mut tool = json!({"type": "tool", "id": synthetic.id, "name": synthetic.name,
                             "state": {"status": "running", "input": synthetic.input, "metadata": {}}, "time": {"created": millis}});
                     settle(&mut tool, event, result, blobs, Some(synthetic.marker))?;
-                    messages.push(assistant(&mut ids, millis, vec![tool]));
+                    messages.push(assistant(
+                        &mut ids,
+                        millis,
+                        vec![tool],
+                        export.models.at(event),
+                    ));
                 }
             },
             Unit::Compaction(event, summary) => {
@@ -98,10 +110,21 @@ pub(in crate::opencode) fn write(
     if let Some(title) = export.title {
         info["title"] = json!(title);
     }
+    if let Some(model) = export.models.last() {
+        let (provider, id) = provider_and_id(Some(model));
+        info["model"] = json!({"id": id, "providerID": provider});
+    }
+
     Ok(json!({"info": info, "messages": messages}))
 }
 
-fn assistant(ids: &mut AscendingIds, millis: i64, content: Vec<Value>) -> Value {
+fn assistant(
+    ids: &mut AscendingIds,
+    millis: i64,
+    content: Vec<Value>,
+    model: Option<Model<'_>>,
+) -> Value {
+    let (provider, model) = provider_and_id(model);
     let finish = if content.iter().any(|block| block["type"] == "tool") {
         "tool-calls"
     } else {
@@ -109,7 +132,7 @@ fn assistant(ids: &mut AscendingIds, millis: i64, content: Vec<Value>) -> Value 
     };
     json!({
         "id": ids.next("msg", millis), "type": "assistant", "time": {"created": millis, "completed": millis},
-        "agent": "build", "model": {"id": "baton", "providerID": "baton"}, "content": content,
+        "agent": "build", "model": {"id": model, "providerID": provider}, "content": content,
         "finish": finish, "cost": 0, "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
     })
 }

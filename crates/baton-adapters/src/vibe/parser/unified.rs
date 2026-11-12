@@ -41,10 +41,15 @@ pub(in crate::vibe) fn read(current: &Path, blobs: &Blobs) -> Result<NativeRead>
     };
     // Messages have no timestamps, and the ones not imported came with the published generation
     let saved = json::timestamp(&generation.manifest["created_at"], &time::now());
-    drafts.extend(parse(
+    let mut own = parse(
         legacy_lines(messages),
         MessageParser::new(blobs, dir, None, saved),
-    )?);
+    )?;
+    // What the session added after an import ran on the model its own metadata names
+    if let Some(meta) = legacy::meta(dir) {
+        legacy::prepend_model(&meta, &mut own);
+    }
+    drafts.extend(own);
     let session = &state["session"];
     info.cwd = json::string(&generation.runtime["session_metadata"]["cwd"]).or(info.cwd);
     // Vibe leaves an imported folder's title behind, so only a rename there replaces it

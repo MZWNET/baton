@@ -21,11 +21,13 @@ fn with_export(f: impl FnOnce(&Export<'_>, &Blobs)) {
     );
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: Some("A title"),
         cwd: Path::new("/work/demo"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        models: &models,
         seed: Some(uuid::Uuid::parse_str("12345678-1234-5678-9234-567812345678").unwrap()),
     };
     f(&export, &blobs);

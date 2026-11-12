@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use baton_core::replay::{Model, Models};
 use baton_core::{Blobs, Body, Event, Image, ToolCall, ToolResult, time};
 use serde_json::{Value, json};
 
-use super::parser::{BATON_PROVIDER, SYNTHETIC_PREFIX};
+use super::parser::SYNTHETIC_PREFIX;
+use crate::support::model::provider_and_id;
 use crate::support::unit::{self, Unit};
 use crate::support::{files, identifiers, json};
 
@@ -13,6 +15,7 @@ const INTERRUPTED: &str = "The tool call was interrupted before the Harness reco
 
 pub(super) struct EventWriter<'a> {
     blobs: &'a Blobs,
+    models: &'a Models<'a>,
     objects_dir: PathBuf,
     header: String,
     events: String,
@@ -28,6 +31,7 @@ pub(super) struct EventWriter<'a> {
 impl<'a> EventWriter<'a> {
     pub(super) fn new(
         blobs: &'a Blobs,
+        models: &'a Models<'a>,
         objects_dir: &Path,
         id: &str,
         cwd: &str,
@@ -41,6 +45,7 @@ impl<'a> EventWriter<'a> {
         );
         Self {
             blobs,
+            models,
             objects_dir: objects_dir.to_owned(),
             header,
             events: String::new(),
@@ -73,6 +78,7 @@ impl<'a> EventWriter<'a> {
                     self.advance(&run[0].timestamp);
                     self.close_step(&mut pending);
                     self.open_step();
+                    let model = self.models.at(run[0]);
                     let mut blocks = Vec::with_capacity(run.len());
                     for event in run {
                         match &event.body {
@@ -86,7 +92,12 @@ impl<'a> EventWriter<'a> {
                             _ => unreachable!(),
                         }
                     }
-                    self.assistant_message(identifiers::uuid_v4(), blocks, !pending.is_empty());
+                    self.assistant_message(
+                        identifiers::uuid_v4(),
+                        blocks,
+                        !pending.is_empty(),
+                        model,
+                    );
                 }
                 Unit::ToolResult(event, result) => {
                     self.advance(&event.timestamp);
@@ -114,6 +125,7 @@ impl<'a> EventWriter<'a> {
                             format!("{SYNTHETIC_PREFIX}{}", identifiers::uuid_v4()),
                             vec![call_block(call)],
                             true,
+                            self.models.at(event),
                         );
                         self.tool_result(call, result)?;
                     }
@@ -121,7 +133,7 @@ impl<'a> EventWriter<'a> {
                 Unit::Compaction(event, summary) => {
                     self.advance(&event.timestamp);
                     self.close_turn(&mut pending);
-                    self.compaction(summary);
+                    self.compaction(summary, self.models.at(event));
                 }
             }
         }
@@ -226,7 +238,13 @@ impl<'a> EventWriter<'a> {
         }
     }
 
-    fn assistant_message(&mut self, id: String, blocks: Vec<Value>, has_calls: bool) {
+    fn assistant_message(
+        &mut self,
+        id: String,
+        blocks: Vec<Value>,
+        has_calls: bool,
+        model: Option<Model<'_>>,
+    ) {
         let mut stream: Vec<Value> = blocks
             .iter()
             .enumerate()
@@ -236,7 +254,8 @@ impl<'a> EventWriter<'a> {
             .collect();
         let reason = if has_calls { "tool-calls" } else { "stop" };
         stream.push(json!({"type": "chunk", "time": self.time, "chunk": {"type": "finish", "reason": {"kind": reason}}}));
-        let message = json!({"id": id, "role": "assistant", "source": {"kind": "model", "provider": BATON_PROVIDER, "model": "baton"}, "content": blocks});
+        let (provider, model) = provider_and_id(model);
+        let message = json!({"id": id, "role": "assistant", "source": {"kind": "model", "provider": provider, "model": model}, "content": blocks});
         self.append_surface(
             "assistant/message",
             json!({"turn": self.turn, "step": self.step, "message": message, "stream": stream}),
@@ -273,7 +292,7 @@ impl<'a> EventWriter<'a> {
         Ok(content)
     }
 
-    fn compaction(&mut self, summary: &str) {
+    fn compaction(&mut self, summary: &str, model: Option<Model<'_>>) {
         let id = identifiers::uuid_v4();
         let message = json!({"id": identifiers::uuid_v4(), "role": "user", "source": {"kind": "compact-checkpoint", "compactionId": id}, "content": [{"type": "text", "text": CHECKPOINT_PREAMBLE}, {"type": "text", "text": summary}, {"type": "text", "text": "</compacted-summary>"}]});
         if self.surface.is_empty() {
@@ -289,9 +308,10 @@ impl<'a> EventWriter<'a> {
         );
         let first = self.surface[0];
         let last = *self.surface.last().expect("surface is not empty");
+        let (provider, model) = provider_and_id(model);
         let summary_seq = self.push(
             "compaction/summary",
-            json!({"compactionId": id, "summary": [{"type": "text", "text": summary}], "shadowedRange": {"start": first, "end": last}, "shadowedSeqs": self.surface, "shadowedTokenCount": 0, "provider": BATON_PROVIDER, "model": "baton"}),
+            json!({"compactionId": id, "summary": [{"type": "text", "text": summary}], "shadowedRange": {"start": first, "end": last}, "shadowedSeqs": self.surface, "shadowedTokenCount": 0, "provider": provider, "model": model}),
             None,
             None,
         );

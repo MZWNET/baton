@@ -29,7 +29,7 @@ pub(super) struct LogWriter<'a> {
 }
 
 impl<'a> LogWriter<'a> {
-    pub(super) fn new(session: &'a str, created: &str, cwd: &str) -> LogWriter<'a> {
+    pub(super) fn new(session: &'a str, created: &str, cwd: &str, model: &str) -> LogWriter<'a> {
         let mut writer = LogWriter {
             session,
             out: String::new(),
@@ -39,7 +39,7 @@ impl<'a> LogWriter<'a> {
             run: None,
             batches: HashMap::new(),
         };
-        let metadata = json!({"kind": "metadata", "record": {"build": {"semver": BUILD.0, "sha": BUILD.1}, "model_id": "baton",
+        let metadata = json!({"kind": "metadata", "record": {"build": {"semver": BUILD.0, "sha": BUILD.1}, "model_id": model,
                               "provider_id": "meta", "tool_surface_version": "1", "web_search_mode": "off", "workspace_root": cwd}});
         writer.push(created, "runtime.session.metadata", metadata);
         let opened = json!({"kind": "session_opened", "record": {"data_dir_free_bytes": 0, "resume": true, "schema_version": 1,

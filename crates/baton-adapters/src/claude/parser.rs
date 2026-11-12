@@ -5,8 +5,9 @@ use baton_core::journal::{Line, Node, Parser};
 use baton_core::{
     Blobs, Body, Compaction, Draft, Image, Info, Thinking, ToolCall, ToolResult, time,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::support::model::LEGACY_PLACEHOLDER;
 use crate::support::normalize::{self, Content};
 use crate::support::{images, json};
 
@@ -16,6 +17,7 @@ pub(super) struct TranscriptParser<'a> {
     info: Info,
     custom_title: Option<String>,
     ai_title: Option<String>,
+    model: Option<String>,
 }
 
 impl<'a> TranscriptParser<'a> {
@@ -25,10 +27,11 @@ impl<'a> TranscriptParser<'a> {
             info: Info::default(),
             custom_title: None,
             ai_title: None,
+            model: None,
         }
     }
 
-    fn bodies(&self, record: &Value) -> Result<Vec<Body>> {
+    fn bodies(&mut self, record: &Value) -> Result<Vec<Body>> {
         let content = &record["message"]["content"];
         match record["type"].as_str().unwrap_or_default() {
             "user" if record["isCompactSummary"] == true => {
@@ -52,6 +55,15 @@ impl<'a> TranscriptParser<'a> {
                         }
                     }
                     other => bodies.extend(other.as_str().and_then(normalize::assistant)),
+                }
+                if !bodies.is_empty()
+                    && let Some(model) = record["message"]["model"]
+                        .as_str()
+                        .filter(|model| !model.is_empty() && *model != LEGACY_PLACEHOLDER)
+                    && self.model.as_deref() != Some(model)
+                {
+                    bodies.insert(0, Body::Meta(json!({"type": "model", "model": model})));
+                    self.model = Some(model.to_owned());
                 }
                 Ok(bodies)
             }

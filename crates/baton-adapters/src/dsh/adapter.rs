@@ -134,6 +134,10 @@ impl Source for DshAdapter {
 }
 
 impl Adapter for DshAdapter {
+    fn writer_version(&self) -> u32 {
+        1
+    }
+
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         let id = format!("session-{}", identifiers::session_v4(export.seed));
         let cwd = export.cwd.to_string_lossy();
@@ -153,7 +157,14 @@ impl Adapter for DshAdapter {
             .join(&id)
             .join(filename);
         let objects_dir = self.objects_dir();
-        let mut writer = EventWriter::new(blobs, &objects_dir, &id, &cwd, export.created);
+        let mut writer = EventWriter::new(
+            blobs,
+            export.models,
+            &objects_dir,
+            &id,
+            &cwd,
+            export.created,
+        );
         writer.push_events(export.events)?;
         if let Some(title) = export.title {
             let timestamp = export

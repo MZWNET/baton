@@ -2,9 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
+use baton_core::replay::Models;
 use baton_core::{Blobs, Body, Event, Image, time};
 use serde_json::{Value, json};
 
+use crate::support::model::{UNKNOWN, provider_and_id};
 use crate::support::unit::{self, Unit};
 use crate::support::{files, identifiers, images, json};
 
@@ -13,6 +15,9 @@ const TITLE_SLOT: usize = 256;
 // Builds a pi or Oh My Pi journal: a linear chain of entries with random 8 digit hex ids
 pub(super) struct JournalWriter<'a> {
     blobs: &'a Blobs,
+    models: &'a Models<'a>,
+    is_omp: bool,
+    last_model: Option<(&'a str, &'a str)>,
     // Oh My Pi references images stored in this directory by hash; pi inlines them
     blob_dir: Option<PathBuf>,
     out: String,
@@ -22,9 +27,17 @@ pub(super) struct JournalWriter<'a> {
 }
 
 impl<'a> JournalWriter<'a> {
-    pub(super) fn new(blobs: &'a Blobs, blob_dir: Option<PathBuf>) -> JournalWriter<'a> {
+    pub(super) fn new(
+        blobs: &'a Blobs,
+        blob_dir: Option<PathBuf>,
+        models: &'a Models<'a>,
+        is_omp: bool,
+    ) -> JournalWriter<'a> {
         JournalWriter {
             blobs,
+            models,
+            is_omp,
+            last_model: None,
             blob_dir,
             out: String::new(),
             parent: None,
@@ -43,6 +56,13 @@ impl<'a> JournalWriter<'a> {
 
     pub(super) fn push_events(&mut self, events: &[&Event]) -> Result<()> {
         for unit in unit::units(events) {
+            let event = match &unit {
+                Unit::User(event, _) | Unit::ToolResult(event, _) | Unit::Compaction(event, _) => {
+                    *event
+                }
+                Unit::Assistant(events) => events[0],
+            };
+            self.push_model_change(event);
             match unit {
                 Unit::User(event, user) => {
                     let content = if user.images.is_empty() {
@@ -92,6 +112,24 @@ impl<'a> JournalWriter<'a> {
         self.out
     }
 
+    fn push_model_change(&mut self, event: &Event) {
+        if let Some((provider, model)) = self
+            .models
+            .at(event)
+            .map(|model| provider_and_id(Some(model)))
+            && self.last_model != Some((provider, model))
+        {
+            let entry = if self.is_omp {
+                json!({"type": "model_change", "model": format!("{provider}/{model}")})
+            } else {
+                json!({"type": "model_change", "provider": provider, "modelId": model})
+            };
+            let id = self.next_id();
+            self.push_entry(id, &event.timestamp, entry);
+            self.last_model = Some((provider, model));
+        }
+    }
+
     fn push_assistant(&mut self, events: &[&Event]) {
         let mut blocks = Vec::new();
         for event in events {
@@ -112,13 +150,13 @@ impl<'a> JournalWriter<'a> {
         } else {
             "stop"
         };
-        // Oh My Pi will not open a session whose model it cannot restore but ignores `<synthetic>`, and pi falls back from unknown models, so both use the configured model
+        let (provider, model) = provider_and_id(self.models.at(events[0]));
         let message = json!({
             "role": "assistant",
             "content": blocks,
-            "api": "baton",
-            "provider": "baton",
-            "model": "<synthetic>",
+            "api": UNKNOWN,
+            "provider": provider,
+            "model": model,
             "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
                       "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
             "stopReason": stop,

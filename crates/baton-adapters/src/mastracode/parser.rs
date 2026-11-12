@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::iter;
 
 use anyhow::Result;
 use baton_core::{Blobs, Body, Compaction, Draft, Image, Thinking, ToolCall, ToolResult, time};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::support::normalize::{self, Content};
 use crate::support::{images, json};
@@ -15,7 +16,7 @@ pub(super) struct Row {
     pub(super) content: String,
 }
 
-pub(super) fn drafts(row: &Row, blobs: &Blobs) -> Result<Vec<Draft>> {
+pub(super) fn drafts(row: &Row, blobs: &Blobs, model: &mut Option<String>) -> Result<Vec<Draft>> {
     // Observational memory hints and reminders of pauses are injected context
     if row.id == "om-continuation" || row.id.starts_with("__temporal_") {
         return Ok(Vec::new());
@@ -56,7 +57,7 @@ pub(super) fn drafts(row: &Row, blobs: &Blobs) -> Result<Vec<Draft>> {
         ("signal", _) if user_signal => normalize::user(self::content(parts, blobs)?)
             .into_iter()
             .collect(),
-        ("assistant", _) => assistant(parts, &marker["resultOrder"], blobs)?,
+        ("assistant", _) => assistant(parts, &marker["resultOrder"], blobs, model)?,
         _ => Vec::new(),
     };
     let timestamp = time::normalize(&row.created).unwrap_or_else(time::now);
@@ -72,7 +73,12 @@ pub(super) fn drafts(row: &Row, blobs: &Blobs) -> Result<Vec<Draft>> {
 }
 
 // Each step lists its text and calls, then the results MastraCode folded into the calls, which is how the model saw them
-fn assistant(parts: &[Value], result_order: &Value, blobs: &Blobs) -> Result<Vec<Body>> {
+fn assistant(
+    parts: &[Value],
+    result_order: &Value,
+    blobs: &Blobs,
+    model: &mut Option<String>,
+) -> Result<Vec<Body>> {
     let mut order = HashMap::new();
     if let Some(ids) = result_order.as_array() {
         for (position, id) in ids.iter().filter_map(Value::as_str).enumerate() {
@@ -80,7 +86,18 @@ fn assistant(parts: &[Value], result_order: &Value, blobs: &Blobs) -> Result<Vec
         }
     }
     let mut bodies = Vec::new();
-    for step in parts.split(|part| part["type"] == "step-start") {
+    // The parts before the first step start have no step model
+    let step_models = iter::once(None).chain(
+        parts
+            .iter()
+            .filter(|part| part["type"] == "step-start")
+            .map(|part| part["model"].as_str()),
+    );
+    for (step, step_model) in parts
+        .split(|part| part["type"] == "step-start")
+        .zip(step_models)
+    {
+        let start = bodies.len();
         let mut results: Vec<(&str, Body)> = Vec::new();
         for part in step {
             match part["type"].as_str().unwrap_or_default() {
@@ -109,6 +126,16 @@ fn assistant(parts: &[Value], result_order: &Value, blobs: &Blobs) -> Result<Vec
             results.sort_by_key(|(id, _)| order.get(id).copied());
         }
         bodies.extend(results.into_iter().map(|(_, result)| result));
+        if bodies.len() > start
+            && let Some(step_model) = step_model.filter(|step_model| !step_model.is_empty())
+            && model.as_deref() != Some(step_model)
+        {
+            bodies.insert(
+                start,
+                Body::Meta(json!({"type": "model", "model": step_model})),
+            );
+            *model = Some(step_model.to_owned());
+        }
     }
     Ok(bodies)
 }

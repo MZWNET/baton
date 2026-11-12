@@ -39,6 +39,10 @@ pub(super) fn drafts(messages: &[Value], unpacked: &Unpacked, blobs: &Blobs) -> 
             .any(|parsed| parsed.time.is_none())
             .then(|| created(message))
             .transpose()?;
+        let model = (message["role"] == "assistant")
+            .then(|| message["modelSnapshot"]["modelId"].as_str())
+            .flatten()
+            .filter(|model| !model.is_empty());
         for parsed in parsed {
             last = last.max(parsed.order);
             let draft = Draft {
@@ -49,12 +53,28 @@ pub(super) fn drafts(messages: &[Value], unpacked: &Unpacked, blobs: &Blobs) -> 
                 native_entry_id: native_entry_id.clone(),
                 body: parsed.body,
             };
-            drafts.push(((parsed.order.or(last), drafts.len()), draft));
+            drafts.push(((parsed.order.or(last), drafts.len()), draft, model));
         }
     }
-    drafts.sort_by_key(|(key, _)| *key);
+    drafts.sort_by_key(|(key, _, _)| *key);
 
-    Ok(drafts.into_iter().map(|(_, draft)| draft).collect())
+    let mut result = Vec::new();
+    let mut last_model = None;
+    for (_, draft, model) in drafts {
+        if let Some(model) = model
+            && last_model != Some(model)
+        {
+            result.push(Draft {
+                timestamp: draft.timestamp.clone(),
+                native_entry_id: draft.native_entry_id.clone(),
+                body: Body::Meta(json!({"type": "model", "model": model})),
+            });
+            last_model = Some(model);
+        }
+        result.push(draft);
+    }
+
+    Ok(result)
 }
 
 fn created(message: &Value) -> Result<String> {

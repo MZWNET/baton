@@ -20,8 +20,9 @@ pub(super) struct WireParser<'a> {
     // Whether the parser continues an earlier read, which never saw the turns before the cursor
     continuing: bool,
     last: Option<String>,
+    model: Option<String>,
     // The node before each user turn, so an undo can return to it
-    turns: Vec<Option<String>>,
+    turns: Vec<(Option<String>, Option<String>)>,
 }
 
 impl<'a> WireParser<'a> {
@@ -31,12 +32,25 @@ impl<'a> WireParser<'a> {
             blob_dir,
             continuing: leaf.is_some(),
             last: leaf.map(String::from),
+            model: None,
             turns: Vec::new(),
         }
     }
 
     fn bodies(&mut self, record: &Value) -> Result<Vec<Body>> {
         let bodies = match record["type"].as_str().unwrap_or_default() {
+            "profile.bind" | "config.update" => {
+                if let Some(model) = record["modelAlias"]
+                    .as_str()
+                    .filter(|model| !model.is_empty())
+                    && self.model.as_deref() != Some(model)
+                {
+                    self.model = Some(model.to_owned());
+                    vec![Body::Meta(json!({"type": "model", "model": model}))]
+                } else {
+                    Vec::new()
+                }
+            }
             "context.append_message" => self.message(&record["message"])?,
             "context.append_loop_event" => self.loop_event(&record["event"])?,
             "context.apply_compaction" => {
@@ -64,7 +78,7 @@ impl<'a> WireParser<'a> {
         let bodies = match message["role"].as_str().unwrap_or_default() {
             // Other origins are messages the runtime injected
             "user" if typed(&message["origin"]) => {
-                self.turns.push(self.last.clone());
+                self.turns.push((self.last.clone(), self.model.clone()));
                 normalize::user(self.content(&message["content"])?)
                     .into_iter()
                     .collect()
@@ -168,7 +182,10 @@ impl<'a> WireParser<'a> {
     fn undo(&mut self, count: u64) -> Line {
         for _ in 0..count {
             match self.turns.pop() {
-                Some(before) => self.last = before,
+                Some((before, model)) => {
+                    self.last = before;
+                    self.model = model;
+                }
                 // An incremental read never saw the turns it would have to undo
                 None if self.continuing => return Line::Restart,
                 None => break,

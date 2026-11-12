@@ -25,11 +25,13 @@ fn export_one(root: &Path, blobs: &Blobs, text: &str) -> String {
     let events = Event::chain([draft], None, Agent::Pi, "source");
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: None,
         cwd: Path::new("/work/demo"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        models: &models,
         seed: None,
     };
     AntigravityAdapter::new(root.into())
@@ -75,11 +77,13 @@ fn writes_native_images_and_reads_them_back_in_order() {
     let events = Event::chain(drafts, None, Agent::Pi, "source");
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: None,
         cwd: Path::new("/work/demo"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        models: &models,
         seed: None,
     };
     let adapter = AntigravityAdapter::new(dir.path().join("antigravity"));

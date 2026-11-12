@@ -1,4 +1,5 @@
 use anyhow::Result;
+use baton_core::replay::Models;
 use baton_core::{Blobs, Body, Event, Image};
 use serde_json::{Value, json};
 
@@ -11,6 +12,7 @@ const VERSION: &str = "2.1.209";
 // Builds a Claude Code transcript as one linear chain of records
 pub(super) struct TranscriptWriter<'a> {
     blobs: &'a Blobs,
+    models: &'a Models<'a>,
     session: &'a str,
     cwd: &'a str,
     out: String,
@@ -18,9 +20,15 @@ pub(super) struct TranscriptWriter<'a> {
 }
 
 impl<'a> TranscriptWriter<'a> {
-    pub(super) fn new(blobs: &'a Blobs, session: &'a str, cwd: &'a str) -> TranscriptWriter<'a> {
+    pub(super) fn new(
+        blobs: &'a Blobs,
+        models: &'a Models<'a>,
+        session: &'a str,
+        cwd: &'a str,
+    ) -> TranscriptWriter<'a> {
         TranscriptWriter {
             blobs,
+            models,
             session,
             cwd,
             out: String::new(),
@@ -105,11 +113,12 @@ impl<'a> TranscriptWriter<'a> {
         } else {
             "end_turn"
         };
+        // `<synthetic>` marks replies no model produced, which baton's parser drops, so an unknown model stays empty
         let message = json!({
             "id": format!("msg_{}", identifiers::short_hex(24)),
             "type": "message",
             "role": "assistant",
-            "model": "baton",
+            "model": self.models.at(events[0]).map_or("", |model| model.id),
             "content": blocks,
             "stop_reason": stop,
             "stop_sequence": null,

@@ -36,6 +36,12 @@ impl Session {
         self.index.contains_key(id)
     }
 
+    pub(crate) fn children(&self, parent: Option<&str>) -> impl Iterator<Item = &Event> {
+        self.events
+            .iter()
+            .filter(move |event| event.parent.as_deref() == parent)
+    }
+
     pub(crate) fn last(&self) -> Option<&Event> {
         self.leaves()
             .into_iter()

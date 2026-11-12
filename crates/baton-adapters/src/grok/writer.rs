@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
+use baton_core::replay::Models;
 use baton_core::{Blobs, Body, Event, Image, time};
 use serde_json::{Value, json};
 
@@ -12,16 +13,24 @@ use crate::support::{identifiers, images, json};
 pub(super) struct UpdateWriter<'a> {
     blobs: &'a Blobs,
     session: &'a str,
+    models: &'a Models<'a>,
+    last_model: Option<&'a str>,
     out: String,
     lines: usize,
     millis: i64,
 }
 
 impl<'a> UpdateWriter<'a> {
-    pub(super) fn new(blobs: &'a Blobs, session: &'a str) -> UpdateWriter<'a> {
+    pub(super) fn new(
+        blobs: &'a Blobs,
+        session: &'a str,
+        models: &'a Models<'a>,
+    ) -> UpdateWriter<'a> {
         UpdateWriter {
             blobs,
             session,
+            models,
+            last_model: None,
             out: String::new(),
             lines: 0,
             millis: 0,
@@ -120,10 +129,24 @@ impl<'a> UpdateWriter<'a> {
     }
 
     fn push(&mut self, event: &Event, update: Value) {
+        if let Some(model) = self.models.at(event).map(|model| model.split().1)
+            && self.last_model != Some(model)
+        {
+            self.push_update(
+                event,
+                "_x.ai/session/update",
+                json!({"sessionUpdate": "model_changed", "model_id": model}),
+            );
+            self.last_model = Some(model);
+        }
+        self.push_update(event, "session/update", update);
+    }
+
+    fn push_update(&mut self, event: &Event, method: &str, update: Value) {
         self.millis = self.millis.max(time::unix_millis(&event.timestamp));
         let line = json!({
             "timestamp": self.millis.div_euclid(1000),
-            "method": "session/update",
+            "method": method,
             "params": {"sessionId": self.session, "update": update, "_meta": {"agentTimestampMs": self.millis}},
         });
         json::push_line(&mut self.out, &line);

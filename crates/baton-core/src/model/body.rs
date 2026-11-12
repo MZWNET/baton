@@ -21,7 +21,7 @@ pub enum Body {
     Compaction(Compaction),
     /// Reasoning of the assistant, kept but never written back to an agent.
     Thinking(Thinking),
-    /// Session facts such as model changes, as an object with a `type` field; never written back to an agent.
+    /// Session facts such as model changes, as an object with a `type` field; never written back as events, but the models they name reach exports through [`Models`](crate::replay::Models)
     ///
     /// A meta event of type `reset` hides everything before it from exports, the way an Oh My Pi reset boundary does.
     Meta(Value),

@@ -10,6 +10,7 @@ use rusqlite::{TransactionBehavior, params};
 
 use crate::devin::parser::{self, Node};
 use crate::devin::writer;
+use crate::support::model::UNKNOWN;
 use crate::support::{files, identifiers, program, sqlite};
 
 // The main chain from its root to the tip `?2`; retries, edits and subagents leave other trees in the forest
@@ -104,13 +105,14 @@ impl Source for DevinAdapter {
         })?;
         let mut seen = HashSet::new();
         let mut drafts = Vec::new();
+        let mut model = None;
         for node in nodes {
             let node = node?;
             // A damaged forest can loop back onto its own chain
             if !seen.insert(node.id) {
                 break;
             }
-            drafts.extend(parser::drafts(&node, blobs)?);
+            drafts.extend(parser::drafts(&node, blobs, &mut model)?);
         }
         Ok(NativeRead {
             info: Info {
@@ -126,6 +128,10 @@ impl Source for DevinAdapter {
 }
 
 impl Adapter for DevinAdapter {
+    fn writer_version(&self) -> u32 {
+        1
+    }
+
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         if !self.db.is_file() {
             bail!(
@@ -133,19 +139,19 @@ impl Adapter for DevinAdapter {
                 self.db.display()
             );
         }
-        let nodes = writer::nodes(export.events, blobs)?;
+        let nodes = writer::nodes(export.events, export.models, blobs)?;
         let id = identifiers::session_v4(export.seed).to_string();
         // The newest session is the one Devin lists first and continues
         let activity = time::unix_millis(&time::now()).div_euclid(1000);
         let mut connection = sqlite::open_read_write(&self.db)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // The fallback model and the default mode the CLI writes itself, so a resumed session keeps the user's own permissions
         transaction.execute(
             "INSERT INTO sessions (id, working_directory, backend_type, model, agent_mode, created_at, last_activity_at, title, main_chain_id, hidden)
-             VALUES (?1, ?2, 'windsurf', 'swe-1-6-fast', 'normal', ?3, ?4, ?5, ?6, 0)",
+             VALUES (?1, ?2, 'windsurf', ?3, 'normal', ?4, ?5, ?6, ?7, 0)",
             params![
                 id,
                 export.cwd.to_string_lossy(),
+                export.models.last().map_or(UNKNOWN, |model| model.split().1),
                 time::unix_millis(export.created).div_euclid(1000),
                 activity,
                 export.title,

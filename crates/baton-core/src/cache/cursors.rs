@@ -8,6 +8,9 @@ use rusqlite::{Connection, params};
 use crate::cache::database;
 use crate::{Agent, Cursor, Progress, Stamp};
 
+// Raised when parsers come to read more of a native session, so the next import reads every session again
+const VERSION: i64 = 1;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS cursors (
     agent TEXT NOT NULL,
@@ -32,6 +35,13 @@ pub(crate) struct Cursors {
 impl Cursors {
     pub(crate) fn open(cache: &Path, data: &Path) -> Result<Cursors> {
         let db = database::open(&cache.join("state.db"), data, SCHEMA, &["cursors"])?;
+        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < VERSION {
+            // No native session has this size, so each is read again, and unlike deleting the cursors this keeps where each was synced
+            db.execute("UPDATE cursors SET size = -1", [])?;
+            db.pragma_update(None, "user_version", VERSION)?;
+        }
+
         Ok(Cursors { db: Mutex::new(db) })
     }
 

@@ -60,6 +60,9 @@ pub struct Link {
     /// The unified event at the end of the exported branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exported_leaf: Option<String>,
+    /// The [`Adapter::writer_version`](crate::Adapter::writer_version) that wrote an exported native session
+    #[serde(default)]
+    pub writer_version: u32,
     /// Whether the exported native session has been continued.
     #[serde(default)]
     pub continued: bool,

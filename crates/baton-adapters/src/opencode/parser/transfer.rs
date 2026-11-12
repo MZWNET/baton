@@ -6,6 +6,7 @@ use baton_core::{
 use serde_json::{Value, json};
 
 use crate::opencode::tool_order;
+use crate::support::model::LEGACY_PLACEHOLDER;
 use crate::support::normalize::{self, Content};
 use crate::support::{images, json};
 
@@ -17,6 +18,7 @@ pub(in crate::opencode) fn parse(data: &Value, blobs: &Blobs) -> Result<NativeRe
         .and_then(time::from_unix_millis);
     let fallback = created.clone().unwrap_or_else(time::now);
     let mut drafts = Vec::new();
+    let mut last_model: Option<(String, String)> = None;
     let messages = data["messages"]
         .as_array()
         .map(Vec::as_slice)
@@ -74,6 +76,23 @@ pub(in crate::opencode) fn parse(data: &Value, blobs: &Blobs) -> Result<NativeRe
                     }
                 }
                 bodies.extend(results);
+                let model = &message["model"];
+                if !bodies.is_empty()
+                    && let (Some(provider), Some(id)) =
+                        (model["providerID"].as_str(), model["id"].as_str())
+                    && !provider.is_empty()
+                    && provider != LEGACY_PLACEHOLDER
+                    && !id.is_empty()
+                    && last_model
+                        .as_ref()
+                        .is_none_or(|(previous_provider, previous_id)| {
+                            previous_provider != provider || previous_id != id
+                        })
+                {
+                    let name = format!("{provider}/{id}");
+                    bodies.insert(0, Body::Meta(json!({"type": "model", "model": name})));
+                    last_model = Some((provider.to_owned(), id.to_owned()));
+                }
             }
             "compaction" if message["status"] == "completed" => {
                 // A provider compaction keeps only an opaque checkpoint, so the visible history stays in force
@@ -84,12 +103,12 @@ pub(in crate::opencode) fn parse(data: &Value, blobs: &Blobs) -> Result<NativeRe
             }
             "model-switched" => {
                 let model = &message["model"];
-                let name = format!(
-                    "{}/{}",
-                    model["providerID"].as_str().unwrap_or_default(),
-                    model["id"].as_str().unwrap_or_default()
-                );
-                bodies.push(Body::Meta(json!({"type": "model", "model": name})));
+                let provider = model["providerID"].as_str().unwrap_or_default();
+                let id = model["id"].as_str().unwrap_or_default();
+                bodies.push(Body::Meta(
+                    json!({"type": "model", "model": format!("{provider}/{id}")}),
+                ));
+                last_model = Some((provider.to_owned(), id.to_owned()));
             }
             _ => {}
         }

@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::grok::writer::UpdateWriter;
 use crate::grok::{bucket, parser};
+use crate::support::model::UNKNOWN;
 use crate::support::{files, identifiers, json, program};
 
 // Directory names of sessions are at most this long on common file systems
@@ -123,11 +124,15 @@ impl Source for GrokAdapter {
 }
 
 impl Adapter for GrokAdapter {
+    fn writer_version(&self) -> u32 {
+        1
+    }
+
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         let id = identifiers::session_v7(export.seed, time::unix_millis(export.created) as u64)
             .to_string();
         let cwd = export.cwd.to_string_lossy().into_owned();
-        let mut writer = UpdateWriter::new(blobs, &id);
+        let mut writer = UpdateWriter::new(blobs, &id, export.models);
         writer.push_events(export.events)?;
         let mut name = bucket::name(&cwd);
         let hashed = name.len() > NAME_MAX;
@@ -155,7 +160,7 @@ impl Adapter for GrokAdapter {
             "updated_at": updated,
             "last_active_at": updated,
             "num_messages": lines,
-            "current_model_id": "grok-build",
+            "current_model_id": export.models.last().map_or(UNKNOWN, |model| model.split().1),
             "chat_format_version": 1,
         });
         // A manual title is never replaced by the one Grok generates

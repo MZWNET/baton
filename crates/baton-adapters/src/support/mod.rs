@@ -3,6 +3,7 @@ pub(crate) mod identifiers;
 pub(crate) mod images;
 pub(crate) mod json;
 pub(crate) mod local_time;
+pub(crate) mod model;
 pub(crate) mod normalize;
 pub(crate) mod program;
 pub(crate) mod protobuf;

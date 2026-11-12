@@ -23,9 +23,16 @@ pub(super) fn legacy(old: &str) -> String {
     derive(&format!("legacy:{old}"))
 }
 
-pub(super) fn exported(session: &str, host: &str, agent: Agent, leaf: Option<&str>) -> Uuid {
+// The writer version keeps a rewrite from colliding with the export it replaces, which is removed only after the new one is written
+pub(super) fn exported(
+    session: &str,
+    host: &str,
+    agent: Agent,
+    leaf: Option<&str>,
+    writer_version: u32,
+) -> Uuid {
     uuid(&format!(
-        "export:{session}:{host}:{agent}:{}",
+        "export:{session}:{host}:{agent}:{}:{writer_version}",
         leaf.unwrap_or_default()
     ))
 }

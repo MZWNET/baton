@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::muse::parser::LogParser;
 use crate::muse::writer::LogWriter;
+use crate::support::model::UNKNOWN;
 use crate::support::{files, identifiers, program};
 
 /// Sessions of [Muse Code](https://dev.meta.ai/docs/muse-code/): `sessions/YYYY/MM/DD/<session uuid>/session.jsonl` under its data directory.
@@ -90,6 +91,10 @@ impl Source for MuseAdapter {
 }
 
 impl Adapter for MuseAdapter {
+    fn writer_version(&self) -> u32 {
+        1
+    }
+
     fn write(&self, export: &Export, _blobs: &Blobs) -> Result<NativeSession> {
         let created = export.created;
         let Some(started) = time::parse(created) else {
@@ -98,7 +103,11 @@ impl Adapter for MuseAdapter {
         // Muse generates time ordered ids and files sessions under their local creation date
         let id =
             identifiers::session_v7(export.seed, started.timestamp_millis() as u64).to_string();
-        let mut writer = LogWriter::new(&id, created, &export.cwd.to_string_lossy());
+        let model = export
+            .models
+            .last()
+            .map_or(UNKNOWN, |model| model.split().1);
+        let mut writer = LogWriter::new(&id, created, &export.cwd.to_string_lossy(), model);
         writer.push_events(export.events);
         let local = started.with_timezone(&Local);
         let path = self

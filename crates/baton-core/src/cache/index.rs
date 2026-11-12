@@ -13,7 +13,7 @@ use crate::project::{identify, matches};
 use crate::storage::record_order;
 use crate::{Agent, Direction, Link, Project, SessionMeta, Store};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS links (
     path TEXT NOT NULL,
     removed INTEGER NOT NULL,
     removable INTEGER NOT NULL,
+    writer_version INTEGER NOT NULL,
     PRIMARY KEY (session, name)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS links_lookup ON links (host, agent, native_id, version, name);
@@ -126,6 +127,8 @@ pub(crate) struct MaterializationLink {
     pub native_id: String,
     /// Whether the link is an untouched export with a recorded digest, so the native session may be removed once obsolete.
     pub removable: bool,
+    /// The writer version of an export
+    pub writer_version: u32,
 }
 
 impl Index {
@@ -337,7 +340,7 @@ impl Index {
     pub(crate) fn materialization_links(&self, agent: Agent) -> Result<Vec<MaterializationLink>> {
         let db = self.db.lock().unwrap();
         let mut statement = db.prepare_cached(
-            "SELECT l.session, l.native_id, l.removable FROM links l WHERE l.host = ?1 AND l.agent = ?2 AND NOT l.removed
+            "SELECT l.session, l.native_id, l.removable, l.writer_version FROM links l WHERE l.host = ?1 AND l.agent = ?2 AND NOT l.removed
              AND NOT EXISTS (SELECT 1 FROM links newer WHERE newer.host = l.host AND newer.agent = l.agent AND newer.native_id = l.native_id AND (newer.version, newer.name, newer.session) > (l.version, l.name, l.session))
              ORDER BY l.session, l.native_id",
         )?;
@@ -346,6 +349,7 @@ impl Index {
                 session: row.get(0)?,
                 native_id: row.get(1)?,
                 removable: row.get(2)?,
+                writer_version: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -514,8 +518,8 @@ fn apply(transaction: &rusqlite::Transaction<'_>, loaded: Loaded) -> Result<()> 
                 && !link.continued
                 && link.exported_digest.is_some();
             transaction.prepare_cached(
-                "INSERT INTO links (session, name, version, host, agent, native_id, path, removed, removable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?.execute(params![id, name, version, link.host, link.agent.name(), link.native_id, link.path, link.removed, removable])?;
+                "INSERT INTO links (session, name, version, host, agent, native_id, path, removed, removable, writer_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?.execute(params![id, name, version, link.host, link.agent.name(), link.native_id, link.path, link.removed, removable, link.writer_version])?;
         }
     }
     if events_changed {

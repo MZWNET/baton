@@ -6,10 +6,10 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use baton_core::{
-    Adapter, Agent, Blobs, Cursor, Export, Info, NativeRead, NativeSession, Progress, Source,
-    Stamp, time,
+    Adapter, Agent, Blobs, Body, Cursor, Draft, Export, Info, NativeRead, NativeSession, Progress,
+    Source, Stamp, time,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::openhands::parser;
@@ -135,7 +135,23 @@ impl Source for OpenhandsAdapter {
         let state = fs::read(session.path.join("base_state.json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-        let cwd = state.and_then(|state| json::string(&state["workspace"]["working_dir"]));
+        let cwd = state
+            .as_ref()
+            .and_then(|state| json::string(&state["workspace"]["working_dir"]));
+        if let Some(first) = drafts.first()
+            && let Some(model) = state
+                .as_ref()
+                .and_then(|state| json::string(&state["agent"]["llm"]["model"]))
+        {
+            drafts.insert(
+                0,
+                Draft {
+                    timestamp: first.timestamp.clone(),
+                    native_entry_id: None,
+                    body: Body::Meta(json!({"type": "model", "model": model})),
+                },
+            );
+        }
         Ok(NativeRead {
             info: Info {
                 cwd,

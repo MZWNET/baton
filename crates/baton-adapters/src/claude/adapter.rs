@@ -65,6 +65,10 @@ impl Source for ClaudeAdapter {
 }
 
 impl Adapter for ClaudeAdapter {
+    fn writer_version(&self) -> u32 {
+        1
+    }
+
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         let id = identifiers::session_v4(export.seed).to_string();
         let cwd = export.cwd.to_string_lossy();
@@ -73,7 +77,7 @@ impl Adapter for ClaudeAdapter {
             .join("projects")
             .join(project_key::from_cwd(&cwd))
             .join(format!("{id}.jsonl"));
-        let mut writer = TranscriptWriter::new(blobs, &id, &cwd);
+        let mut writer = TranscriptWriter::new(blobs, export.models, &id, &cwd);
         writer.push_events(export.events)?;
         if let Some(title) = export.title {
             writer.push_title(title);

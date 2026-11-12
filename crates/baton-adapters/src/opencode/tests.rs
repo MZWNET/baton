@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use baton_core::{
-    Agent, Assistant, Blobs, Body, Draft, Event, Export, Image, ToolCall, ToolResult, User, replay,
+    Agent, Assistant, Blobs, Body, Compaction, Draft, Event, Export, Image, ToolCall, ToolResult,
+    User, replay,
 };
 use serde_json::{Value, json};
 
@@ -164,11 +165,13 @@ fn written_bundles_read_back_unchanged() {
     let events = Event::chain(drafts, None, Agent::Opencode, "ses_x");
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: Some("Round trip"),
         cwd: Path::new("/work/demo"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        models: &models,
         seed: None,
     };
     let bundle = writer::bundle::write(&export, "ses_fixture", "1.19.5", &blobs).unwrap();
@@ -206,7 +209,12 @@ fn written_bundles_read_back_unchanged() {
         .collect();
     assert!(ids.is_sorted(), "OpenCode orders messages by id");
     let read = parser::bundle::parse(&bundle, &blobs).unwrap();
-    let bodies: Vec<&Body> = read.drafts.iter().map(|draft| &draft.body).collect();
+    let bodies: Vec<&Body> = read
+        .drafts
+        .iter()
+        .map(|draft| &draft.body)
+        .filter(|body| !matches!(body, Body::Meta(_)))
+        .collect();
     let expected: Vec<&Body> = replayed.iter().map(|event| &event.body).collect();
     assert_eq!(bodies, expected);
     assert_eq!(read.info.title.as_deref(), Some("Round trip"));
@@ -300,11 +308,13 @@ fn written_v2_transfers_read_back_unchanged() {
     let events = Event::chain(drafts, None, Agent::Opencode, "ses_y");
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: None,
         cwd: Path::new("/work/demo"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        models: &models,
         seed: None,
     };
     let data = writer::transfer::write(&export, "ses_fixture", &blobs).unwrap();
@@ -341,9 +351,172 @@ fn written_v2_transfers_read_back_unchanged() {
         .collect();
     assert!(ids.is_sorted(), "OpenCode orders messages by id");
     let read = parser::transfer::parse(&data, &blobs).unwrap();
-    let bodies: Vec<&Body> = read.drafts.iter().map(|draft| &draft.body).collect();
+    let bodies: Vec<&Body> = read
+        .drafts
+        .iter()
+        .map(|draft| &draft.body)
+        .filter(|body| !matches!(body, Body::Meta(_)))
+        .collect();
     let expected: Vec<&Body> = replayed.iter().map(|event| &event.body).collect();
     assert_eq!(bodies, expected);
     assert_eq!(read.info.title, None, "OpenCode 2 has no placeholder title");
     assert_eq!(read.info.cwd.as_deref(), Some("/work/demo"));
+}
+
+fn model_round_trip(bundle: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    for with_models in [true, false] {
+        let mut bodies = Vec::new();
+        for model in [
+            json!({"type": "model", "provider": "first", "model": "alpha"}),
+            json!({"type": "model", "model": "second/beta"}),
+            json!({"type": "model", "model": "unqualified"}),
+        ] {
+            if with_models {
+                bodies.push(Body::Meta(model));
+            }
+            bodies.push(Body::User(User {
+                text: "question".into(),
+                images: vec![],
+            }));
+            bodies.push(Body::Assistant(Assistant {
+                text: "answer".into(),
+            }));
+        }
+        bodies.push(Body::Compaction(Compaction {
+            summary: "summary".into(),
+        }));
+        bodies.push(Body::ToolResult(ToolResult {
+            call_id: "missing".into(),
+            text: "result".into(),
+            images: vec![],
+            is_error: false,
+        }));
+        let drafts = bodies.into_iter().map(|body| Draft {
+            timestamp: "2026-08-18T12:00:00.000Z".into(),
+            native_entry_id: None,
+            body,
+        });
+        let events = Event::chain(drafts, None, Agent::Opencode, "ses_models");
+        let path: Vec<&Event> = events.iter().collect();
+        let replayed = replay::events(&path);
+        let models = replay::Models::new(&path);
+        let export = Export {
+            title: None,
+            cwd: Path::new("/work/demo"),
+            created: "2026-01-01T00:00:00.000Z",
+            events: &replayed,
+            models: &models,
+            seed: None,
+        };
+        let (data, read) = if bundle {
+            let data = writer::bundle::write(&export, "ses_fixture", "1.19.5", &blobs).unwrap();
+            let read = parser::bundle::parse(&data, &blobs).unwrap();
+            (data, read)
+        } else {
+            let data = writer::transfer::write(&export, "ses_fixture", &blobs).unwrap();
+            let read = parser::transfer::parse(&data, &blobs).unwrap();
+            (data, read)
+        };
+        let expected = if with_models {
+            if bundle {
+                vec![
+                    json!({"type": "model", "provider": "first", "model": "alpha"}),
+                    json!({"type": "model", "provider": "second", "model": "beta"}),
+                    json!({"type": "model", "provider": "<synthetic>", "model": "unqualified"}),
+                ]
+            } else {
+                vec![
+                    json!({"type": "model", "model": "first/alpha"}),
+                    json!({"type": "model", "model": "second/beta"}),
+                    json!({"type": "model", "model": "<synthetic>/unqualified"}),
+                ]
+            }
+        } else if bundle {
+            vec![json!({"type": "model", "provider": "<synthetic>", "model": "<synthetic>"})]
+        } else {
+            vec![json!({"type": "model", "model": "<synthetic>/<synthetic>"})]
+        };
+        let actual: Vec<Value> = read
+            .drafts
+            .iter()
+            .filter_map(|draft| match &draft.body {
+                Body::Meta(value) if value["type"] == "model" => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        let messages = data["messages"].as_array().unwrap();
+        let (first_provider, first_id, second_provider, second_id, last_id) = if with_models {
+            ("first", "alpha", "second", "beta", "unqualified")
+        } else {
+            (
+                "<synthetic>",
+                "<synthetic>",
+                "<synthetic>",
+                "<synthetic>",
+                "<synthetic>",
+            )
+        };
+        if bundle {
+            assert_eq!(
+                messages[0]["info"]["model"],
+                json!({"providerID": first_provider, "modelID": first_id})
+            );
+            assert_eq!(messages[1]["info"]["providerID"], first_provider);
+            assert_eq!(messages[1]["info"]["modelID"], first_id);
+            assert_eq!(
+                messages[2]["info"]["model"],
+                json!({"providerID": second_provider, "modelID": second_id})
+            );
+            assert_eq!(messages[3]["info"]["providerID"], second_provider);
+            assert_eq!(messages[3]["info"]["modelID"], second_id);
+            assert_eq!(
+                messages[4]["info"]["model"],
+                json!({"providerID": "<synthetic>", "modelID": last_id})
+            );
+            assert_eq!(
+                messages[6]["info"]["model"],
+                json!({"providerID": "<synthetic>", "modelID": last_id})
+            );
+            for message in [&messages[5], &messages[7], &messages[8]] {
+                assert_eq!(message["info"]["providerID"], "<synthetic>");
+                assert_eq!(message["info"]["modelID"], last_id);
+            }
+        } else {
+            assert_eq!(
+                messages[1]["model"],
+                json!({"providerID": first_provider, "id": first_id})
+            );
+            assert_eq!(
+                messages[3]["model"],
+                json!({"providerID": second_provider, "id": second_id})
+            );
+            for message in [&messages[5], &messages[7]] {
+                assert_eq!(
+                    message["model"],
+                    json!({"providerID": "<synthetic>", "id": last_id})
+                );
+            }
+            if with_models {
+                assert_eq!(
+                    data["info"]["model"],
+                    json!({"providerID": "<synthetic>", "id": "unqualified"})
+                );
+            } else {
+                assert!(data["info"].get("model").is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn bundle_models_read_back() {
+    model_round_trip(true);
+}
+
+#[test]
+fn transfer_models_read_back() {
+    model_round_trip(false);
 }

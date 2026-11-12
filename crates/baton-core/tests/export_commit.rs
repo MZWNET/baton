@@ -31,6 +31,7 @@ struct DeferredAdapter<'a> {
     path: PathBuf,
     staged: Mutex<Transcripts>,
     before_flush: FlushHook<'a>,
+    writer_version: u32,
 }
 
 impl DeferredAdapter<'_> {
@@ -41,6 +42,7 @@ impl DeferredAdapter<'_> {
             staged: Mutex::new(Self::committed(&path)),
             path,
             before_flush: &no_hook,
+            writer_version: 0,
         }
     }
 
@@ -120,6 +122,10 @@ impl Source for DeferredAdapter<'_> {
 }
 
 impl Adapter for DeferredAdapter<'_> {
+    fn writer_version(&self) -> u32 {
+        self.writer_version
+    }
+
     fn write(&self, export: &Export, _blobs: &Blobs) -> Result<NativeSession> {
         let id = export.seed.unwrap_or_else(Uuid::new_v4).to_string();
         let mut staged = self.staged.lock().unwrap();
@@ -203,6 +209,80 @@ fn import_new(baton: &mut Baton, source: &DeferredAdapter, native: &NativeSessio
     baton.refresh().unwrap();
 
     session
+}
+
+#[test]
+fn materialize_writes_untouched_exports_of_an_older_writer_again() {
+    isolated(
+        "materialize_writes_untouched_exports_of_an_older_writer_again",
+        |mut baton, root| {
+            let mut source = DeferredAdapter::open(Agent::Pi, root);
+            let first_native = source.set("first", vec![user("a")]);
+            let first = import_new(&mut baton, &source, &first_native);
+            let second_native = source.set("second", vec![user("b")]);
+            let second = import_new(&mut baton, &source, &second_native);
+            let mut adapter = DeferredAdapter::open(Agent::Claude, root);
+            let natives = adapter.discover(None).unwrap();
+            let result = baton
+                .materialize(&adapter, &natives, None, &HashSet::new())
+                .unwrap();
+            assert_eq!(result.exported, 2);
+            baton.refresh().unwrap();
+
+            let old_first = baton
+                .index
+                .latest_native(&first, Agent::Claude)
+                .unwrap()
+                .unwrap();
+            let continued = baton
+                .index
+                .latest_native(&second, Agent::Claude)
+                .unwrap()
+                .unwrap();
+            let native = adapter.set(&continued, vec![user("b"), user("continued")]);
+            assert!(matches!(
+                baton.import(&adapter, &native).unwrap(),
+                ImportOutcome::Appended { events: 1, .. }
+            ));
+            baton.refresh().unwrap();
+
+            adapter.writer_version = 1;
+            let natives = adapter.discover(None).unwrap();
+            let result = baton
+                .materialize(&adapter, &natives, None, &HashSet::new())
+                .unwrap();
+            assert_eq!(result.refreshed, 1);
+            assert_eq!(result.removed, 1);
+            assert_eq!(result.up_to_date, 1);
+            baton.refresh().unwrap();
+
+            let new_first = baton
+                .index
+                .latest_native(&first, Agent::Claude)
+                .unwrap()
+                .unwrap();
+            assert_ne!(new_first, old_first);
+            assert_eq!(
+                baton
+                    .index
+                    .latest_native(&second, Agent::Claude)
+                    .unwrap()
+                    .unwrap(),
+                continued
+            );
+            let natives = adapter.discover(None).unwrap();
+            assert!(!natives.iter().any(|native| native.id == old_first));
+            assert!(natives.iter().any(|native| native.id == continued));
+
+            let result = baton
+                .materialize(&adapter, &natives, None, &HashSet::new())
+                .unwrap();
+            assert_eq!(result.up_to_date, 2);
+            assert_eq!(result.exported, 0);
+            assert_eq!(result.refreshed, 0);
+            assert_eq!(result.removed, 0);
+        },
+    );
 }
 
 #[test]

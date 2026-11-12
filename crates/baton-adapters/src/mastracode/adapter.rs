@@ -126,8 +126,9 @@ impl Source for MastracodeAdapter {
             })
         })?;
         let mut drafts = Vec::new();
+        let mut model = None;
         for row in rows {
-            drafts.extend(parser::drafts(&row?, blobs)?);
+            drafts.extend(parser::drafts(&row?, blobs, &mut model)?);
         }
         Ok(NativeRead {
             info: Info {

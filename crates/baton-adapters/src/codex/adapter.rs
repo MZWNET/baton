@@ -180,8 +180,13 @@ impl Source for CodexAdapter {
         cursor: Option<&Cursor>,
         blobs: &Blobs,
     ) -> Result<NativeRead> {
+        let head = files::head(&session.path, 1)?;
+        let provider = head
+            .first()
+            .and_then(|record| json::string(&record["payload"]["model_provider"]));
+
         journal::read(&session.path, cursor, |leaf| {
-            RolloutParser::new(blobs, leaf)
+            RolloutParser::new(blobs, leaf, provider.clone())
         })
     }
 }

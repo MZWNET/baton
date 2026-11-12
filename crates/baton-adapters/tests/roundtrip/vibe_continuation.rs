@@ -57,11 +57,13 @@ fn export(adapter: &VibeAdapter, blobs: &Blobs, bodies: Vec<Body>) -> (NativeSes
     );
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: Some("exported"),
         cwd: Path::new("/work/demo"),
         created: CREATED,
         events: &replayed,
+        models: &models,
         seed: None,
     };
     let native = adapter.write(&export, blobs).unwrap();

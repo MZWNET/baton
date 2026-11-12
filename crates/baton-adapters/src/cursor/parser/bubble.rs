@@ -3,7 +3,7 @@
 use anyhow::Result;
 use baton_core::{Body, Draft, Thinking, ToolCall, ToolResult, portable_call_id};
 use rusqlite::{Connection, OptionalExtension};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::support::json;
 use crate::support::normalize::{self, Content};
@@ -20,6 +20,7 @@ pub(in crate::cursor) fn read(
 ) -> Result<Vec<Draft>> {
     let mut drafts = Vec::new();
     let mut clock = created.to_owned();
+    let mut model = None;
     let headers = data["fullConversationHeadersOnly"]
         .as_array()
         .map(Vec::as_slice)
@@ -45,7 +46,23 @@ pub(in crate::cursor) fn read(
         } else {
             &header["type"]
         };
-        for body in bodies(kind.as_i64(), &bubble, id) {
+        let kind = kind.as_i64();
+        let bodies = bodies(kind, &bubble, id);
+        if kind == Some(AI) && !bodies.is_empty()
+            // `default` is the model picker's choice, not a model
+            && let Some(next) = bubble["modelInfo"]["modelName"]
+                .as_str()
+                .filter(|name| !name.is_empty() && *name != "default")
+            && model.as_deref() != Some(next)
+        {
+            drafts.push(Draft {
+                timestamp: clock.clone(),
+                native_entry_id: Some(id.to_owned()),
+                body: Body::Meta(json!({"type": "model", "model": next})),
+            });
+            model = Some(next.to_owned());
+        }
+        for body in bodies {
             drafts.push(Draft {
                 timestamp: clock.clone(),
                 native_entry_id: Some(id.to_owned()),

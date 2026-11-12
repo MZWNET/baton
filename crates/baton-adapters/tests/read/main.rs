@@ -438,6 +438,127 @@ fn rollout(root: &Path, name: &str, records: &[Value]) -> PathBuf {
 }
 
 #[test]
+fn claude_reads_model_changes_without_placeholders() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let root = dir.path().join("claude");
+    let session = "21000000-0000-4000-8000-000000000002";
+    let assistant = |id: &str, parent: Option<&str>, model: &str, text: &str| json!({"type": "assistant", "uuid": id, "parentUuid": parent, "sessionId": session, "timestamp": "2026-01-06T10:00:00Z", "message": {"role": "assistant", "model": model, "content": [{"type": "text", "text": text}]}});
+    let records = [
+        assistant("a1", None, "A", "first"),
+        assistant("a2", Some("a1"), "A", "second"),
+        assistant("synthetic", Some("a2"), "<synthetic>", "ignored"),
+        assistant("placeholder", Some("synthetic"), "baton", "exported"),
+        assistant("empty", Some("placeholder"), "B", ""),
+        assistant("b", Some("empty"), "B", "third"),
+    ];
+    support::write(
+        &root.join(format!("projects/-workspace/{session}.jsonl")),
+        &support::jsonl(&records),
+    );
+    let read = read(&ClaudeAdapter::new(root), &blobs);
+    assert_eq!(
+        kinds(&read.drafts),
+        pairs(&[
+            ("meta", r#"{"model":"A","type":"model"}"#),
+            ("assistant", "first"),
+            ("assistant", "second"),
+            ("assistant", "exported"),
+            ("meta", r#"{"model":"B","type":"model"}"#),
+            ("assistant", "third"),
+        ])
+    );
+}
+
+#[test]
+fn codex_reads_model_changes_and_continues_with_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let root = dir.path().join("codex");
+    let id = "11111111-1111-4111-8111-111111111112";
+    let record = |kind: &str, payload: Value| json!({"timestamp": "2026-01-05T09:00:00Z", "type": kind, "payload": payload});
+    let context = |model: &str| record("turn_context", json!({"model": model}));
+    let user = |text: &str| {
+        record(
+            "event_msg",
+            json!({"type": "user_message", "message": text}),
+        )
+    };
+    let answer = |text: &str| {
+        record(
+            "response_item",
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}),
+        )
+    };
+    let first = vec![
+        record("session_meta", json!({"id": id, "model_provider": "p"})),
+        user("first"),
+        context("A"),
+        answer("one"),
+    ];
+    let path = rollout(
+        &root,
+        &format!("rollout-2026-01-05T09-00-00-{id}.jsonl"),
+        &first,
+    );
+    let adapter = CodexAdapter::new(root);
+    let session = support::only(&adapter, None);
+    let initial = adapter.read(&session, None, &blobs).unwrap();
+    assert_eq!(
+        kinds(&initial.drafts),
+        pairs(&[
+            ("user", "first"),
+            ("meta", r#"{"model":"A","provider":"p","type":"model"}"#),
+            ("assistant", "one")
+        ])
+    );
+    let cursor = Cursor {
+        path: path.clone(),
+        stamp: session.stamp,
+        progress: initial.progress,
+        event: None,
+        session: String::new(),
+    };
+    let mut records = first;
+    records.extend([
+        user("second"),
+        context("A"),
+        answer("two"),
+        user("third"),
+        context("B"),
+        answer("three"),
+    ]);
+    fs::write(&path, support::jsonl(&records)).unwrap();
+    let full = adapter.read(&session, None, &blobs).unwrap();
+    assert_eq!(
+        kinds(&full.drafts),
+        pairs(&[
+            ("user", "first"),
+            ("meta", r#"{"model":"A","provider":"p","type":"model"}"#),
+            ("assistant", "one"),
+            ("user", "second"),
+            ("assistant", "two"),
+            ("user", "third"),
+            ("meta", r#"{"model":"B","provider":"p","type":"model"}"#),
+            ("assistant", "three"),
+        ])
+    );
+    records.truncate(4);
+    records.extend([user("continued"), context("C"), answer("four")]);
+    fs::write(&path, support::jsonl(&records)).unwrap();
+    let continuation = adapter.read(&session, Some(&cursor), &blobs).unwrap();
+    assert!(continuation.continued);
+    assert_eq!(
+        kinds(&continuation.drafts),
+        pairs(&[
+            ("user", "continued"),
+            ("meta", r#"{"model":"C","provider":"p","type":"model"}"#),
+            ("assistant", "four")
+        ])
+    );
+}
+
+#[test]
 fn codex_legacy_rollouts_follow_rollbacks_and_index_titles() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = Blobs::new(dir.path().join("blobs"));
@@ -509,6 +630,7 @@ fn codex_legacy_rollouts_follow_rollbacks_and_index_titles() {
         json!({"message": "compacted summary"}),
     ));
     records.extend(user_turn(8, "Discarded request"));
+    records.push(record(8, "turn_context", json!({"model": "other"})));
     records.extend(answer(9, "Discarded answer"));
     records.push(record(
         10,
@@ -516,6 +638,7 @@ fn codex_legacy_rollouts_follow_rollbacks_and_index_titles() {
         json!({"type": "thread_rolled_back", "num_turns": 1}),
     ));
     records.extend(user_turn(11, "Replacement request"));
+    records.push(record(11, "turn_context", json!({"model": "other"})));
     records.extend(answer(12, "Replacement answer"));
     rollout(
         &root,
@@ -545,6 +668,7 @@ fn codex_legacy_rollouts_follow_rollbacks_and_index_titles() {
     assert_eq!(
         kinds(&read.drafts),
         pairs(&[
+            ("meta", r#"{"model":"gpt","type":"model"}"#),
             ("user", "First request"),
             ("thinking", ""),
             ("tool_call", r#"shell {"command":["ls"]}"#),
@@ -552,6 +676,7 @@ fn codex_legacy_rollouts_follow_rollbacks_and_index_titles() {
             ("assistant", "First answer"),
             ("compaction", "compacted summary"),
             ("user", "Replacement request"),
+            ("meta", r#"{"model":"other","type":"model"}"#),
             ("assistant", "Replacement answer"),
         ])
     );
@@ -601,7 +726,7 @@ fn rikkahub_reads_selected_branches_and_splits_tool_steps_as_the_app_does() {
         json!({
             "id": id, "role": role, "parts": parts, "annotations": [],
             "createdAt": "2026-01-01T08:00:00.123", "finishedAt": null,
-            "modelId": null, "modelSnapshot": null, "usage": null,
+            "modelId": "11111111-1111-4111-8111-111111111111", "modelSnapshot": if role == "assistant" { Some(json!({"modelId": if id.ends_with("008") || id.ends_with("009") { "claude-b" } else { "claude-a" }, "displayName": "Claude"})) } else { None }, "usage": null,
             "generationTimeMs": null, "lastUsage": null, "stepCount": null,
             "translation": null, "isContextCheckpoint": checkpoint
         })
@@ -687,6 +812,42 @@ fn rikkahub_reads_selected_branches_and_splits_tool_steps_as_the_app_does() {
                 false
             )]),
         ),
+        (
+            0,
+            json!([message(
+                "00000000-0000-4000-8000-000000000007",
+                "assistant",
+                json!([{"type": "text", "text": "same model"}]),
+                false
+            )]),
+        ),
+        (
+            0,
+            json!([message(
+                "00000000-0000-4000-8000-000000000008",
+                "assistant",
+                json!([]),
+                false
+            )]),
+        ),
+        (
+            0,
+            json!([message(
+                "00000000-0000-4000-8000-000000000010",
+                "assistant",
+                json!([{"type": "text", "text": "still same"}]),
+                false
+            )]),
+        ),
+        (
+            0,
+            json!([message(
+                "00000000-0000-4000-8000-000000000009",
+                "assistant",
+                json!([{"type": "text", "text": "new model"}]),
+                false
+            )]),
+        ),
     ];
     support::rikkahub_backup(
         &backup,
@@ -710,6 +871,7 @@ fn rikkahub_reads_selected_branches_and_splits_tool_steps_as_the_app_does() {
         kinds(&read.drafts),
         pairs(&[
             ("user", "Plan a trip"),
+            ("meta", r#"{"model":"claude-a","type":"model"}"#),
             ("thinking", "weighing options"),
             ("assistant", "Let me check"),
             ("tool_call", r#"search {"q":"flights"}"#),
@@ -723,6 +885,10 @@ fn rikkahub_reads_selected_branches_and_splits_tool_steps_as_the_app_does() {
             ("assistant", "Done"),
             ("compaction", "Trip summary"),
             ("user", "Thanks"),
+            ("assistant", "same model"),
+            ("assistant", "still same"),
+            ("meta", r#"{"model":"claude-b","type":"model"}"#),
+            ("assistant", "new model"),
         ])
     );
     assert_eq!(
@@ -749,10 +915,14 @@ fn hermes_reads_active_rows_across_a_rotated_compression() {
     connection
         .execute_batch(
             r#"
-INSERT INTO sessions (id, source, started_at, ended_at, end_reason, cwd, title) VALUES
-  ('20260101_090000_aaaaaa', 'cli', 1767258000.0, 1767258060.0, 'compression', '/workspace/hermes', 'Hermes fixture');
-INSERT INTO sessions (id, source, parent_session_id, started_at, cwd) VALUES
-  ('20260101_090100_bbbbbb', 'cli', '20260101_090000_aaaaaa', 1767258060.0, '/workspace/hermes');
+INSERT INTO sessions (id, source, started_at, ended_at, end_reason, cwd, title, model, model_config, billing_provider) VALUES
+  ('20260101_090000_aaaaaa', 'cli', 1767258000.0, 1767258060.0, 'compression', '/workspace/hermes', 'Hermes fixture', 'model-a', '{"provider":"route-a","gateway_runtime":{"provider":"ignored"}}', 'billing');
+INSERT INTO sessions (id, source, parent_session_id, started_at, end_reason, cwd, model, model_config, billing_provider) VALUES
+  ('20260101_090100_bbbbbb', 'cli', '20260101_090000_aaaaaa', 1767258060.0, 'compression', '/workspace/hermes', 'model-b', '{"gateway_runtime":{"provider":"route-b"}}', 'billing'),
+  ('20260101_090200_dddddd', 'cli', '20260101_090100_bbbbbb', 1767258120.0, 'compression', '/workspace/hermes', 'model-b', '{"provider":"route-b"}', NULL),
+  ('20260101_090300_eeeeee', 'cli', '20260101_090200_dddddd', 1767258180.0, 'compression', '/workspace/hermes', 'model-b', NULL, 'billing'),
+  ('20260101_090400_ffffff', 'cli', '20260101_090300_eeeeee', 1767258240.0, 'compression', '/workspace/hermes', 'empty-session-model', NULL, NULL),
+  ('20260101_090500_gggggg', 'cli', '20260101_090400_ffffff', 1767258300.0, NULL, '/workspace/hermes', 'model-b', NULL, NULL);
 INSERT INTO sessions (id, source, started_at) VALUES ('20260101_090200_cccccc', 'tool', 1767258120.0);
 INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, reasoning, timestamp, active, _compressed_summary) VALUES
   ('20260101_090000_aaaaaa', 'user', 'first question', NULL, NULL, NULL, 1767258001.0, 1, 0),
@@ -762,7 +932,10 @@ INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, reaso
   ('20260101_090000_aaaaaa', 'assistant', 'it failed', NULL, NULL, 'private', 1767258005.0, 1, 0),
   ('20260101_090100_bbbbbb', 'user', '[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below.' || char(10) || 'summary body' || char(10) || char(10) || '--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---' || char(10) || char(10) || 'live question', NULL, NULL, NULL, 1767258061.0, 1, 1),
   ('20260101_090100_bbbbbb', 'user', char(0) || 'json:[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,cGl4ZWxz"}}]', NULL, NULL, NULL, 1767258062.0, 1, 0),
-  ('20260101_090100_bbbbbb', 'assistant', 'final', NULL, NULL, NULL, 1767258063.0, 1, 0);
+  ('20260101_090100_bbbbbb', 'assistant', 'final', NULL, NULL, NULL, 1767258063.0, 1, 0),
+  ('20260101_090200_dddddd', 'user', 'same model', NULL, NULL, NULL, 1767258121.0, 1, 0),
+  ('20260101_090300_eeeeee', 'user', 'without provider', NULL, NULL, NULL, 1767258181.0, 1, 0),
+  ('20260101_090500_gggggg', 'user', 'after empty session', NULL, NULL, NULL, 1767258301.0, 1, 0);
 "#,
         )
         .unwrap();
@@ -778,25 +951,37 @@ INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, reaso
     assert_eq!(
         kinds(&read.drafts),
         pairs(&[
+            (
+                "meta",
+                r#"{"model":"model-a","provider":"route-a","type":"model"}"#
+            ),
             ("user", "first question"),
             ("tool_call", r#"terminal {"command":"ls"}"#),
             ("tool_result", envelope),
             ("thinking", "private"),
             ("assistant", "it failed"),
+            (
+                "meta",
+                r#"{"model":"model-b","provider":"route-b","type":"model"}"#
+            ),
             ("compaction", "summary body"),
             ("user", "live question"),
             ("user", "look"),
             ("assistant", "final"),
+            ("user", "same model"),
+            ("meta", r#"{"model":"model-b","type":"model"}"#),
+            ("user", "without provider"),
+            ("user", "after empty session"),
         ])
     );
-    let Body::ToolCall(call) = &read.drafts[1].body else {
+    let Body::ToolCall(call) = &read.drafts[2].body else {
         panic!("expected a tool call")
     };
     assert_eq!(
-        read.drafts[2].body,
+        read.drafts[3].body,
         support::result(&call.call_id, envelope, vec![], true)
     );
-    assert_eq!(read.drafts[7].body, support::user("look", vec![pixels()]));
+    assert_eq!(read.drafts[9].body, support::user("look", vec![pixels()]));
     assert_eq!(read.info.cwd.as_deref(), Some("/workspace/hermes"));
     assert_eq!(
         read.info.created.as_deref(),
@@ -828,10 +1013,11 @@ INSERT INTO mastra_threads VALUES
 INSERT INTO mastra_messages VALUES
   ('m1', 't1', '{"format":2,"metadata":{"signal":{"type":"user"}},"parts":[{"type":"text","text":"inspect this"},{"type":"file","data":"cGl4ZWxz","mimeType":"image/png"}]}', 'signal', 'user', '2026-01-01T09:00:01.000Z', 'work-1'),
   ('__temporal_gap', 't1', '{"format":2,"metadata":{"signal":{"type":"reactive"}},"parts":[{"type":"text","text":"time passed"}]}', 'signal', 'reactive', '2026-01-01T09:00:02.000Z', 'work-1'),
-  ('m2', 't1', '{"format":2,"parts":[{"type":"tool-invocation","toolInvocation":{"state":"result","toolCallId":"call_a","toolName":"execute_command","args":{"command":"ls"},"result":"raw output"},"providerMetadata":{"mastra":{"modelOutput":{"type":"text","value":"model saw this"}}}},{"type":"data-sandbox-exit","data":{"exitCode":0}},{"type":"step-start"},{"type":"reasoning","reasoning":"hmm","providerMetadata":{"anthropic":{"signature":"sig"}}},{"type":"text","text":"answer one"},{"type":"tool-invocation","toolInvocation":{"state":"output-error","toolCallId":"call_b","toolName":"view","args":{"path":"x"},"errorText":"File not found: x"}}]}', 'assistant', 'v2', '2026-01-01T09:00:03.000Z', 'work-1'),
+  ('m2', 't1', '{"format":2,"parts":[{"type":"step-start","model":"anthropic/a"},{"type":"tool-invocation","toolInvocation":{"state":"result","toolCallId":"call_a","toolName":"execute_command","args":{"command":"ls"},"result":"raw output"},"providerMetadata":{"mastra":{"modelOutput":{"type":"text","value":"model saw this"}}}},{"type":"data-sandbox-exit","data":{"exitCode":0}},{"type":"step-start","model":"anthropic/b"},{"type":"step-start","model":"anthropic/a"},{"type":"reasoning","reasoning":"hmm","providerMetadata":{"anthropic":{"signature":"sig"}}},{"type":"text","text":"answer one"},{"type":"tool-invocation","toolInvocation":{"state":"output-error","toolCallId":"call_b","toolName":"view","args":{"path":"x"},"errorText":"File not found: x"}},{"type":"step-start","model":"anthropic/b"},{"type":"text","text":"new step"}]}', 'assistant', 'v2', '2026-01-01T09:00:03.000Z', 'work-1'),
   ('om-continuation', 't1', '{"format":2,"parts":[{"type":"text","text":"continue"}]}', 'user', 'v2', '2026-01-01T09:00:04.000Z', 'work-1'),
   ('m3', 't1', '{"format":2,"metadata":{"signal":{"type":"notification"}},"parts":[{"type":"text","text":"build finished"}]}', 'signal', 'notification', '2026-01-01T09:00:05.000Z', 'work-1'),
   ('m4', 't1', '{"format":2,"parts":[{"type":"text","text":"second"}]}', 'user', 'v2', '2026-01-01T09:00:06.000Z', 'work-1'),
+  ('m6', 't1', '{"format":2,"parts":[{"type":"step-start","model":"anthropic/b"},{"type":"text","text":"same across rows"}]}', 'assistant', 'v2', '2026-01-01T09:00:07.000Z', 'work-1'),
   ('m5', 't2', '{"format":2,"parts":[{"type":"text","text":"subagent"}]}', 'user', 'v2', '2026-01-01T09:00:06.000Z', 'work-1');
 "#,
         )
@@ -842,13 +1028,17 @@ INSERT INTO mastra_messages VALUES
         kinds(&read.drafts),
         pairs(&[
             ("user", "inspect this"),
+            ("meta", r#"{"model":"anthropic/a","type":"model"}"#),
             ("tool_call", r#"execute_command {"command":"ls"}"#),
             ("tool_result", "model saw this"),
             ("thinking", "hmm"),
             ("assistant", "answer one"),
             ("tool_call", r#"view {"path":"x"}"#),
             ("tool_result", "File not found: x"),
+            ("meta", r#"{"model":"anthropic/b","type":"model"}"#),
+            ("assistant", "new step"),
             ("user", "second"),
+            ("assistant", "same across rows"),
         ])
     );
     assert_eq!(
@@ -856,7 +1046,7 @@ INSERT INTO mastra_messages VALUES
         support::user("inspect this", vec![pixels()])
     );
     assert_eq!(
-        read.drafts[6].body,
+        read.drafts[7].body,
         support::result("call_b", "File not found: x", vec![], true)
     );
     assert_eq!(read.info.title.as_deref(), Some("Mastra fixture"));
@@ -873,18 +1063,22 @@ fn devin_reads_the_main_chain_without_injected_context() {
         .execute_batch(
             r#"
 INSERT INTO sessions (id, working_directory, backend_type, model, agent_mode, created_at, last_activity_at, title, main_chain_id, hidden) VALUES
-  ('brisk-otter', '/workspace/devin', 'windsurf', 'swe-1-6-slow', 'normal', 1767258000, 1767258100, 'Devin fixture', 6, 0),
+  ('brisk-otter', '/workspace/devin', 'windsurf', 'swe-1-6-slow', 'normal', 1767258000, 1767258100, 'Devin fixture', 11, 0),
   ('summarizer', '/workspace/devin', 'windsurf', 'swe-1-6-slow', 'normal', 1767258000, 1767258100, NULL, 0, 1),
   ('fresh', '/workspace/devin', 'windsurf', 'swe-1-6-slow', 'normal', 1767258000, 1767258100, NULL, NULL, 0);
 INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, created_at) VALUES
   ('brisk-otter', 0, NULL, '{"message_id":"m0","role":"system","content":"system prompt"}', 1767258000),
   ('brisk-otter', 1, 0, '{"message_id":"m1","role":"user","content":"look","images":[{"width":1,"height":1,"base64_data":"cGl4ZWxz","mime_type":"image/png"}],"metadata":{"is_user_input":true,"created_at":"2026-01-01T09:00:01.123456789Z"}}', 1767258001),
-  ('brisk-otter', 2, 1, '{"message_id":"m2","role":"assistant","content":"reading","thinking":{"thinking":"hmm","signature":"sig"},"tool_calls":[{"id":"call_a","name":"read","arguments":{"file_path":"a"},"index":0,"kind":"function"},{"id":"call_b","name":"read","arguments":{"file_path":"b"},"index":1,"kind":"function"}],"metadata":{}}', 1767258002),
+  ('brisk-otter', 2, 1, '{"message_id":"m2","role":"assistant","content":"reading","thinking":{"thinking":"hmm","signature":"sig"},"tool_calls":[{"id":"call_a","name":"read","arguments":{"file_path":"a"},"index":0,"kind":"function"},{"id":"call_b","name":"read","arguments":{"file_path":"b"},"index":1,"kind":"function"}],"metadata":{"generation_model":"provider/model-a"}}', 1767258002),
   ('brisk-otter', 3, 2, '{"message_id":"m3","role":"tool","content":"a body","tool_call_id":"call_a","metadata":{}}', 1767258003),
   ('brisk-otter', 4, 3, '{"message_id":"m4","role":"tool","content":"Failed to read file","tool_call_id":"call_b","metadata":{"extensions":{"chisel/tool_result_meta":{"success":false}}}}', 1767258004),
   ('brisk-otter', 5, 4, '{"message_id":"m5","role":"user","content":"workspace context","metadata":{"is_user_input":null}}', 1767258005),
-  ('brisk-otter', 6, 5, '{"message_id":"m6","role":"assistant","content":"done","tool_calls":[],"metadata":{}}', 1767258006),
-  ('brisk-otter', 7, 1, '{"message_id":"m7","role":"assistant","content":"abandoned retry","metadata":{}}', 1767258007);
+  ('brisk-otter', 6, 5, '{"message_id":"m6","role":"assistant","content":"done","tool_calls":[],"metadata":{"generation_model":"provider/model-a"}}', 1767258006),
+  ('brisk-otter', 7, 1, '{"message_id":"m7","role":"assistant","content":"abandoned retry","metadata":{}}', 1767258007),
+  ('brisk-otter', 8, 6, '{"message_id":"m8","role":"assistant","content":"","metadata":{"generation_model":"model-b"}}', 1767258008),
+  ('brisk-otter', 9, 8, '{"message_id":"m9","role":"assistant","content":"same model","metadata":{"generation_model":"provider/model-a"}}', 1767258009),
+  ('brisk-otter', 10, 9, '{"message_id":"m10","role":"assistant","content":"switched","metadata":{"generation_model":"model-b"}}', 1767258010),
+  ('brisk-otter', 11, 10, '{"message_id":"m11","role":"assistant","content":"unnamed","metadata":{"generation_model":""}}', 1767258011);
 "#,
         )
         .unwrap();
@@ -896,6 +1090,7 @@ INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, cr
         kinds(&read.drafts),
         pairs(&[
             ("user", "look"),
+            ("meta", r#"{"model":"provider/model-a","type":"model"}"#),
             ("thinking", "hmm"),
             ("assistant", "reading"),
             ("tool_call", r#"read {"file_path":"a"}"#),
@@ -903,12 +1098,16 @@ INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message, cr
             ("tool_result", "a body"),
             ("tool_result", "Failed to read file"),
             ("assistant", "done"),
+            ("assistant", "same model"),
+            ("meta", r#"{"model":"model-b","type":"model"}"#),
+            ("assistant", "switched"),
+            ("assistant", "unnamed"),
         ])
     );
     assert_eq!(read.drafts[0].body, support::user("look", vec![pixels()]));
     assert_eq!(read.drafts[0].timestamp, "2026-01-01T09:00:01.123Z");
     assert_eq!(
-        read.drafts[6].body,
+        read.drafts[7].body,
         support::result("call_b", "Failed to read file", vec![], true)
     );
     assert_eq!(read.info.cwd.as_deref(), Some("/workspace/devin"));
@@ -1210,7 +1409,7 @@ fn openhands_reads_events_in_index_order_up_to_the_first_gap() {
         );
     }
     support::write(&conversation.join("events/event-00010-late.json"), &json!({"kind": "MessageEvent", "source": "user", "llm_message": {"role": "user", "content": [text("after a gap")]}}).to_string());
-    support::write(&conversation.join("base_state.json"), &json!({"id": "99e61c51-f6e9-45cc-93b0-22fee3a459f4", "workspace": {"working_dir": "/workspace/openhands"}}).to_string());
+    support::write(&conversation.join("base_state.json"), &json!({"id": "99e61c51-f6e9-45cc-93b0-22fee3a459f4", "workspace": {"working_dir": "/workspace/openhands"}, "agent": {"llm": {"model": "anthropic/claude-sonnet-4-5"}}}).to_string());
     support::write(
         &conversations.join("not-a-conversation/events/event-00000-x.json"),
         "{}",
@@ -1222,6 +1421,10 @@ fn openhands_reads_events_in_index_order_up_to_the_first_gap() {
     assert_eq!(
         kinds(&read.drafts),
         pairs(&[
+            (
+                "meta",
+                r#"{"model":"anthropic/claude-sonnet-4-5","type":"model"}"#
+            ),
             ("user", "look"),
             ("thinking", "hmm"),
             ("assistant", "reading both"),
@@ -1233,9 +1436,9 @@ fn openhands_reads_events_in_index_order_up_to_the_first_gap() {
             ("compaction", "read two files"),
         ])
     );
-    assert_eq!(read.drafts[0].body, support::user("look", vec![pixels()]));
+    assert_eq!(read.drafts[1].body, support::user("look", vec![pixels()]));
     assert_eq!(
-        read.drafts[6].body,
+        read.drafts[7].body,
         support::result("call_b", "bad arguments", vec![], true)
     );
     assert_eq!(read.info.cwd.as_deref(), Some("/workspace/openhands"));
@@ -1264,12 +1467,10 @@ fn vibe_reads_messages_from_the_last_compaction_boundary_on_as_vibe_replays_them
                "name": "bash", "tool_call_id": "call_b", "tool_result": {"output": null, "cancelled": true}}),
     ];
     support::write(&session.join("messages.jsonl"), &support::jsonl(&messages));
-    support::write(
-        &session.join("meta.json"),
-        &json!({"session_id": "76f1b367-a336-6b84-96cb-66ccf903b3d5", "start_time": "2026-01-01T09:00:00.734402+00:00", "end_time": null,
+    let mut meta = json!({"session_id": "76f1b367-a336-6b84-96cb-66ccf903b3d5", "start_time": "2026-01-01T09:00:00.734402+00:00", "end_time": null,
                 "environment": {"working_directory": "/workspace/vibe"}, "username": "me", "title": "Vibe fixture", "title_source": "manual",
-                "total_messages": 9}).to_string(),
-    );
+                "config": {"model_name": "mistral-large", "active_model": "large"}, "total_messages": 9});
+    support::write(&session.join("meta.json"), &meta.to_string());
     let adapter = VibeAdapter::new(dir.path().join("vibe"));
     let native = support::only(&adapter, None);
     assert_eq!(native.title.as_deref(), Some("Vibe fixture"));
@@ -1277,6 +1478,7 @@ fn vibe_reads_messages_from_the_last_compaction_boundary_on_as_vibe_replays_them
     assert_eq!(
         kinds(&read.drafts),
         pairs(&[
+            ("meta", r#"{"model":"mistral-large","type":"model"}"#),
             ("user", "inspect @card.png"),
             ("tool_call", r#"read_file {"file_path":"a.txt"}"#),
             ("tool_result", "read_file: missing"),
@@ -1295,17 +1497,104 @@ fn vibe_reads_messages_from_the_last_compaction_boundary_on_as_vibe_replays_them
         ])
     );
     assert_eq!(
-        read.drafts[0].body,
+        read.drafts[1].body,
         support::user("inspect @card.png", vec![pixels()])
     );
     assert_eq!(
-        read.drafts[2].body,
+        read.drafts[3].body,
         support::result("call_a", "read_file: missing", vec![], true)
     );
     assert_eq!(read.info.cwd.as_deref(), Some("/workspace/vibe"));
     assert_eq!(
         read.info.created.as_deref(),
         Some("2026-01-01T09:00:00.734Z")
+    );
+    let cursor = Cursor {
+        path: native.path.clone(),
+        stamp: native.stamp,
+        progress: read.progress,
+        event: None,
+        session: String::new(),
+    };
+    let mut appended = messages.to_vec();
+    appended.push(json!({"role": "assistant", "content": "continued"}));
+    support::write(&session.join("messages.jsonl"), &support::jsonl(&appended));
+    let continued = adapter.read(&native, Some(&cursor), &blobs).unwrap();
+    assert!(continued.continued);
+    assert_eq!(
+        kinds(&continued.drafts),
+        pairs(&[("assistant", "continued")])
+    );
+
+    meta["config"]["model_name"] = json!("");
+    support::write(&session.join("meta.json"), &meta.to_string());
+    let fallback = adapter.read(&native, None, &blobs).unwrap();
+    assert_eq!(
+        fallback.drafts[0].body,
+        Body::Meta(json!({"type": "model", "model": "large"}))
+    );
+    support::write(&session.join("messages.jsonl"), "");
+    assert!(
+        adapter
+            .read(&native, None, &blobs)
+            .unwrap()
+            .drafts
+            .is_empty()
+    );
+}
+
+#[test]
+fn vibe_reads_unified_session_model_from_metadata() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let sessions = dir.path().join("vibe");
+    let session = sessions.join("unified/session-id");
+    let generation = session.join("generations/1");
+    let store = |path: &Path, value: Value| {
+        let body = value.to_string();
+        support::write(path, &format!("{body}\n"));
+        base16ct::lower::encode_string(&Sha256::digest(body.as_bytes()))
+    };
+    let checkpoint = store(
+        &generation.join("checkpoint.json"),
+        json!({"context": {"messages": [
+            {"source": "user", "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}}
+        ]}}),
+    );
+    let runtime = store(
+        &generation.join("runtime.json"),
+        json!({"identity": {"kind": "root"}}),
+    );
+    let projection = store(
+        &generation.join("projection.json"),
+        json!({"snapshot": {"session": {"id": "session-id"}}}),
+    );
+    support::write(&session.join("journal/1.jsonl"), "");
+    let manifest = store(
+        &generation.join("manifest.json"),
+        json!({"created_at": "2026-01-01T00:00:00Z",
+        "checkpoint": {"path": "checkpoint.json", "sha256": checkpoint}, "runtime_state": {"path": "runtime.json", "sha256": runtime},
+        "projection_state": {"path": "projection.json", "sha256": projection}, "recovery_journal_segment": {"path": "journal/1.jsonl"}}),
+    );
+    store(
+        &session.join("CURRENT"),
+        json!({"store_format": "mistral.vibe.unified-session-store/v1", "generation": "1", "manifest_sha256": manifest}),
+    );
+    support::write(
+        &session.join("meta.json"),
+        &json!({"config": {"model_name": "mistral-medium", "active_model": "medium"}}).to_string(),
+    );
+    let adapter = VibeAdapter::new(sessions);
+    let native = support::only(&adapter, None);
+    let read = adapter.read(&native, None, &blobs).unwrap();
+    assert_eq!(
+        kinds(&read.drafts),
+        pairs(&[
+            ("meta", r#"{"model":"mistral-medium","type":"model"}"#),
+            ("user", "hello"),
+        ])
     );
 }
 
@@ -1594,6 +1883,9 @@ fn kimi_reads_typed_turns_and_loop_events_and_follows_undo() {
             "runtime.set_binding",
             json!({"workspaceId": "wd_kimi_0123456789ab"}),
         ),
+        record("profile.bind", json!({"modelAlias": "moonshot-v1"})),
+        record("config.update", json!({"modelAlias": "moonshot-v1"})),
+        record("config.update", json!({"thinkingEffort": "high"})),
         record(
             "context.append_message",
             user(
@@ -1642,11 +1934,14 @@ fn kimi_reads_typed_turns_and_loop_events_and_follows_undo() {
             "context.append_message",
             user(json!([text("abandoned")]), json!({"kind": "user"})),
         ),
+        record("config.update", json!({"modelAlias": "moonshot-v2"})),
         record(
             "context.append_message",
             json!({"message": {"role": "assistant", "content": [text("abandoned answer")], "toolCalls": []}}),
         ),
         record("context.undo", json!({"count": 1})),
+        record("config.update", json!({"modelAlias": "moonshot-v2"})),
+        record("config.update", json!({"modelAlias": "moonshot-v2"})),
         record(
             "context.apply_compaction",
             json!({"summary": "read a", "compactedCount": 5, "keptUserMessageCount": 1}),
@@ -1695,23 +1990,25 @@ fn kimi_reads_typed_turns_and_loop_events_and_follows_undo() {
     assert_eq!(
         kinds(&read.drafts),
         pairs(&[
+            ("meta", r#"{"model":"moonshot-v1","type":"model"}"#),
             ("user", "look"),
             ("thinking", "hmm"),
             ("assistant", "reading"),
             ("tool_call", r#"Read {"path":"a"}"#),
             ("tool_result", "a body\n<system>1 line read</system>"),
+            ("meta", r#"{"model":"moonshot-v2","type":"model"}"#),
             ("compaction", "read a"),
             ("user", "next"),
             ("tool_call", r#"Bash {"command":"false"}"#),
             ("tool_result", "exit 1"),
         ])
     );
-    assert_eq!(read.drafts[0].body, support::user("look", vec![pixels()]));
-    let Body::ToolCall(call) = &read.drafts[3].body else {
+    assert_eq!(read.drafts[1].body, support::user("look", vec![pixels()]));
+    let Body::ToolCall(call) = &read.drafts[4].body else {
         panic!("expected a tool call")
     };
     assert_eq!(
-        read.drafts[4].body,
+        read.drafts[5].body,
         support::result(
             &call.call_id,
             "a body\n<system>1 line read</system>",
@@ -1720,7 +2017,7 @@ fn kimi_reads_typed_turns_and_loop_events_and_follows_undo() {
         )
     );
     assert_eq!(
-        read.drafts[8].body,
+        read.drafts[10].body,
         support::result("call_2", "exit 1", vec![], true)
     );
     assert_eq!(read.info.cwd.as_deref(), Some("/workspace/kimi"));

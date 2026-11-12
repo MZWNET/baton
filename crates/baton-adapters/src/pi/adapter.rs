@@ -127,6 +127,10 @@ impl Source for PiAdapter {
 }
 
 impl Adapter for PiAdapter {
+    fn writer_version(&self) -> u32 {
+        1
+    }
+
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         let created = export.created;
         let cwd = export.cwd.to_string_lossy();
@@ -142,7 +146,7 @@ impl Adapter for PiAdapter {
             .join(self.bucket(&cwd))
             .join(file);
         let blob_dir = self.is_omp().then(|| self.root.join("blobs"));
-        let mut writer = JournalWriter::new(blobs, blob_dir);
+        let mut writer = JournalWriter::new(blobs, blob_dir, export.models, self.is_omp());
         if self.is_omp() {
             let title = export.title.unwrap_or_default();
             writer.push_raw(&title_slot(title, created));

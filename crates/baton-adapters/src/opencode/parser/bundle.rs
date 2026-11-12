@@ -3,10 +3,11 @@ use baton_core::{
     Blobs, Body, Compaction, Draft, Image, Info, NativeRead, Progress, Thinking, ToolCall,
     ToolResult, time,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::opencode::tool_order;
 use crate::opencode::writer::bundle::UNNAMED;
+use crate::support::model::LEGACY_PLACEHOLDER;
 use crate::support::normalize::{self, Content};
 use crate::support::{images, json};
 
@@ -19,6 +20,7 @@ pub(in crate::opencode) fn parse(bundle: &Value, blobs: &Blobs) -> Result<Native
     let fallback = created.clone().unwrap_or_else(time::now);
     let mut drafts = Vec::new();
     let mut compacting = false;
+    let mut model: Option<(String, String)> = None;
     let messages = bundle["messages"]
         .as_array()
         .map(Vec::as_slice)
@@ -60,6 +62,7 @@ pub(in crate::opencode) fn parse(bundle: &Value, blobs: &Blobs) -> Result<Native
                 }
             }
             "assistant" => {
+                let start = drafts.len();
                 let mut results = Vec::new();
                 for part in parts {
                     match part["type"].as_str().unwrap_or_default() {
@@ -91,6 +94,28 @@ pub(in crate::opencode) fn parse(bundle: &Value, blobs: &Blobs) -> Result<Native
                     }
                 }
                 drafts.append(&mut results);
+                if drafts.len() > start
+                    && head["summary"] != true
+                    && let (Some(provider), Some(id)) =
+                        (head["providerID"].as_str(), head["modelID"].as_str())
+                    && !provider.is_empty()
+                    && provider != LEGACY_PLACEHOLDER
+                    && !id.is_empty()
+                    && model
+                        .as_ref()
+                        .is_none_or(|(previous_provider, previous_id)| {
+                            previous_provider != provider || previous_id != id
+                        })
+                {
+                    drafts.insert(
+                        start,
+                        draft(
+                            Body::Meta(json!({"type": "model", "provider": provider, "model": id})),
+                            &head["id"],
+                        ),
+                    );
+                    model = Some((provider.to_owned(), id.to_owned()));
+                }
             }
             _ => {}
         }

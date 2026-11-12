@@ -337,6 +337,7 @@ impl Baton {
     ) -> Result<PendingMaterialization<'a>> {
         let mut pending = PendingMaterialization::default();
         let agent = adapter.agent();
+        let writer_version = adapter.writer_version();
         let id = &indexed.id;
         if !indexed.replayable {
             pending.result.skipped += 1;
@@ -351,15 +352,18 @@ impl Baton {
         let mut up_to_date = false;
         let mut obsolete = Vec::new();
         for (link, native) in linked {
-            let current = self
-                .cursors
-                .get(agent, &link.native_id)?
-                .is_some_and(|cursor| {
-                    cursor.session == *id
-                        && cursor.path == native.path
-                        && cursor.stamp == native.stamp
-                        && cursor.event == indexed.leaf
-                });
+            // An untouched export of an older writer is written again, like one of an older leaf
+            let outdated = link.removable && link.writer_version < writer_version;
+            let current = !outdated
+                && self
+                    .cursors
+                    .get(agent, &link.native_id)?
+                    .is_some_and(|cursor| {
+                        cursor.session == *id
+                            && cursor.path == native.path
+                            && cursor.stamp == native.stamp
+                            && cursor.event == indexed.leaf
+                    });
             up_to_date |= current;
             if !current && link.removable && !protected.contains(&native.id) {
                 obsolete.push((link, native));
@@ -376,14 +380,12 @@ impl Baton {
         if !up_to_date {
             let path = session.path();
             let leaf = path.last().map(|event| event.id.as_str());
-            let events = replay::events(&path);
-            let seed = session_id::exported(id, self.store.host(), agent, leaf);
+            let seed = session_id::exported(id, self.store.host(), agent, leaf, writer_version);
             pending.export = Some(self.prepare_export(
                 &session,
                 adapter,
                 materialization_cwd(&session)?,
-                &events,
-                leaf,
+                &path,
                 Some(seed),
             )?);
             if had_native {
@@ -630,15 +632,7 @@ impl Baton {
             },
         };
         let path = session.path();
-        let events = replay::events(&path);
-        let pending = self.prepare_export(
-            &session,
-            adapter,
-            cwd,
-            &events,
-            path.last().map(|event| event.id.as_str()),
-            None,
-        )?;
+        let pending = self.prepare_export(&session, adapter, cwd, &path, None)?;
         let agent = adapter.agent();
         adapter.flush().with_context(|| {
             format!(
@@ -656,18 +650,20 @@ impl Baton {
         session: &Session,
         adapter: &(impl Adapter + ?Sized),
         cwd: PathBuf,
-        events: &[&Event],
-        leaf: Option<&str>,
+        path: &[&Event],
         seed: Option<Uuid>,
     ) -> Result<PendingExport> {
+        let events = replay::events(path);
         if events.is_empty() {
             bail!("session {} has nothing to replay", session.meta.id);
         }
+        let models = replay::Models::new(path);
         let export = Export {
             title: session.meta.title.as_deref(),
             cwd: &cwd,
             created: &session.meta.created,
-            events,
+            events: &events,
+            models: &models,
             seed,
         };
         let blobs = self.store.blobs();
@@ -686,6 +682,7 @@ impl Baton {
             }
         };
         let exported_digest = replay::digest(read.drafts.iter().map(|draft| &draft.body));
+        let leaf = path.last().map(|event| event.id.as_str());
         let link = Link {
             host: self.store.host().to_owned(),
             agent,
@@ -695,6 +692,7 @@ impl Baton {
             exported_events: events.len(),
             exported_leaf: leaf.map(str::to_owned),
             exported_digest: Some(exported_digest),
+            writer_version: adapter.writer_version(),
             continued: false,
             removed: false,
             direction: Direction::Export,
@@ -850,6 +848,7 @@ impl Baton {
                 exported_events: replay::events(&path).len(),
                 exported_leaf: None,
                 exported_digest: None,
+                writer_version: 0,
                 continued: direction == Direction::Export,
                 removed: false,
                 direction,

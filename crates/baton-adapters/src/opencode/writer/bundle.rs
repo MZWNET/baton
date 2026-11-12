@@ -1,10 +1,12 @@
 use anyhow::Result;
+use baton_core::replay::Models;
 use baton_core::{Blobs, Body, Event, Export, Image, ToolResult, time};
 use serde_json::{Value, json};
 
 use crate::opencode::ascending_ids::AscendingIds;
 use crate::opencode::tool_order::{self, Placement, ToolOrder};
 use crate::support::images;
+use crate::support::model::provider_and_id;
 use crate::support::unit::{self, Unit};
 
 // OpenCode's placeholder title, which it replaces with a generated one after the next message
@@ -20,6 +22,7 @@ pub(in crate::opencode) fn write(
     let cwd = export.cwd.to_string_lossy().into_owned();
     let mut writer = BundleWriter {
         blobs,
+        models: export.models,
         session: session_id,
         cwd: &cwd,
         ids: AscendingIds::default(),
@@ -60,6 +63,7 @@ enum Reply {
 
 struct BundleWriter<'a> {
     blobs: &'a Blobs,
+    models: &'a Models<'a>,
     session: &'a str,
     cwd: &'a str,
     ids: AscendingIds,
@@ -88,7 +92,7 @@ impl<'a> BundleWriter<'a> {
                         let file = self.file(image)?;
                         parts.push(self.part(&id, millis, file));
                     }
-                    self.push_user(&id, millis, parts);
+                    self.push_user(&id, millis, parts, event);
                 }
                 Unit::Assistant(events) => {
                     let millis = time::unix_millis(&events[0].timestamp);
@@ -109,7 +113,7 @@ impl<'a> BundleWriter<'a> {
                         parts.push(self.part(&id, millis, fields));
                     }
                     let parent = self.last_user.clone().unwrap_or_else(|| id.clone());
-                    self.push_assistant(&id, &parent, millis, parts, Reply::Turn);
+                    self.push_assistant(&id, &parent, millis, parts, Reply::Turn, events[0]);
                     self.calls.assistant(&events);
                 }
                 Unit::ToolResult(event, result) => self.store_result(event, result)?,
@@ -122,7 +126,7 @@ impl<'a> BundleWriter<'a> {
                         millis,
                         json!({"type": "compaction", "auto": true}),
                     );
-                    self.push_user(&request, millis, vec![marker]);
+                    self.push_user(&request, millis, vec![marker], event);
                     let id = self.ids.next("msg", millis);
                     let text = self.part(&id, millis, json!({"type": "text", "text": summary}));
                     self.push_assistant(
@@ -131,6 +135,7 @@ impl<'a> BundleWriter<'a> {
                         millis,
                         vec![text],
                         Reply::CompactionSummary,
+                        event,
                     );
                 }
             }
@@ -155,7 +160,7 @@ impl<'a> BundleWriter<'a> {
                 );
                 let parent = self.last_user.clone().unwrap_or_else(|| id.clone());
                 let message = self.messages.len();
-                self.push_assistant(&id, &parent, millis, vec![part], Reply::Turn);
+                self.push_assistant(&id, &parent, millis, vec![part], Reply::Turn, event);
                 self.settle_result(message, 0, event, result, Some(synthetic.marker))
             }
         }
@@ -222,9 +227,10 @@ impl<'a> BundleWriter<'a> {
         }))
     }
 
-    fn push_user(&mut self, id: &str, millis: i64, parts: Vec<Value>) {
+    fn push_user(&mut self, id: &str, millis: i64, parts: Vec<Value>, event: &Event) {
+        let (provider, model) = provider_and_id(self.models.at(event));
         let info = json!({"id": id, "sessionID": self.session, "role": "user", "time": {"created": millis},
-                          "agent": "build", "model": {"providerID": "baton", "modelID": "baton"}});
+                          "agent": "build", "model": {"providerID": provider, "modelID": model}});
         self.messages.push(json!({"info": info, "parts": parts}));
         self.last_user = Some(id.to_owned());
     }
@@ -236,7 +242,9 @@ impl<'a> BundleWriter<'a> {
         millis: i64,
         parts: Vec<Value>,
         reply: Reply,
+        event: &Event,
     ) {
+        let (provider, model) = provider_and_id(self.models.at(event));
         let finish = if parts.iter().any(|part| part["type"] == "tool") {
             "tool-calls"
         } else {
@@ -244,7 +252,7 @@ impl<'a> BundleWriter<'a> {
         };
         let mut info = json!({
             "id": id, "sessionID": self.session, "role": "assistant", "time": {"created": millis, "completed": millis},
-            "parentID": parent, "modelID": "baton", "providerID": "baton", "mode": "build", "agent": "build",
+            "parentID": parent, "modelID": model, "providerID": provider, "mode": "build", "agent": "build",
             "path": {"cwd": self.cwd, "root": self.cwd}, "cost": 0,
             "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
             "finish": finish,

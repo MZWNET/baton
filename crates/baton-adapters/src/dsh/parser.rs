@@ -9,11 +9,11 @@ use baton_core::{
 };
 use serde_json::{Value, json};
 
+use crate::support::model::LEGACY_PLACEHOLDER;
 use crate::support::normalize::{self, Content};
 use crate::support::{images, json};
 
 pub(super) const SYNTHETIC_PREFIX: &str = "baton-synthetic-";
-pub(super) const BATON_PROVIDER: &str = "baton";
 
 pub(super) struct EventParser<'a> {
     blobs: &'a Blobs,
@@ -78,7 +78,7 @@ impl<'a> EventParser<'a> {
             return Ok(Vec::new());
         }
         let mut bodies = Vec::new();
-        if message["source"]["provider"] != BATON_PROVIDER
+        if message["source"]["provider"] != LEGACY_PLACEHOLDER
             && let Some(model) = json::string(&message["source"]["model"])
             && self.model.as_ref() != Some(&model)
         {

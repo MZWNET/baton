@@ -6,6 +6,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
+use crate::replay::Models;
 use crate::{Agent, Blobs, Draft, Event};
 
 /// The size and modification time of a native session, compared between imports to skip sessions that did not change.
@@ -104,6 +105,8 @@ pub struct Export<'a> {
     pub created: &'a str,
     /// The events to write, as selected by [`replay::events`](crate::replay::events).
     pub events: &'a [&'a Event],
+    /// The model in force at each exported event
+    pub models: &'a Models<'a>,
     /// Fixes the native session id, so writing the same events again on this host gives the same session; `None` chooses a fresh id.
     pub seed: Option<Uuid>,
 }
@@ -133,6 +136,11 @@ pub trait Source: Send + Sync {
 ///
 /// A full read immediately after `write`, before `flush`, must give back the written conversation as compared by [`replay::digest`](crate::replay::digest) over the replayable events after the last reset
 pub trait Adapter: Source {
+    /// The version of what [`Adapter::write`] writes, raised when native sessions written earlier should be written again: materializing replaces untouched exports of older versions
+    fn writer_version(&self) -> u32 {
+        0
+    }
+
     /// Writes the events as a new native session without overwriting anything; images are read from `blobs`. An error must not leave a partial session
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession>;
 

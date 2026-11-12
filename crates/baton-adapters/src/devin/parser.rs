@@ -1,6 +1,6 @@
 use anyhow::Result;
 use baton_core::{Blobs, Body, Compaction, Draft, Image, Thinking, ToolCall, ToolResult, time};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::support::normalize::{self, Content};
 use crate::support::{images, json};
@@ -18,14 +18,14 @@ pub(super) struct Node {
     pub(super) summarized: bool,
 }
 
-pub(super) fn drafts(node: &Node, blobs: &Blobs) -> Result<Vec<Draft>> {
+pub(super) fn drafts(node: &Node, blobs: &Blobs, model: &mut Option<String>) -> Result<Vec<Draft>> {
     let Ok(message @ Value::Object(_)) = serde_json::from_str::<Value>(&node.chat_message) else {
         return Ok(Vec::new());
     };
     let metadata = &message["metadata"];
     let content = content(&message, blobs)?;
     let role = message["role"].as_str().unwrap_or_default();
-    let bodies = match (role, summary(node, &message)) {
+    let mut bodies = match (role, summary(node, &message)) {
         (_, Some(summary)) => vec![Body::Compaction(Compaction {
             summary: summary.to_owned(),
         })],
@@ -70,6 +70,16 @@ pub(super) fn drafts(node: &Node, blobs: &Blobs) -> Result<Vec<Draft>> {
         }
         _ => Vec::new(),
     };
+    if role == "assistant"
+        && !bodies.is_empty()
+        && let Some(next) = metadata["generation_model"]
+            .as_str()
+            .filter(|next| !next.is_empty())
+        && model.as_deref() != Some(next)
+    {
+        bodies.insert(0, Body::Meta(json!({"type": "model", "model": next})));
+        *model = Some(next.to_owned());
+    }
     let timestamp = metadata["created_at"]
         .as_str()
         .and_then(time::normalize)

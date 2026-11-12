@@ -219,6 +219,7 @@ impl Paseo {
             direction,
             exported_digest: None,
             exported_leaf: None,
+            writer_version: 0,
             continued: false,
             removed: false,
         }

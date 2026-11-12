@@ -10,6 +10,7 @@ use crate::support::{images, json};
 const CLI_VERSION: &str = "0.144.4";
 
 // Builds a legacy rollout, which Codex replays from its response items and shows from its event messages
+// No turn_context and so no model: on resume Codex would restore the policies it records and stop injecting its developer instructions
 pub(super) struct RolloutWriter<'a> {
     blobs: &'a Blobs,
     out: String,

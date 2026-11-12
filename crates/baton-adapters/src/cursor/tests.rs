@@ -209,11 +209,13 @@ fn write(adapter: &CursorAdapter, blobs: &Blobs, bodies: Vec<Body>) -> NativeSes
     let events = Event::chain(drafts, None, Agent::Pi, "source");
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: Some("Imported"),
         cwd: Path::new("/workspace/cli"),
         created: "2026-01-01T00:00:00.000Z",
         events: &replayed,
+        models: &models,
         seed: None,
     };
     adapter.write(&export, blobs).unwrap()
@@ -403,18 +405,28 @@ fn ide_reads_older_chats_from_their_bubbles() {
         (
             "a1",
             2,
-            json!({"type": 2, "text": "answer", "thinking": {"text": "pondering", "signature": "sig"}}),
+            json!({"type": 2, "text": "answer", "modelInfo": {"modelName": "claude-sonnet"}, "thinking": {"text": "pondering", "signature": "sig"}}),
+        ),
+        (
+            "empty",
+            2,
+            json!({"type": 2, "modelInfo": {"modelName": "unused"}}),
         ),
         (
             "t1",
             2,
-            json!({"type": 2, "text": "", "createdAt": "2026-01-02T00:00:05Z",
+            json!({"type": 2, "text": "", "createdAt": "2026-01-02T00:00:05Z", "modelInfo": {"modelName": "claude-sonnet"},
             "toolFormerData": {"toolCallId": "call-1", "name": "read_file", "status": "completed", "params": "{\"path\":\"a\"}", "result": {"contents": "body"}}}),
         ),
         (
             "t2",
             2,
-            json!({"type": 2, "toolFormerData": {"toolCallId": "call-2", "name": "run_terminal_cmd", "status": "error", "rawArgs": "{\"command\":\"ls\"}", "error": "denied"}}),
+            json!({"type": 2, "modelInfo": {"modelName": "gpt-4"}, "toolFormerData": {"toolCallId": "call-2", "name": "run_terminal_cmd", "status": "error", "rawArgs": "{\"command\":\"ls\"}", "error": "denied"}}),
+        ),
+        (
+            "default",
+            2,
+            json!({"type": 2, "text": "default picker", "modelInfo": {"modelName": "default"}}),
         ),
     ];
     let mut headers = Vec::new();
@@ -437,15 +449,18 @@ fn ide_reads_older_chats_from_their_bubbles() {
         outline(&read.drafts),
         [
             "user: question",
+            r#"meta: {"model":"claude-sonnet","type":"model"}"#,
             "thinking: pondering",
             "assistant: answer",
             r#"tool_call: read_file {"path":"a"}"#,
             r#"tool_result: {"contents":"body"}"#,
+            r#"meta: {"model":"gpt-4","type":"model"}"#,
             r#"tool_call: run_terminal_cmd {"command":"ls"}"#,
             "tool_result: denied",
+            "assistant: default picker",
         ]
     );
-    let Body::ToolResult(failed) = &read.drafts[6].body else {
+    let Body::ToolResult(failed) = &read.drafts[8].body else {
         panic!("expected a result");
     };
     assert!(failed.is_error);
@@ -455,10 +470,10 @@ fn ide_reads_older_chats_from_their_bubbles() {
         .map(|draft| &draft.timestamp[..19])
         .collect();
     assert_eq!(
-        times[2], "2026-01-02T00:00:00",
+        times[3], "2026-01-02T00:00:00",
         "a bubble without a time takes the one before it"
     );
-    assert_eq!(times[6], "2026-01-02T00:00:05");
+    assert_eq!(times[8], "2026-01-02T00:00:05");
     assert_eq!(
         read.info.cwd.as_deref(),
         Some("/workspace/old"),

@@ -5,16 +5,17 @@ use std::process::Command;
 
 use anyhow::{Result, bail};
 use baton_core::{
-    Adapter, Agent, Blobs, Cursor, Export, Info, NativeRead, NativeSession, Progress, Source, time,
+    Adapter, Agent, Blobs, Body, Cursor, Draft, Export, Info, NativeRead, NativeSession, Progress,
+    Source, time,
 };
 use chrono::Local;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::hermes::parser::{self, Row};
 use crate::hermes::writer;
-use crate::support::{files, identifiers, program, sqlite};
+use crate::support::{files, identifiers, json, program, sqlite};
 
 // The sessions Hermes lists: no delegated subagent runs, tool sessions or hidden plugin sessions, and child sessions only where they branched off or replaced their parent
 const LISTED: &str = "
@@ -195,8 +196,10 @@ impl Source for HermesAdapter {
             created: time::from_unix_millis((started * 1000.0).round() as i64),
         };
         let mut drafts = Vec::new();
+        let mut last_model = None;
         let mut statement = snapshot.prepare(ROWS)?;
         for id in &lineage {
+            let model = session_model(&snapshot, id)?;
             let rows = statement.query_map([id], |row| {
                 Ok(Row {
                     id: row.get(0)?,
@@ -212,7 +215,19 @@ impl Source for HermesAdapter {
                 })
             })?;
             for row in rows {
-                drafts.extend(parser::drafts(&row?, blobs)?);
+                let row_drafts = parser::drafts(&row?, blobs)?;
+                if let Some(first) = row_drafts.first()
+                    && let Some(meta) = &model
+                    && last_model.as_ref() != Some(meta)
+                {
+                    drafts.push(Draft {
+                        timestamp: first.timestamp.clone(),
+                        native_entry_id: first.native_entry_id.clone(),
+                        body: Body::Meta(meta.clone()),
+                    });
+                    last_model = Some(meta.clone());
+                }
+                drafts.extend(row_drafts);
             }
         }
         Ok(NativeRead {
@@ -225,6 +240,10 @@ impl Source for HermesAdapter {
 }
 
 impl Adapter for HermesAdapter {
+    fn writer_version(&self) -> u32 {
+        1
+    }
+
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         let db = self.home.join("state.db");
         if !db.is_file() {
@@ -255,8 +274,8 @@ impl Adapter for HermesAdapter {
             None => None,
         };
         transaction.execute(
-            "INSERT INTO sessions (id, source, started_at, ended_at, end_reason, message_count, tool_call_count, cwd, title)
-             VALUES (?1, 'cli', ?2, ?3, 'cli_close', ?4, ?5, ?6, ?7)",
+            "INSERT INTO sessions (id, source, started_at, ended_at, end_reason, message_count, tool_call_count, cwd, title, model)
+             VALUES (?1, 'cli', ?2, ?3, 'cli_close', ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 time::unix_millis(created) as f64 / 1000.0,
@@ -265,8 +284,13 @@ impl Adapter for HermesAdapter {
                 tool_calls as i64,
                 export.cwd.to_string_lossy(),
                 title,
+                export.models.last().map(|model| model.split().1),
             ],
         )?;
+        let mut model_config = serde_json::Map::new();
+        if let Some(provider) = export.models.last().and_then(|model| model.split().0) {
+            model_config.insert("provider".into(), json!(provider));
+        }
         {
             let mut insert = transaction.prepare(
                 "INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, tool_name, finish_reason,
@@ -295,15 +319,18 @@ impl Adapter for HermesAdapter {
                     archived,
                 ])?;
                 if index + 1 == first_active {
-                    let marker =
-                        json!({"_baton_compacted_through": transaction.last_insert_rowid()})
-                            .to_string();
-                    transaction.execute(
-                        "UPDATE sessions SET model_config = ?2 WHERE id = ?1",
-                        params![id, marker],
-                    )?;
+                    model_config.insert(
+                        "_baton_compacted_through".into(),
+                        json!(transaction.last_insert_rowid()),
+                    );
                 }
             }
+        }
+        if !model_config.is_empty() {
+            transaction.execute(
+                "UPDATE sessions SET model_config = ?2 WHERE id = ?1",
+                params![id, Value::Object(model_config).to_string()],
+            )?;
         }
         transaction.commit()?;
         let stamp = sqlite::stamp(&db)?;
@@ -366,6 +393,29 @@ fn title(connection: &Connection, lineage: &[String]) -> Result<Option<String>> 
         }
     }
     Ok(None)
+}
+
+// The model meta of one session of a lineage: its current model, with the provider of the route its model config names
+fn session_model(connection: &Connection, id: &str) -> Result<Option<Value>> {
+    let (model, config): (Option<String>, Option<String>) = connection.query_row(
+        "SELECT model, model_config FROM sessions WHERE id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let Some(model) = model.filter(|model| !model.is_empty()) else {
+        return Ok(None);
+    };
+    let mut meta = json!({"type": "model", "model": model});
+    let config: Value = config
+        .and_then(|config| serde_json::from_str(&config).ok())
+        .unwrap_or_default();
+    if let Some(provider) = json::string(&config["provider"])
+        .or_else(|| json::string(&config["gateway_runtime"]["provider"]))
+    {
+        meta["provider"] = json!(provider);
+    }
+
+    Ok(Some(meta))
 }
 
 // Hermes names sessions after their local start time and a six-character hex suffix

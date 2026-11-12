@@ -111,11 +111,13 @@ fn round_trip(agent: Agent, root: &Path, blobs: &Blobs) -> Back {
     let events = sample(blobs);
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: Some("Round trip"),
         cwd: Path::new("/work/demo"),
         created: CREATED,
         events: &replayed,
+        models: &models,
         seed: None,
     };
     let adapter = writable_adapter(agent, root).unwrap();
@@ -141,7 +143,11 @@ fn round_trip(agent: Agent, root: &Path, blobs: &Blobs) -> Back {
 
     Back {
         expected: replayed.iter().map(|event| event.body.clone()).collect(),
-        read: support::bodies(&read.drafts),
+        // Writers record the models they write, which reads give back as meta events
+        read: support::bodies(&read.drafts)
+            .into_iter()
+            .filter(|body| !matches!(body, Body::Meta(_)))
+            .collect(),
         title: read.info.title.or(native.title),
         cwd: read.info.cwd,
         file: native.path,
@@ -155,11 +161,13 @@ fn seeded_exports_have_the_same_native_id_and_path_in_fresh_stores() {
     let events = sample(&blobs);
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: Some("Round trip"),
         cwd: Path::new("/work/demo"),
         created: CREATED,
         events: &replayed,
+        models: &models,
         seed: Some(uuid::Uuid::parse_str("12345678-1234-5678-9234-567812345678").unwrap()),
     };
     // RikkaHub canonicalizes its backup path, and macOS temp directories sit behind a /var symlink
@@ -215,11 +223,13 @@ fn ids_that_differ_natively_keep_their_own_results_through_an_export() {
     let events = Event::chain(read.drafts, None, Agent::Pi, "pi-session");
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: None,
         cwd: Path::new("/workspace/demo"),
         created: CREATED,
         events: &replayed,
+        models: &models,
         seed: None,
     };
     let claude = ClaudeAdapter::new(dir.path().join("claude"));
@@ -262,6 +272,316 @@ fn every_writable_agent_reads_back_what_it_wrote() {
             keeps_cwd.then_some("/work/demo"),
             "{agent}"
         );
+    }
+}
+
+#[test]
+fn model_changes_round_trip_through_writable_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let events = Event::chain(
+        [
+            support::meta(
+                json!({"type": "model", "provider": "anthropic", "model": "claude-opus-5"}),
+            ),
+            support::user("first", vec![]),
+            support::assistant("first answer"),
+            support::meta(json!({"type": "model", "model": "magpie/auto/claude-opus-5-5"})),
+            support::user("second", vec![]),
+            support::assistant("second answer"),
+            support::meta(json!({"type": "model", "model": "claude-opus-4-5"})),
+            support::user("third", vec![]),
+            support::assistant("third answer"),
+        ]
+        .into_iter()
+        .map(support::draft),
+        None,
+        Agent::Pi,
+        "source",
+    );
+    let path: Vec<&Event> = events.iter().collect();
+    let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
+    let export = Export {
+        title: None,
+        cwd: Path::new("/work/demo"),
+        created: CREATED,
+        events: &replayed,
+        models: &models,
+        seed: None,
+    };
+    for (agent, expected) in [
+        (
+            Agent::Claude,
+            vec![
+                json!({"type": "model", "model": "claude-opus-5"}),
+                json!({"type": "model", "model": "magpie/auto/claude-opus-5-5"}),
+                json!({"type": "model", "model": "claude-opus-4-5"}),
+            ],
+        ),
+        (
+            Agent::Pi,
+            vec![
+                json!({"type": "model", "provider": "anthropic", "model": "claude-opus-5"}),
+                json!({"type": "model", "provider": "magpie", "model": "auto/claude-opus-5-5"}),
+                json!({"type": "model", "provider": "<synthetic>", "model": "claude-opus-4-5"}),
+            ],
+        ),
+        (
+            Agent::Omp,
+            vec![
+                json!({"type": "model", "model": "anthropic/claude-opus-5"}),
+                json!({"type": "model", "model": "magpie/auto/claude-opus-5-5"}),
+                json!({"type": "model", "model": "<synthetic>/claude-opus-4-5"}),
+            ],
+        ),
+        (
+            Agent::Dsh,
+            vec![
+                json!({"type": "model", "model": "claude-opus-5"}),
+                json!({"type": "model", "model": "auto/claude-opus-5-5"}),
+                json!({"type": "model", "model": "claude-opus-4-5"}),
+            ],
+        ),
+    ] {
+        let adapter = writable_adapter(agent, &dir.path().join(agent.name())).unwrap();
+        let written = adapter.write(&export, &blobs).unwrap();
+        let read = adapter.read(&written, None, &blobs).unwrap();
+        let actual: Vec<_> = read
+            .drafts
+            .into_iter()
+            .filter_map(|draft| match draft.body {
+                Body::Meta(meta) if meta["type"] == "model" => Some(meta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actual, expected, "{agent}");
+
+        if agent == Agent::Omp {
+            let journal = fs::read_to_string(written.path).unwrap();
+            let assistant = journal
+                .lines()
+                .rev()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|record| {
+                    record["type"] == "message" && record["message"]["role"] == "assistant"
+                })
+                .unwrap();
+            assert_eq!(assistant["message"]["provider"], "<synthetic>");
+            assert_eq!(assistant["message"]["model"], "claude-opus-4-5");
+            assert_eq!(assistant["message"]["api"], "<synthetic>");
+        }
+    }
+}
+
+#[test]
+fn resume_fields_carry_the_last_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let events = Event::chain(
+        [
+            support::meta(
+                json!({"type": "model", "provider": "anthropic", "model": "claude-opus-5"}),
+            ),
+            support::user("first", vec![]),
+            support::assistant("first answer"),
+            support::meta(json!({"type": "model", "model": "magpie/auto/claude-opus-5-5"})),
+            support::user("second", vec![]),
+            support::assistant("second answer"),
+            support::meta(
+                json!({"type": "model", "provider": "anthropic", "model": "claude-opus-4-5"}),
+            ),
+            support::user("third", vec![]),
+            support::assistant("third answer"),
+        ]
+        .into_iter()
+        .map(support::draft),
+        None,
+        Agent::Pi,
+        "source",
+    );
+    let path: Vec<&Event> = events.iter().collect();
+    let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
+    let export = Export {
+        title: None,
+        cwd: Path::new("/work/demo"),
+        created: CREATED,
+        events: &replayed,
+        models: &models,
+        seed: None,
+    };
+    for (agent, expected) in [
+        (
+            Agent::Grok,
+            vec![
+                json!({"type": "model", "model": "claude-opus-5"}),
+                json!({"type": "model", "model": "auto/claude-opus-5-5"}),
+                json!({"type": "model", "model": "claude-opus-4-5"}),
+            ],
+        ),
+        (
+            Agent::Devin,
+            vec![
+                json!({"type": "model", "model": "claude-opus-5"}),
+                json!({"type": "model", "model": "magpie/auto/claude-opus-5-5"}),
+                json!({"type": "model", "model": "claude-opus-4-5"}),
+            ],
+        ),
+        (
+            Agent::Hermes,
+            vec![json!({"type": "model", "provider": "anthropic", "model": "claude-opus-4-5"})],
+        ),
+    ] {
+        let adapter = writable_adapter(agent, &dir.path().join(agent.name())).unwrap();
+        let written = adapter.write(&export, &blobs).unwrap();
+        let read = adapter.read(&written, None, &blobs).unwrap();
+        let actual: Vec<_> = read
+            .drafts
+            .into_iter()
+            .filter_map(|draft| match draft.body {
+                Body::Meta(meta) if meta["type"] == "model" => Some(meta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actual, expected, "{agent}");
+
+        match agent {
+            Agent::Grok => {
+                let summary: serde_json::Value = serde_json::from_slice(
+                    &fs::read(written.path.with_file_name("summary.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(summary["current_model_id"], "claude-opus-4-5");
+            }
+            Agent::Devin | Agent::Hermes => {
+                let connection = Connection::open(&written.path).unwrap();
+                let model: String = connection
+                    .query_row(
+                        "SELECT model FROM sessions WHERE id = ?1",
+                        [&written.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(model, "claude-opus-4-5");
+                if agent == Agent::Hermes {
+                    let config: String = connection
+                        .query_row(
+                            "SELECT model_config FROM sessions WHERE id = ?1",
+                            [&written.id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+                    assert_eq!(config["provider"], "anthropic");
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    let compacted = Event::chain(
+        [
+            support::meta(
+                json!({"type": "model", "provider": "anthropic", "model": "claude-opus-4-5"}),
+            ),
+            support::user("before", vec![]),
+            support::assistant("answer"),
+            support::compaction("summary"),
+            support::user("after", vec![]),
+        ]
+        .into_iter()
+        .map(support::draft),
+        None,
+        Agent::Pi,
+        "source",
+    );
+    let path: Vec<&Event> = compacted.iter().collect();
+    let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
+    let export = Export {
+        events: &replayed,
+        models: &models,
+        ..export
+    };
+    let adapter = writable_adapter(Agent::Hermes, &dir.path().join("hermes-compacted")).unwrap();
+    let written = adapter.write(&export, &blobs).unwrap();
+    let connection = Connection::open(&written.path).unwrap();
+    let config: String = connection
+        .query_row(
+            "SELECT model_config FROM sessions WHERE id = ?1",
+            [&written.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+    assert_eq!(config["provider"], "anthropic");
+    assert!(config["_baton_compacted_through"].is_number());
+
+    let unknown = Event::chain(
+        [
+            support::user("question", vec![]),
+            support::assistant("answer"),
+        ]
+        .into_iter()
+        .map(support::draft),
+        None,
+        Agent::Pi,
+        "source",
+    );
+    let path: Vec<&Event> = unknown.iter().collect();
+    let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
+    let export = Export {
+        events: &replayed,
+        models: &models,
+        ..export
+    };
+    for agent in [Agent::Grok, Agent::Devin, Agent::Hermes] {
+        let adapter =
+            writable_adapter(agent, &dir.path().join(format!("{}-unknown", agent.name()))).unwrap();
+        let written = adapter.write(&export, &blobs).unwrap();
+        let read = adapter.read(&written, None, &blobs).unwrap();
+        assert!(
+            !read
+                .drafts
+                .iter()
+                .any(|draft| matches!(&draft.body, Body::Meta(meta) if meta["type"] == "model")),
+            "{agent}"
+        );
+        match agent {
+            Agent::Grok => {
+                let summary: serde_json::Value = serde_json::from_slice(
+                    &fs::read(written.path.with_file_name("summary.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(summary["current_model_id"], "<synthetic>");
+            }
+            Agent::Devin | Agent::Hermes => {
+                let connection = Connection::open(&written.path).unwrap();
+                let model: Option<String> = connection
+                    .query_row(
+                        "SELECT model FROM sessions WHERE id = ?1",
+                        [&written.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    model.as_deref(),
+                    (agent == Agent::Devin).then_some("<synthetic>")
+                );
+                if agent == Agent::Hermes {
+                    let config: Option<String> = connection
+                        .query_row(
+                            "SELECT model_config FROM sessions WHERE id = ?1",
+                            [&written.id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert!(config.is_none());
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -358,11 +678,13 @@ fn rikkahub_removes_a_conversation_without_deleting_a_shared_upload() {
     let events = Event::chain([support::draft(body.clone())], None, Agent::Pi, "source");
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: Some("Shared image"),
         cwd: Path::new("/work/demo"),
         created: CREATED,
         events: &replayed,
+        models: &models,
         seed: None,
     };
     let adapter = RikkahubAdapter::new(Some(backup.clone()));
@@ -536,11 +858,13 @@ fn codex_recreates_a_lost_seeded_rollout_without_reindexing_its_title() {
     let events = sample(&blobs);
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: Some("Round trip"),
         cwd: Path::new("/work/demo"),
         created: CREATED,
         events: &replayed,
+        models: &models,
         seed: Some(uuid::Uuid::parse_str("12345678-1234-5678-9234-567812345678").unwrap()),
     };
     let root = dir.path().join("codex");
@@ -674,6 +998,7 @@ fn grok_preserves_orphan_results_and_later_calls() {
         "source",
     );
     let path: Vec<&Event> = events.iter().collect();
+    let models = replay::Models::new(&path);
     let adapter = GrokAdapter::new(dir.path().join("grok"));
     let native = adapter
         .write(
@@ -682,6 +1007,7 @@ fn grok_preserves_orphan_results_and_later_calls() {
                 cwd: Path::new("/work"),
                 created: CREATED,
                 events: &path,
+                models: &models,
                 seed: None,
             },
             &blobs,
@@ -755,6 +1081,7 @@ fn openhands_preserves_timestamps_in_the_repeated_dst_hour() {
     let events = Event::chain(drafts, None, Agent::Pi, "source");
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let adapter = OpenhandsAdapter::new(dir.path().join("conversations"));
     let native = adapter
         .write(
@@ -763,6 +1090,7 @@ fn openhands_preserves_timestamps_in_the_repeated_dst_hour() {
                 cwd: Path::new("/work"),
                 created: timestamps[0],
                 events: &replayed,
+                models: &models,
                 seed: None,
             },
             &blobs,
@@ -818,11 +1146,13 @@ fn vibe_answers_calls_whose_results_come_later_with_lines_it_reads_past() {
     );
     let path: Vec<&Event> = events.iter().collect();
     let replayed = replay::events(&path);
+    let models = replay::Models::new(&path);
     let export = Export {
         title: None,
         cwd: Path::new("/work/demo"),
         created: CREATED,
         events: &replayed,
+        models: &models,
         seed: None,
     };
     let root = dir.path().join("vibe");

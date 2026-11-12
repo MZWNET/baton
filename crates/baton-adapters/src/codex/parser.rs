@@ -14,8 +14,10 @@ pub(super) struct RolloutParser<'a> {
     // Whether the parser continues an earlier read, which never saw the turns before the cursor
     continuing: bool,
     last: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
     // The node before each user turn, so a rollback can return to it
-    turns: Vec<Option<String>>,
+    turns: Vec<(Option<String>, Option<String>)>,
     info: Info,
 }
 
@@ -26,11 +28,17 @@ struct Output {
 }
 
 impl<'a> RolloutParser<'a> {
-    pub(super) fn new(blobs: &'a Blobs, leaf: Option<&str>) -> RolloutParser<'a> {
+    pub(super) fn new(
+        blobs: &'a Blobs,
+        leaf: Option<&str>,
+        provider: Option<String>,
+    ) -> RolloutParser<'a> {
         RolloutParser {
             blobs,
             continuing: leaf.is_some(),
             last: leaf.map(String::from),
+            provider,
+            model: None,
             turns: Vec::new(),
             info: Info::default(),
         }
@@ -41,6 +49,20 @@ impl<'a> RolloutParser<'a> {
         let payload = &record["payload"];
         let paginated = record.get("ordinal").is_some();
         let bodies = match record["type"].as_str().unwrap_or_default() {
+            "turn_context" => {
+                if let Some(model) = payload["model"].as_str().filter(|model| !model.is_empty())
+                    && self.model.as_deref() != Some(model)
+                {
+                    let mut meta = json!({"type": "model", "model": model});
+                    if let Some(provider) = &self.provider {
+                        meta["provider"] = json!(provider);
+                    }
+                    self.model = Some(model.to_owned());
+                    vec![Body::Meta(meta)]
+                } else {
+                    Vec::new()
+                }
+            }
             "response_item" => self.response_item(payload, paginated)?,
             "event_msg" => match payload["type"].as_str().unwrap_or_default() {
                 "user_message" if !paginated => self.user_message(payload)?,
@@ -58,7 +80,7 @@ impl<'a> RolloutParser<'a> {
     }
 
     fn user_message(&mut self, payload: &Value) -> Result<Vec<Body>> {
-        self.turns.push(self.last.clone());
+        self.turns.push((self.last.clone(), self.model.clone()));
         let mut attached = Vec::new();
         for url in strings(&payload["images"]) {
             attached.extend(images::from_data_url(self.blobs, url)?);
@@ -179,7 +201,7 @@ impl<'a> RolloutParser<'a> {
             .unwrap_or_default();
         let bodies = match item["type"].as_str().unwrap_or_default() {
             "UserMessage" => {
-                self.turns.push(self.last.clone());
+                self.turns.push((self.last.clone(), self.model.clone()));
                 let mut attached = Vec::new();
                 for block in blocks {
                     match block["type"].as_str().unwrap_or_default() {
@@ -217,11 +239,15 @@ impl<'a> RolloutParser<'a> {
     fn rollback(&mut self, turns: u64) -> Line {
         for _ in 0..turns {
             match self.turns.pop() {
-                Some(before) => self.last = before,
+                Some((before, model)) => {
+                    self.last = before;
+                    self.model = model;
+                }
                 // An incremental read never saw the turns it would have to undo
                 None if self.continuing => return Line::Restart,
                 None => {
                     self.last = None;
+                    self.model = None;
                     break;
                 }
             }

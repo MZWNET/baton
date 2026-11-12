@@ -1,4 +1,5 @@
 use anyhow::Result;
+use baton_core::replay::Models;
 use baton_core::{Blobs, Event, Image, time};
 use serde_json::{Value, json};
 
@@ -13,7 +14,7 @@ pub(super) struct Node {
 }
 
 // One node per message, chained in order
-pub(super) fn nodes(events: &[&Event], blobs: &Blobs) -> Result<Vec<Node>> {
+pub(super) fn nodes(events: &[&Event], models: &Models, blobs: &Blobs) -> Result<Vec<Node>> {
     let mut nodes = Vec::new();
     for unit in unit::units(events) {
         match unit {
@@ -39,6 +40,9 @@ pub(super) fn nodes(events: &[&Event], blobs: &Blobs) -> Result<Vec<Node>> {
                     let mut message = message(reply.event, "assistant", reply.text, None);
                     message["tool_calls"] = json!(calls);
                     message["metadata"]["finish_reason"] = json!(finish);
+                    if let Some(model) = models.at(reply.event) {
+                        message["metadata"]["generation_model"] = json!(model.id);
+                    }
                     nodes.push(node(reply.event, message));
                 }
             }

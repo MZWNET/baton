@@ -174,6 +174,10 @@ impl Source for OpencodeAdapter {
 }
 
 impl Adapter for OpencodeAdapter {
+    fn writer_version(&self) -> u32 {
+        1
+    }
+
     fn write(&self, export: &Export, blobs: &Blobs) -> Result<NativeSession> {
         let id = ascending_ids::session_id(export.seed, time::unix_millis(export.created));
         let v2 = self.is_v2()?;
