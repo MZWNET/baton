@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use baton_adapters::{
     AntigravityAdapter, ClaudeAdapter, CodexAdapter, CopilotAdapter, CursorAdapter, DevinAdapter,
     DshAdapter, GrokAdapter, HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter,
-    OpenhandsAdapter, PiAdapter, QwenAdapter, RikkahubAdapter, VibeAdapter,
+    OpenhandsAdapter, PiAdapter, QwenAdapter, RikkahubAdapter, VibeAdapter, ZcodeAdapter,
 };
 use baton_core::{Adapter, Agent, Blobs, Body, Event, Export, Image, Source, replay};
 use rusqlite::Connection;
@@ -46,6 +46,18 @@ fn writable_adapter(agent: Agent, root: &Path) -> Option<Box<dyn Adapter>> {
                 );
             }
             Box::new(DevinAdapter::new(root.join("sessions.db")))
+        }
+        Agent::Zcode => {
+            if !root.join("db.sqlite").exists() {
+                support::database(
+                    &root.join("db.sqlite"),
+                    include_str!("../fixtures/zcode-db.sql"),
+                );
+            }
+            Box::new(ZcodeAdapter::new(
+                root.join("db.sqlite"),
+                root.join("artifacts"),
+            ))
         }
         Agent::Copilot => Box::new(CopilotAdapter::new(root.to_path_buf())),
         Agent::Grok => Box::new(GrokAdapter::new(root.to_path_buf())),
@@ -432,6 +444,14 @@ fn resume_fields_carry_the_last_model() {
             Agent::Hermes,
             vec![json!({"type": "model", "provider": "anthropic", "model": "claude-opus-4-5"})],
         ),
+        (
+            Agent::Zcode,
+            vec![
+                json!({"type": "model", "provider": "anthropic", "model": "claude-opus-5"}),
+                json!({"type": "model", "provider": "magpie", "model": "auto/claude-opus-5-5"}),
+                json!({"type": "model", "provider": "anthropic", "model": "claude-opus-4-5"}),
+            ],
+        ),
     ] {
         let adapter = writable_adapter(agent, &dir.path().join(agent.name())).unwrap();
         let written = adapter.write(&export, &blobs).unwrap();
@@ -453,6 +473,21 @@ fn resume_fields_carry_the_last_model() {
                 )
                 .unwrap();
                 assert_eq!(summary["current_model_id"], "claude-opus-4-5");
+            }
+            Agent::Zcode => {
+                let connection = Connection::open(&written.path).unwrap();
+                let data: String = connection
+                    .query_row(
+                        "SELECT data FROM session_entry WHERE session_id = ?1 AND type = 'runtime/model_selection'",
+                        [&written.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+                assert_eq!(
+                    data,
+                    json!({"modelSelection": {"providerId": "anthropic", "modelId": "claude-opus-4-5"}})
+                );
             }
             Agent::Devin | Agent::Hermes => {
                 let connection = Connection::open(&written.path).unwrap();

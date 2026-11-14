@@ -5,10 +5,9 @@ use baton_core::{
 };
 use serde_json::{Value, json};
 
-use crate::opencode::tool_order;
 use crate::support::model::LEGACY_PLACEHOLDER;
 use crate::support::normalize::{self, Content};
-use crate::support::{images, json};
+use crate::support::{images, json, tool_order};
 
 // An OpenCode 2 export: flat typed messages, with each tool's result in its call's state
 pub(in crate::opencode) fn parse(data: &Value, blobs: &Blobs) -> Result<NativeRead> {

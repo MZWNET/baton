@@ -23,6 +23,7 @@ mod registry;
 mod rikkahub;
 mod support;
 mod vibe;
+mod zcode;
 
 pub use antigravity::{AntigravityAdapter, AntigravityDesktopAdapter, AntigravityIdeAdapter};
 pub use claude::ClaudeAdapter;
@@ -44,3 +45,4 @@ pub use qwen::QwenAdapter;
 pub use registry::{adapter, source};
 pub use rikkahub::RikkahubAdapter;
 pub use vibe::VibeAdapter;
+pub use zcode::ZcodeAdapter;

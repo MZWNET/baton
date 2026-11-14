@@ -5,7 +5,7 @@ use crate::{
     AntigravityAdapter, AntigravityDesktopAdapter, AntigravityIdeAdapter, ClaudeAdapter,
     CodexAdapter, CopilotAdapter, CursorAdapter, CursorIdeAdapter, DevinAdapter, DshAdapter,
     GrokAdapter, HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpencodeAdapter,
-    OpenhandsAdapter, PiAdapter, QwenAdapter, RikkahubAdapter, VibeAdapter,
+    OpenhandsAdapter, PiAdapter, QwenAdapter, RikkahubAdapter, VibeAdapter, ZcodeAdapter,
 };
 
 /// The source of `agent`'s sessions at the agent's default location, honoring the agent's own environment overrides such as `CODEX_HOME`.
@@ -55,6 +55,10 @@ pub fn adapter(agent: Agent) -> Result<Box<dyn Adapter>> {
         Agent::Dsh => Box::new(DshAdapter::new(DshAdapter::default_home()?)),
         // RikkaHub keeps its conversations on the phone, so only a backup handed to the adapter holds any
         Agent::Rikkahub => Box::new(RikkahubAdapter::new(None)),
+        Agent::Zcode => Box::new(ZcodeAdapter::new(
+            ZcodeAdapter::default_db()?,
+            ZcodeAdapter::default_artifacts()?,
+        )),
         Agent::AntigravityDesktop | Agent::AntigravityIde | Agent::CursorIde => {
             bail!("baton can only read {agent} sessions")
         }

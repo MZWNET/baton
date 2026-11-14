@@ -30,6 +30,7 @@ Keep the conversations of your coding agents in one append-only history, back it
 | [Cursor](https://cursor.com/) editor | `cursor-ide` | Read only |
 | [Paseo](https://github.com/getpaseo/paseo) | `paseo` | Read / Write |
 | [RikkaHub](https://github.com/rikkahub/rikkahub) | `rikkahub` | Read / Write |
+| [ZCode](https://github.com/zai-org/ZCode) | `zcode` | Read / Write |
 
 ## Install
 
@@ -82,12 +83,13 @@ Each agent's own location variables are honored, such as `CLAUDE_CONFIG_DIR`, `C
 - Agent sessions are only read during import; exports create new sessions and never overwrite existing ones.
 - Before running `baton materialize --in codex`, close older Codex versions that do not use the shared `session_index.jsonl.lock` for title updates.
 - Thinking is stored but never written back, tool calls are written as history and never run again, and auth, hooks, and MCP settings are untouched.
-- Sessions exported to Claude Code, OpenCode, Kilo Code, DeepSeek Harness, pi, Oh My Pi, Grok Build, and Devin keep the model each message was written with, as far as the source agent recorded it; Hermes and Muse Code get the session's last model, and Codex sessions carry no model and resume on Codex's own configured model. A provider or model the source agent did not record is left out or written as `<synthetic>`. Agents that resume on a session's model resume on its last one, and when the local install lacks that model the agent handles it as it handles a model it no longer offers: interactive Oh My Pi falls back to its default model, and it refuses to open the session with `-p` or in RPC or ACP mode.
+- Sessions exported to Claude Code, OpenCode, Kilo Code, DeepSeek Harness, pi, Oh My Pi, Grok Build, Devin, and ZCode keep the model each message was written with, as far as the source agent recorded it; Hermes and Muse Code get the session's last model, and Codex sessions carry no model and resume on Codex's own configured model. A provider or model the source agent did not record is left out or written as `<synthetic>`. Agents that resume on a session's model resume on its last one, and when the local install lacks that model the agent handles it as it handles a model it no longer offers: interactive Oh My Pi falls back to its default model, and it refuses to open the session with `-p` or in RPC or ACP mode.
 - OpenCode and Kilo Code sessions go through the `opencode` and `kilo` commands on `PATH`, and the project directory must exist to receive a session.
 - Paseo keeps no conversations of its own: baton imports a Paseo agent through its provider's session (Claude Code, Codex, OpenCode, Pi, Oh My Pi), so the chat stays one baton session.
 - `export --to paseo` and `resume --in paseo` take `--provider`, while `materialize --in paseo` restores every session that was a Paseo agent somewhere under each provider it was registered with; registering goes through `paseo` and a running Paseo daemon, and when the daemon is not running `materialize --in paseo` writes only the provider sessions and warns that registration and deletion are skipped.
 - DeepSeek Harness cannot open a session by id, so `baton resume --in dsh` starts `dsh web`, where the session is listed under its workspace or Ungrouped.
 - RikkaHub runs on Android, so baton reads backups exported from the app; `--backup <file>` with `export` or `materialize` adds sessions to that backup and creates it when missing, and `resume` cannot open RikkaHub. Restoring a backup in the app replaces all of its conversations, so add sessions to a backup made right before restoring.
+- ZCode sessions are read from and written to its CLI database `~/.zcode/cli/db/db.sqlite` (or `ZCODE_SESSION_DB_PATH`), so run `zcode` once before writing a session there. ZCode resumes on the session's last model only when the source agent recorded its provider, and otherwise asks for a model.
 
 ## Credits
 

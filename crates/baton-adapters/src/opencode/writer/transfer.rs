@@ -4,9 +4,9 @@ use baton_core::{Blobs, Body, Event, Export, Image, ToolResult, time};
 use serde_json::{Value, json};
 
 use crate::opencode::ascending_ids::AscendingIds;
-use crate::opencode::tool_order::{self, Placement, ToolOrder};
 use crate::support::images;
 use crate::support::model::provider_and_id;
+use crate::support::tool_order::{self, Placement, ToolOrder};
 use crate::support::unit::{self, Unit};
 
 // OpenCode 2 drops assistant messages without a completion time on import

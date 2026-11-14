@@ -54,11 +54,13 @@ pub enum Agent {
     Paseo,
     /// [RikkaHub](https://github.com/rikkahub/rikkahub), an Android app whose backups baton reads conversations from and adds them to
     Rikkahub,
+    /// [ZCode](https://github.com/zai-org/ZCode), which keeps sessions in its SQLite database `~/.zcode/cli/db/db.sqlite`.
+    Zcode,
 }
 
 impl Agent {
     /// Every supported agent, in the order imports visit them.
-    pub const ALL: [Agent; 24] = [
+    pub const ALL: [Agent; 25] = [
         Agent::Pi,
         Agent::Omp,
         Agent::Claude,
@@ -83,6 +85,7 @@ impl Agent {
         Agent::CursorIde,
         Agent::Paseo,
         Agent::Rikkahub,
+        Agent::Zcode,
     ];
 
     /// The name used on the command line, in `agent:native_id` references and in stored events.
@@ -112,6 +115,7 @@ impl Agent {
             Agent::CursorIde => "cursor-ide",
             Agent::Paseo => "paseo",
             Agent::Rikkahub => "rikkahub",
+            Agent::Zcode => "zcode",
         }
     }
 }

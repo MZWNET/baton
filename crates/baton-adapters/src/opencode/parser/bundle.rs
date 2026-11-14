@@ -5,11 +5,10 @@ use baton_core::{
 };
 use serde_json::{Value, json};
 
-use crate::opencode::tool_order;
 use crate::opencode::writer::bundle::UNNAMED;
 use crate::support::model::LEGACY_PLACEHOLDER;
 use crate::support::normalize::{self, Content};
-use crate::support::{images, json};
+use crate::support::{images, json, tool_order};
 
 // Tool results follow the step that produced them, where the model saw them, and a compaction request with its summary reply becomes one compaction
 pub(in crate::opencode) fn parse(bundle: &Value, blobs: &Blobs) -> Result<NativeRead> {

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use baton_adapters::{
     ClaudeAdapter, CodexAdapter, CopilotAdapter, DevinAdapter, DshAdapter, GrokAdapter,
     HermesAdapter, KimiAdapter, MastracodeAdapter, MuseAdapter, OpenhandsAdapter, Paseo, PiAdapter,
-    QwenAdapter, RikkahubAdapter, VibeAdapter,
+    QwenAdapter, RikkahubAdapter, VibeAdapter, ZcodeAdapter,
 };
 use baton_core::{Agent, Blobs, Body, Cursor, Draft, Image, NativeRead, Source};
 use rusqlite::params;
@@ -714,6 +714,150 @@ fn pixels() -> Image {
         blob: PIXELS_SHA256.into(),
         mime: "image/png".into(),
     }
+}
+
+#[test]
+fn zcode_reads_the_active_branch_with_preserved_compactions_and_artifact_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = Blobs::new(dir.path().join("blobs"));
+    let db = dir.path().join("db.sqlite");
+    let artifacts = dir.path().join("artifacts");
+    let connection = support::database(&db, include_str!("../fixtures/zcode-db.sql"));
+    let revert = json!({
+        "targetMessageID": "msg_x",
+        "keptMessageIDs": ["msg_1", "msg_2", "msg_3"],
+        "branchCutAfterMessageID": "msg_y"
+    });
+    for (id, task_type, deleted, session_revert) in [
+        ("sess_main", "interactive", None, Some(revert.to_string())),
+        ("sess_deleted", "interactive", Some(1), None),
+        ("sess_child", "subagent_child", None, None),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO session (id, project_id, slug, directory, title, version, task_type, time_created, time_updated, time_deleted, revert) VALUES (?1, 'proj_demo', ?1, '/workspace/demo', 'ZCode session', '3.18.2', ?2, 1000, 9000, ?3, ?4)",
+                params![id, task_type, deleted, session_revert],
+            )
+            .unwrap();
+    }
+    let messages = [
+        (
+            "msg_1",
+            json!({"role": "user", "time": {"created": 1000}}),
+            vec![
+                ("part_1", json!({"type": "text", "text": "Look at this"})),
+                (
+                    "part_2",
+                    json!({"type": "file", "mime": "image/png", "url": "zcode-artifact://sess_main/tool-result-abc"}),
+                ),
+            ],
+        ),
+        (
+            "msg_2",
+            json!({"role": "user", "synthetic": true, "time": {"created": 2000}}),
+            vec![(
+                "part_3",
+                json!({"type": "text", "text": "runtime reminder"}),
+            )],
+        ),
+        (
+            "msg_3",
+            json!({"role": "assistant", "time": {"created": 3000}}),
+            vec![
+                (
+                    "part_4",
+                    json!({"type": "tool", "callID": "call_1", "tool": "read", "blockIndex": 2, "state": {"status": "completed", "input": {"path": "a.txt"}, "output": "file body"}}),
+                ),
+                (
+                    "part_5",
+                    json!({"type": "text", "text": "Let me check", "blockIndex": 0}),
+                ),
+                (
+                    "part_6",
+                    json!({"type": "reasoning", "text": "private reasoning", "blockIndex": 1}),
+                ),
+            ],
+        ),
+        (
+            "msg_x",
+            json!({"role": "user", "time": {"created": 4000}}),
+            vec![(
+                "part_7",
+                json!({"type": "text", "text": "abandoned question"}),
+            )],
+        ),
+        (
+            "msg_y",
+            json!({"role": "assistant", "time": {"created": 5000}}),
+            vec![(
+                "part_8",
+                json!({"type": "text", "text": "abandoned answer"}),
+            )],
+        ),
+        (
+            "msg_4",
+            json!({"role": "user", "time": {"created": 6000}}),
+            vec![(
+                "part_9",
+                json!({"type": "text", "text": "Preserved prompt"}),
+            )],
+        ),
+        (
+            "msg_5",
+            json!({"role": "user", "time": {"created": 7000}}),
+            vec![
+                (
+                    "part_10",
+                    json!({"type": "text", "text": "Earlier summary", "synthetic": true}),
+                ),
+                (
+                    "part_11",
+                    json!({"type": "compaction", "compactBoundary": {"preservedSegment": {"headMessageId": "msg_4"}}}),
+                ),
+            ],
+        ),
+    ];
+    for (id, data, parts) in messages {
+        let created = data["time"]["created"].as_i64().unwrap();
+        connection
+            .execute(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, 'sess_main', ?2, ?2, ?3)",
+                params![id, created, data.to_string()],
+            )
+            .unwrap();
+        for (part_id, part) in parts {
+            connection
+                .execute(
+                    "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, 'sess_main', ?3, ?3, ?4)",
+                    params![part_id, id, created, part.to_string()],
+                )
+                .unwrap();
+        }
+    }
+    drop(connection);
+    support::write(
+        &artifacts.join("sess_main/attachment-1-tool-result-abc.txt"),
+        "data:image/png;base64,cGl4ZWxz",
+    );
+    let adapter = ZcodeAdapter::new(db, artifacts);
+    let sessions = adapter.discover(None).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "sess_main");
+    let read = adapter.read(&sessions[0], None, &blobs).unwrap();
+    assert_eq!(
+        support::bodies(&read.drafts),
+        vec![
+            support::user("Look at this", vec![pixels()]),
+            support::assistant("Let me check"),
+            support::thinking("private reasoning", None),
+            support::call("call_1", "read", json!({"path": "a.txt"})),
+            support::result("call_1", "file body", vec![], false),
+            support::compaction("Earlier summary"),
+            support::user("Preserved prompt", vec![]),
+        ]
+    );
+    assert_eq!(read.info.cwd.as_deref(), Some("/workspace/demo"));
+    assert_eq!(read.info.title.as_deref(), Some("ZCode session"));
 }
 
 #[test]

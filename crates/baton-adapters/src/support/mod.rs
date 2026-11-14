@@ -8,5 +8,6 @@ pub(crate) mod normalize;
 pub(crate) mod program;
 pub(crate) mod protobuf;
 pub(crate) mod sqlite;
+pub(crate) mod tool_order;
 pub(crate) mod unit;
 pub(crate) mod uri;
