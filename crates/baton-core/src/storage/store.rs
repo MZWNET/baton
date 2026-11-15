@@ -273,6 +273,12 @@ impl Store {
         self.write_file(id, "records", "json", &encode_record(record)?)
     }
 
+    pub(crate) fn remove(&self, id: &str) -> Result<()> {
+        let dir = self.root.join("sessions").join(id);
+
+        fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))
+    }
+
     pub(crate) fn replace_segment(&self, id: &str, name: &str, events: &[Event]) -> Result<()> {
         let path = self
             .root

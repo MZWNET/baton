@@ -45,14 +45,19 @@ impl Cursors {
         Ok(Cursors { db: Mutex::new(db) })
     }
 
-    pub(crate) fn remap_events(&self, ids: &HashMap<String, String>) -> Result<()> {
+    pub(crate) fn remap_events(
+        &self,
+        ids: &HashMap<String, HashMap<String, String>>,
+    ) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let transaction = db.transaction()?;
         {
-            let mut update =
-                transaction.prepare("UPDATE cursors SET event = ?1 WHERE event = ?2")?;
-            for (old, new) in ids {
-                update.execute(params![new, old])?;
+            let mut update = transaction
+                .prepare("UPDATE cursors SET event = ?1 WHERE session = ?2 AND event = ?3")?;
+            for (session, events) in ids {
+                for (old, new) in events {
+                    update.execute(params![new, session, old])?;
+                }
             }
         }
         transaction.commit()?;

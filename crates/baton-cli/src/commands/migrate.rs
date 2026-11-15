@@ -12,13 +12,23 @@ pub(crate) fn run() -> Result<()> {
     if migrated.rewritten > 0 {
         println!("{} sessions had call ids rewritten", migrated.rewritten);
     }
+    if migrated.merged > 0 {
+        println!(
+            "{} redundant forks merged into the sessions they forked from",
+            migrated.merged
+        );
+    }
     if migrated.corrected > 0 {
         println!(
             "{} sessions had project remotes corrected",
             migrated.corrected
         );
     }
-    if migrated.converted == 0 && migrated.rewritten == 0 && migrated.corrected == 0 {
+    if migrated.converted == 0
+        && migrated.rewritten == 0
+        && migrated.merged == 0
+        && migrated.corrected == 0
+    {
         println!("Nothing needed migrating");
     }
 

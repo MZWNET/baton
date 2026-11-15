@@ -12,11 +12,10 @@ use crate::model::Record;
 use crate::storage::replace;
 use crate::sync::session_id;
 use crate::{
-    Agent, Body, Direction, Event, ForkPoint, Index, Migrated, SessionMeta, Store,
-    portable_call_id, project,
+    Direction, Event, ForkPoint, Index, Migrated, Session, SessionMeta, Store, project, replay,
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const JOURNAL: &str = ".migration.tmp";
 
 fn supported_version(data: &Path) -> Result<u32> {
@@ -64,33 +63,17 @@ fn write_version(data: &Path) -> Result<()> {
     replace(&data.join("version"), format!("{VERSION}\n").as_bytes())
 }
 
-fn migrated_call_id(id: &str) -> Option<String> {
-    let (call_suffix, function) = id.strip_prefix("call_")?.split_once('_')?;
-    let (prefix, suffix) = function.split_once('_')?;
-    if call_suffix.is_empty()
-        || !matches!(prefix, "fc" | "ctc")
-        || suffix.is_empty()
-        || !call_suffix.bytes().all(|c| c.is_ascii_alphanumeric())
-        || !suffix.bytes().all(|c| c.is_ascii_alphanumeric())
-    {
-        return None;
-    }
-
-    Some(portable_call_id(&format!("call_{call_suffix}|{function}")))
-}
-
 #[derive(Serialize, Deserialize)]
 struct Journal {
-    event_ids: HashMap<String, String>,
-    rewritten_calls: HashMap<String, HashSet<String>>,
+    events: HashMap<String, HashMap<String, String>>,
 }
 
 pub(super) fn migrate(data: &Path, cache: &Path, store: &Store) -> Result<Migrated> {
     supported_version(data)?;
     let converted = convert_layout(data, store)?;
     let journal = load_or_plan_journal(data, store)?;
-    apply(store, &Cursors::open(cache, data)?, &journal)?;
-    let rewritten = journal.rewritten_calls.len();
+    let rewritten = apply(store, &Cursors::open(cache, data)?, &journal)?;
+    let merged = merge_forks(store)?;
     let corrected = correct_projects(store)?;
     write_version(data)?;
     Index::remove(cache)?;
@@ -100,6 +83,7 @@ pub(super) fn migrate(data: &Path, cache: &Path, store: &Store) -> Result<Migrat
     Ok(Migrated {
         converted,
         rewritten,
+        merged,
         corrected,
     })
 }
@@ -114,26 +98,17 @@ fn load_or_plan_journal(data: &Path, store: &Store) -> Result<Journal> {
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     }
-    let files = store.session_files()?;
-    let mut metas = HashMap::new();
-    for session in &files {
-        metas.insert(session.id.clone(), store.record_meta(&session.id)?);
-    }
-    let mut order: Vec<_> = files.iter().collect();
-    order.sort_by_cached_key(|session| depth(&session.id, &metas));
-    let mut event_ids: HashMap<String, String> = HashMap::new();
-    let mut rewritten_calls: HashMap<String, HashSet<String>> = HashMap::new();
-    for session in order {
-        let meta = &metas[&session.id];
-        let exports: HashSet<_> = meta
-            .links
-            .iter()
-            .filter(|link| link.direction == Direction::Export)
-            .map(|link| (link.agent, link.native_id.as_str()))
-            .collect();
+    let mut sessions = HashMap::new();
+    for session in store.session_files()? {
         let mut events = Vec::new();
+        let mut seen = HashSet::new();
         for name in &session.events {
-            events.extend(store.segment(&session.id, name)?);
+            events.extend(
+                store
+                    .segment(&session.id, name)?
+                    .into_iter()
+                    .filter(|event| seen.insert(event.id.clone())),
+            );
         }
         let positions: HashMap<_, _> = events
             .iter()
@@ -141,7 +116,7 @@ fn load_or_plan_journal(data: &Path, store: &Store) -> Result<Journal> {
             .map(|(index, event)| (event.id.clone(), index))
             .collect();
         let mut done = vec![false; events.len()];
-        let mut changed = vec![false; events.len()];
+        let mut event_ids: HashMap<String, String> = HashMap::new();
         for index in 0..events.len() {
             let mut pending = Vec::new();
             let mut current = Some(index);
@@ -162,108 +137,200 @@ fn load_or_plan_journal(data: &Path, store: &Store) -> Result<Journal> {
                     && let Some(mapped) = event_ids.get(parent)
                 {
                     *parent = mapped.clone();
-                    changed[next] = true;
                 }
-                if matches!(event.origin.agent, Agent::Pi | Agent::Omp)
-                    && !exports.contains(&(event.origin.agent, event.origin.native_id.as_str()))
-                {
-                    let call_id = match &mut event.body {
-                        Body::ToolCall(call) => Some(&mut call.call_id),
-                        Body::ToolResult(result) => Some(&mut result.call_id),
-                        _ => None,
-                    };
-                    if let Some(call_id) = call_id
-                        && let Some(mapped) = migrated_call_id(call_id)
-                    {
-                        *call_id = mapped;
-                        changed[next] = true;
-                        rewritten_calls
-                            .entry(session.id.clone())
-                            .or_default()
-                            .insert(old.clone());
-                    }
-                }
-                if changed[next] {
-                    event.id = Event::id_for(event.parent.as_deref(), &event.body);
-                    event_ids.insert(old, event.id.clone());
+                event.body.replace_legacy_call_id();
+                let id = Event::id_for(event.parent.as_deref(), &event.body);
+                if id != old {
+                    event_ids.insert(old, id);
                 }
                 done[next] = true;
             }
         }
+        if !event_ids.is_empty() {
+            sessions.insert(session.id, event_ids);
+        }
     }
 
-    let journal = Journal {
-        event_ids,
-        rewritten_calls,
-    };
+    let journal = Journal { events: sessions };
     replace(&path, &serde_json::to_vec(&journal)?)?;
 
     Ok(journal)
 }
 
-fn apply(store: &Store, cursors: &Cursors, journal: &Journal) -> Result<()> {
+fn apply(store: &Store, cursors: &Cursors, journal: &Journal) -> Result<usize> {
     let files = store.session_files()?;
     for session in &files {
         for (name, mut record) in store.read_records(&session.id, &session.records)? {
             let mut changed = false;
-            for id in [
-                record
-                    .parent
-                    .as_mut()
-                    .and_then(|parent| parent.event.as_mut()),
-                record
-                    .link
-                    .as_mut()
-                    .and_then(|link| link.exported_leaf.as_mut()),
-            ]
-            .into_iter()
-            .flatten()
+            if let Some(parent) = &mut record.parent
+                && let Some(id) = &mut parent.event
+                && let Some(mapped) = journal
+                    .events
+                    .get(&parent.session)
+                    .and_then(|events| events.get(id))
             {
-                if let Some(mapped) = journal.event_ids.get(id) {
-                    *id = mapped.clone();
-                    changed = true;
-                }
+                id.clone_from(mapped);
+                changed = true;
+            }
+            if let Some(id) = record
+                .link
+                .as_mut()
+                .and_then(|link| link.exported_leaf.as_mut())
+                && let Some(mapped) = journal
+                    .events
+                    .get(&session.id)
+                    .and_then(|events| events.get(id))
+            {
+                id.clone_from(mapped);
+                changed = true;
             }
             if changed {
                 store.replace_record(&session.id, &name, &record)?;
             }
         }
     }
-    cursors.remap_events(&journal.event_ids)?;
+    cursors.remap_events(&journal.events)?;
+    let mut rewritten = 0;
     for session in &files {
+        let mut session_changed = false;
         for name in &session.events {
             let mut events = store.segment(&session.id, name)?;
             let mut changed = false;
             for event in &mut events {
-                if let Some(mapped) = journal.event_ids.get(&event.id) {
-                    if journal
-                        .rewritten_calls
-                        .get(&session.id)
-                        .is_some_and(|calls| calls.contains(&event.id))
-                    {
-                        let call_id = match &mut event.body {
-                            Body::ToolCall(call) => &mut call.call_id,
-                            Body::ToolResult(result) => &mut result.call_id,
-                            _ => unreachable!(),
-                        };
-                        *call_id = migrated_call_id(call_id).expect("journal records old call ids");
-                    }
+                changed |= event.body.replace_legacy_call_id();
+                if let Some(mapped) = journal
+                    .events
+                    .get(&session.id)
+                    .and_then(|events| events.get(&event.id))
+                {
                     event.id.clone_from(mapped);
-                    if let Some(parent) = &mut event.parent
-                        && let Some(mapped) = journal.event_ids.get(parent)
-                    {
-                        parent.clone_from(mapped);
-                    }
+                    changed = true;
+                }
+                if let Some(parent) = &mut event.parent
+                    && let Some(mapped) = journal
+                        .events
+                        .get(&session.id)
+                        .and_then(|events| events.get(parent))
+                {
+                    parent.clone_from(mapped);
                     changed = true;
                 }
             }
             if changed {
                 store.replace_segment(&session.id, name, &events)?;
+                session_changed = true;
             }
         }
+        rewritten += usize::from(session_changed);
     }
 
-    Ok(())
+    Ok(rewritten)
+}
+
+fn matching_prefix<'a>(
+    events: &[&Event],
+    branches: &'a [Vec<&'a Event>],
+) -> Option<&'a [&'a Event]> {
+    let digest = replay::digest(events.iter().map(|event| &event.body));
+
+    branches.iter().find_map(|branch| {
+        if branch.len() >= events.len()
+            && replay::digest(branch[..events.len()].iter().map(|event| &event.body)) == digest
+        {
+            Some(&branch[..events.len()])
+        } else {
+            None
+        }
+    })
+}
+
+fn replay_branches(session: &Session) -> Vec<Vec<&Event>> {
+    std::iter::once(session.path())
+        .chain(session.branches())
+        .map(|path| replay::events(&path))
+        .collect()
+}
+
+fn merge_forks(store: &Store) -> Result<usize> {
+    let mut metas = HashMap::new();
+    for files in store.session_files()? {
+        metas.insert(files.id.clone(), store.record_meta(&files.id)?);
+    }
+    let mut forks: Vec<_> = metas
+        .iter()
+        .filter(|(_, meta)| meta.parent.is_some())
+        .map(|(id, _)| id.clone())
+        .collect();
+    forks.sort_by_cached_key(|id| Reverse(depth(id, &metas)));
+    let mut merged = 0;
+    for id in forks {
+        let parent_id = metas[&id]
+            .parent
+            .as_ref()
+            .map(|parent| parent.session.clone())
+            .expect("fork has a parent");
+        if !metas.contains_key(&parent_id)
+            || metas.values().any(|meta| {
+                meta.parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.session == id)
+            })
+        {
+            continue;
+        }
+        let fork = store.load(&id)?;
+        let parent = store.load(&parent_id)?;
+        let branches = replay_branches(&parent);
+        if !replay_branches(&fork)
+            .iter()
+            .all(|branch| matching_prefix(branch, &branches).is_some())
+        {
+            continue;
+        }
+        let versions = store.link_versions(&parent_id)?;
+        for link in &fork.meta.links {
+            let mut restored = if let Some((_, previous)) = versions
+                .iter()
+                .rev()
+                .find(|(_, previous)| previous.is_for(&link.host, link.agent, &link.native_id))
+            {
+                let mut previous = previous.clone();
+                previous.path.clone_from(&link.path);
+                previous
+            } else {
+                let mut restored = link.clone();
+                restored.direction = Direction::Export;
+                if let Some(leaf) = &link.exported_leaf
+                    && fork.contains(leaf)
+                {
+                    let path = fork.path_to(leaf);
+                    let events = replay::events(&path);
+                    let matched = matching_prefix(&events, &branches);
+                    restored.exported_leaf = matched
+                        .and_then(|prefix| prefix.last())
+                        .map(|event| event.id.clone());
+                    if matched.is_some() {
+                        restored.exported_events = events.len();
+                    }
+                }
+                restored
+            };
+            restored.continued = false;
+            restored.removed = false;
+            store.record(
+                &parent_id,
+                &Record {
+                    link: Some(restored),
+                    ..Record::default()
+                },
+            )?;
+        }
+        store.remove(&id)?;
+        metas.remove(&id);
+        merged += 1;
+    }
+
+    Ok(merged)
 }
 
 fn correct_projects(store: &Store) -> Result<usize> {

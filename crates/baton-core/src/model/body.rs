@@ -92,6 +92,22 @@ pub fn portable_call_id(id: &str) -> String {
     }
 }
 
+/// The portable id of an older baton call id written by replacing the `|` pi and omp put between OpenAI call and item ids
+fn portable_legacy_call_id(id: &str) -> Option<String> {
+    let (call_suffix, function) = id.strip_prefix("call_")?.split_once('_')?;
+    let (prefix, suffix) = function.split_once('_')?;
+    if call_suffix.is_empty()
+        || !matches!(prefix, "fc" | "ctc")
+        || suffix.is_empty()
+        || !call_suffix.bytes().all(|c| c.is_ascii_alphanumeric())
+        || !suffix.bytes().all(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+
+    Some(portable_call_id(&format!("call_{call_suffix}|{function}")))
+}
+
 /// A summary that replaces everything before it in the model's context.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Compaction {
@@ -110,6 +126,20 @@ pub struct Thinking {
 }
 
 impl Body {
+    pub(crate) fn replace_legacy_call_id(&mut self) -> bool {
+        let id = match self {
+            Body::ToolCall(call) => &mut call.call_id,
+            Body::ToolResult(result) => &mut result.call_id,
+            _ => return false,
+        };
+        if let Some(mapped) = portable_legacy_call_id(id) {
+            *id = mapped;
+            return true;
+        }
+
+        false
+    }
+
     /// The `kind` the body is stored under, such as `tool_call`.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -141,6 +171,35 @@ impl Body {
             Body::Compaction(compaction) => Cow::Borrowed(&compaction.summary),
             Body::Thinking(thinking) => Cow::Borrowed(&thinking.text),
             Body::Meta(meta) => Cow::Owned(meta.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{portable_call_id, portable_legacy_call_id};
+
+    #[test]
+    fn converts_only_legacy_openai_call_ids_to_portable_ids() {
+        for (old, original) in [
+            ("call_X_fc_Y", "call_X|fc_Y"),
+            ("call_123_ctc_ABC", "call_123|ctc_ABC"),
+        ] {
+            assert_eq!(
+                portable_legacy_call_id(old),
+                Some(portable_call_id(original))
+            );
+        }
+        for id in [
+            "call__fc_Y",
+            "call_X_fc_",
+            "call_X_fc_Y_Z",
+            "call_X_other_Y",
+            "call_X-Y_fc_Z",
+            "call_X|fc_Y",
+            "call_function_abcdefghijkl_1",
+        ] {
+            assert_eq!(portable_legacy_call_id(id), None, "{id}");
         }
     }
 }

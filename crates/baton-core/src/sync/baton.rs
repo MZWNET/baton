@@ -58,8 +58,10 @@ pub struct Materialized {
 pub struct Migrated {
     /// Sessions converted from the old layout
     pub converted: usize,
-    /// Sessions with rewritten call identifiers
+    /// Sessions whose event segments were rewritten
     pub rewritten: usize,
+    /// Redundant forks merged into their parents
+    pub merged: usize,
     /// Sessions with corrected project remotes
     pub corrected: usize,
 }
@@ -349,7 +351,7 @@ impl Baton {
             return Ok(pending);
         }
         let had_native = !linked.is_empty();
-        let mut up_to_date = false;
+        let mut current_links = Vec::new();
         let mut obsolete = Vec::new();
         for (link, native) in linked {
             // An untouched export of an older writer is written again, like one of an older leaf
@@ -364,8 +366,21 @@ impl Baton {
                             && cursor.stamp == native.stamp
                             && cursor.event == indexed.leaf
                     });
-            up_to_date |= current;
-            if !current && link.removable && !protected.contains(&native.id) {
+            if current {
+                current_links.push((link, native));
+            } else if link.removable && !protected.contains(&native.id) {
+                obsolete.push((link, native));
+            }
+        }
+        current_links.sort_by(|(a, _), (b, _)| {
+            a.removable
+                .cmp(&b.removable)
+                .then_with(|| b.writer_version.cmp(&a.writer_version))
+                .then_with(|| a.native_id.cmp(&b.native_id))
+        });
+        let up_to_date = !current_links.is_empty();
+        for (link, native) in current_links.into_iter().skip(1) {
+            if link.removable && !protected.contains(&native.id) {
                 obsolete.push((link, native));
             }
         }
@@ -536,10 +551,14 @@ impl Baton {
         }
         let NativeRead {
             info,
-            drafts,
+            mut drafts,
             continued,
             progress,
         } = source.read(native, cursor.as_ref(), &self.store.blobs())?;
+        // Older exports can still contain the legacy ids
+        for draft in &mut drafts {
+            draft.body.replace_legacy_call_id();
+        }
         let incoming = Incoming {
             agent,
             native,

@@ -226,13 +226,176 @@ fn old_pi_call_ids_migrate_without_adding_a_branch() {
 fn newer_format_is_refused_without_changing_version() {
     let home = Home::new();
     fs::create_dir_all(home.path("baton")).unwrap();
-    fs::write(home.path("baton/version"), "3\n").unwrap();
+    fs::write(home.path("baton/version"), "4\n").unwrap();
     assert!(!home.run(&["list"]).status.success());
     assert!(!home.run(&["migrate"]).status.success());
     assert_eq!(
         fs::read_to_string(home.path("baton/version")).unwrap(),
-        "3\n"
+        "4\n"
     );
+}
+
+#[test]
+fn migration_repairs_corrupted_ids_and_merges_the_fork() {
+    let home = Home::new();
+    let host = home.host();
+    let hashed = baton_core::portable_call_id("call_X|fc_Y");
+    let events = Event::chain(
+        [
+            draft(
+                1,
+                "a1",
+                Body::User(User {
+                    text: "question".into(),
+                    images: vec![],
+                }),
+            ),
+            draft(
+                2,
+                "a2",
+                Body::ToolCall(ToolCall {
+                    call_id: hashed.clone(),
+                    name: "read".into(),
+                    input: json!({"path":"file"}),
+                }),
+            ),
+            draft(
+                3,
+                "a3",
+                Body::ToolResult(ToolResult {
+                    call_id: hashed,
+                    text: "output".into(),
+                    images: vec![],
+                    is_error: false,
+                }),
+            ),
+        ],
+        None,
+        Agent::Pi,
+        "pi-1",
+    );
+    let claude_link = json!({"host":host, "agent":"claude", "native_id":"claude-1", "path":"/old/claude.jsonl", "exported_events":3, "exported_leaf":events[2].id, "direction":"export", "continued":true});
+    store(
+        &home,
+        "parent",
+        &events,
+        json!({"created":"2026-01-01T00:00:00.000Z", "link":{"host":host,"agent":"pi","native_id":"pi-1","path":"/pi.jsonl","exported_events":3,"direction":"import"}}),
+    );
+    fs::write(
+        home.session("parent/records/test-018cc251-f400-7000-8000-000000000002.json"),
+        format!("{}\n", json!({"link":claude_link})),
+    )
+    .unwrap();
+    let mut corrupted = events.clone();
+    for event in &mut corrupted {
+        event.origin.agent = Agent::Claude;
+        match &mut event.body {
+            Body::ToolCall(call) => call.call_id = "call_X_fc_Y".into(),
+            Body::ToolResult(result) => result.call_id = "call_X_fc_Y".into(),
+            _ => {}
+        }
+    }
+    store(
+        &home,
+        "fork",
+        &corrupted,
+        json!({"created":"2026-01-01T00:00:00.000Z", "parent":{"session":"parent", "event":null}, "link":{"host":host,"agent":"claude","native_id":"claude-1","path":"/new/claude.jsonl","exported_events":3,"direction":"import"}}),
+    );
+    store(
+        &home,
+        "corrupted",
+        &corrupted,
+        json!({"created":"2026-01-01T00:00:00.000Z"}),
+    );
+    fs::write(home.path("baton/version"), "2\n").unwrap();
+    let output = home.baton(&["migrate"]);
+    assert!(output.contains("1 redundant forks merged"), "{output}");
+    assert!(!home.session("fork").exists());
+    let records: Vec<Value> = fs::read_dir(home.session("parent/records"))
+        .unwrap()
+        .map(|entry| serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["link"]["native_id"] == "claude-1"
+                && record["link"]["path"] == "/new/claude.jsonl"
+                && record["link"]["continued"] == false)
+    );
+    for session in ["parent", "corrupted"] {
+        for entry in fs::read_dir(home.session(&format!("{session}/events"))).unwrap() {
+            let bytes =
+                zstd::stream::decode_all(fs::File::open(entry.unwrap().path()).unwrap()).unwrap();
+            for line in bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                let event: Event = serde_json::from_slice(line).unwrap();
+                let expected = Event::chain(
+                    [draft(1, "entry", event.body.clone())],
+                    event.parent.clone(),
+                    event.origin.agent,
+                    &event.origin.native_id,
+                );
+                assert_eq!(event.id, expected[0].id);
+            }
+        }
+    }
+    assert!(
+        home.baton(&["migrate"])
+            .contains("Nothing needed migrating")
+    );
+}
+
+#[test]
+fn legacy_export_backflow_does_not_fork() {
+    let home = Home::new();
+    write_pi(
+        &home,
+        &[
+            header("/work"),
+            ask("a1", None, 1, "question"),
+            entry(
+                "a2",
+                Some("a1"),
+                2,
+                json!({"role":"assistant", "content":[{"type":"toolCall", "id":"call_X|fc_Y", "name":"read", "arguments":{"path":"file"}}], "stopReason":"toolUse"}),
+            ),
+            entry(
+                "a3",
+                Some("a2"),
+                3,
+                json!({"role":"toolResult", "toolCallId":"call_X|fc_Y", "content":[{"type":"text", "text":"output"}], "isError":false}),
+            ),
+        ],
+    );
+    home.baton(&["import", "--agent", "pi"]);
+    let session = home.sessions(&[]).remove(0);
+    let id = home.export(&session, "claude");
+    let transcript = home.claude_transcript(&id);
+    let text = fs::read_to_string(&transcript).unwrap();
+    let hashed = baton_core::portable_call_id("call_X|fc_Y");
+    assert!(text.contains(&hashed));
+    fs::write(&transcript, text.replace(&hashed, "call_X_fc_Y")).unwrap();
+    home.baton(&["import", "--agent", "claude"]);
+    assert_eq!(home.sessions(&[]), vec![session]);
+}
+
+#[test]
+fn materialize_removes_duplicate_current_exports() {
+    let home = Home::new();
+    write_pi(&home, &[header("/work"), ask("a1", None, 1, "question")]);
+    home.baton(&["import", "--agent", "pi"]);
+    let session = home.sessions(&[]).remove(0);
+    let first = home.export(&session, "claude");
+    let second = home.export(&session, "claude");
+    assert_ne!(first, second);
+    assert_eq!(home.claude_transcripts().len(), 2);
+    home.baton(&["materialize", "--in", "claude"]);
+    let remaining = home.claude_transcripts();
+    assert_eq!(remaining.len(), 1);
+    let remaining_id = remaining[0].file_stem().unwrap().to_str().unwrap();
+    assert!(remaining_id == first || remaining_id == second);
 }
 
 #[test]
