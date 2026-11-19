@@ -18,7 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 hostname = "0.4"
-jiff = "0.2"
+jiff = "1.0"
 md-5 = { version = "0.11", default-features = false }
 rayon = "1"
 rusqlite = { version = "0.41", features = ["bundled"] }
