@@ -26,11 +26,11 @@ pub(crate) fn run(
     // Only a running daemon opens the agent, so without one nothing is exported
     let paseo = match provider {
         Some(provider) => {
-            let paseo = Paseo::new(Paseo::default_home()?);
+            let paseo = Paseo::open(Paseo::default_home()?)?;
             if !paseo.available() {
                 bail!("paseo daemon is not running; cannot open a Paseo agent");
             }
-            let registrations = paseo.discover()?;
+            let registrations = paseo.discover()?.active;
             Some((provider, paseo, registrations))
         }
         None => None,

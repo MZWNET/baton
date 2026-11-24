@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use baton_adapters::{Paseo, PaseoAgent};
+use baton_adapters::{Paseo, PaseoAgent, PaseoAgents};
 use baton_core::{
     Adapter, Agent, Baton, Direction, Exported, Link, Materialized, NativeSession, Session,
     materialization_cwd,
@@ -27,7 +27,7 @@ pub(crate) fn run(baton: &mut Baton, agents: &[Agent], backup: Option<&Path>) ->
             continue;
         }
         targets.push(match agent {
-            Agent::Paseo => Target::Paseo(Paseo::new(Paseo::default_home()?)),
+            Agent::Paseo => Target::Paseo(Paseo::open(Paseo::default_home()?)?),
             _ => Target::Adapter(export::adapter(
                 agent,
                 backup.filter(|_| agent == Agent::Rikkahub),
@@ -63,7 +63,7 @@ fn materialize_agent(baton: &mut Baton, adapter: &dyn Adapter) -> Result<()> {
         wrapped_natives(
             agent,
             &natives,
-            &Paseo::new(Paseo::default_home()?).discover()?,
+            &Paseo::open(Paseo::default_home()?)?.discover()?,
         )
     } else {
         HashSet::new()
@@ -75,26 +75,26 @@ fn materialize_agent(baton: &mut Baton, adapter: &dyn Adapter) -> Result<()> {
     Ok(())
 }
 
-// Restores every session that was a Paseo agent under each of its providers; without a running daemon only the provider sessions are written
+// Restores every session that was a Paseo agent under each of its providers Paseo has turned on, except where an archived agent holds it; without a running daemon only the provider sessions are written
 fn materialize_paseo(baton: &mut Baton, paseo: &Paseo) -> Result<()> {
-    let registrations = paseo.discover()?;
+    let agents = paseo.discover()?;
     let mut tally = import::Tally::default();
-    import::import_registrations(baton, paseo, &registrations, &mut tally)?;
+    import::import_registrations(baton, paseo, &agents.active, &mut tally)?;
     let mut groups: HashMap<Agent, HashSet<String>> = HashMap::new();
     for (id, link) in baton.registry_sessions(Agent::Paseo)? {
         if let Some(provider) = link.provider
-            && Paseo::supports(provider.agent)
+            && paseo.providers().contains(&provider.agent)
         {
             groups.entry(provider.agent).or_default().insert(id);
         }
     }
-    let mut providers = Vec::new();
+    let mut discovered = Vec::new();
     for (provider, ids) in groups {
         let adapter = baton_adapters::adapter(provider)?;
         match adapter.discover(None) {
             Ok(natives) => {
                 import::import_sessions(baton, adapter.as_ref(), &natives, &mut tally);
-                providers.push((adapter, natives, ids));
+                discovered.push((adapter, natives, ids));
             }
             Err(error) => eprintln!("baton: {provider}: {error:#}"),
         }
@@ -106,8 +106,18 @@ fn materialize_paseo(baton: &mut Baton, paseo: &Paseo) -> Result<()> {
         eprintln!("baton: paseo daemon is not running; skipping registration and deletion");
     }
     let mut summary = Materialized::default();
-    for (adapter, natives, ids) in providers {
-        let protected = wrapped_natives(adapter.agent(), &natives, &registrations);
+    for (adapter, natives, mut ids) in discovered {
+        // Registering its provider session again makes Paseo restore an archived agent
+        for agent in agents
+            .inactive
+            .iter()
+            .filter(|agent| agent.provider == adapter.agent())
+        {
+            if let Some(session) = held_session(baton, agent)? {
+                ids.remove(&session);
+            }
+        }
+        let protected = wrapped_natives(adapter.agent(), &natives, &agents);
         summary += baton.materialize(adapter.as_ref(), &natives, Some(&ids), &protected)?;
         baton.refresh()?;
         if available {
@@ -116,6 +126,17 @@ fn materialize_paseo(baton: &mut Baton, paseo: &Paseo) -> Result<()> {
     }
     report(Agent::Paseo, &summary);
     Ok(())
+}
+
+// The session an inactive Paseo agent holds: the one linked to it, or else the one holding its provider session
+fn held_session(baton: &Baton, agent: &PaseoAgent) -> Result<Option<String>> {
+    match baton
+        .index
+        .linked_session_any_host(Some(Agent::Paseo), &agent.id)?
+    {
+        Some(session) => Ok(Some(session)),
+        None => Ok(import::wrapped_session(baton, agent)?.map(|(session, _)| session)),
+    }
 }
 
 // Registers the provider session each session was just materialized to, and only once Paseo holds that registration deletes the ones baton made for older provider sessions, whose sessions materializing then removes unless another Paseo agent opens them
@@ -132,7 +153,7 @@ fn replace_registrations(
         .iter()
         .map(|native| (native.id.as_str(), native))
         .collect();
-    let registrations = paseo.discover()?;
+    let agents = paseo.discover()?;
     let mut unregistered = HashSet::new();
     for id in ids {
         let session = baton.store.load(id)?;
@@ -146,7 +167,7 @@ fn replace_registrations(
         if let Err(error) = export::register(
             baton,
             paseo,
-            &registrations,
+            &agents.active,
             &session.meta,
             provider,
             &exported,
@@ -162,7 +183,7 @@ fn replace_registrations(
                 link,
                 current,
                 &natives_by_id,
-                &registrations,
+                &agents.active,
             )
             .and_then(|obsolete| {
                 if obsolete {
@@ -275,16 +296,18 @@ fn obsolete_registration(
     baton.untouched_export(adapter, native_link, native)
 }
 
-// The provider sessions Paseo agents point at
+// The provider sessions Paseo agents point at, including inactive agents Paseo can open again
 fn wrapped_natives(
     provider: Agent,
     natives: &[NativeSession],
-    registrations: &[PaseoAgent],
+    agents: &PaseoAgents,
 ) -> HashSet<String> {
-    let handles: HashSet<&str> = registrations
+    let handles: HashSet<&str> = agents
+        .active
         .iter()
-        .filter(|registration| registration.provider == provider)
-        .map(|registration| registration.handle.as_str())
+        .chain(&agents.inactive)
+        .filter(|agent| agent.provider == provider)
+        .map(|agent| agent.handle.as_str())
         .collect();
     natives
         .iter()

@@ -1,3 +1,3 @@
 mod registry;
 
-pub use registry::{Paseo, PaseoAgent};
+pub use registry::{Paseo, PaseoAgent, PaseoAgents};

@@ -98,13 +98,13 @@ pub(crate) fn run(
         println!("{}", exported.native.id);
         return Ok(());
     };
-    let paseo = Paseo::new(Paseo::default_home()?);
+    let paseo = Paseo::open(Paseo::default_home()?)?;
     if !paseo.available() {
         eprintln!("baton: paseo daemon is not running; skipping registration");
         println!("{}", exported.native.id);
         return Ok(());
     }
-    let registrations = paseo.discover()?;
+    let registrations = paseo.discover()?.active;
     let session = baton.store.load(&session)?;
     println!(
         "{}",

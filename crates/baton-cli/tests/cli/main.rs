@@ -185,6 +185,67 @@ fn paseo_materialize_registers_once_and_handles_a_missing_daemon() {
 
 #[cfg(unix)]
 #[test]
+fn paseo_materialize_skips_providers_paseo_turned_off() {
+    let source = Home::new();
+    paseo_fixture(&source);
+    source.baton(&["import", "--agent", "paseo"]);
+    let session = source.sessions(&[]).remove(0);
+    let target = Home::new();
+    copy_session_files(&source, &target, &session);
+    target.install_paseo(true);
+    let config = target.path(".paseo/config.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        config,
+        json!({"agents": {"providers": {"claude": {"enabled": false}}}}).to_string(),
+    )
+    .unwrap();
+    target.baton(&["materialize", "--in", "paseo"]);
+    assert!(target.claude_transcripts().is_empty());
+    let log = fs::read_to_string(target.path("paseo.log")).unwrap();
+    assert!(!log.lines().any(|line| line.starts_with("import ")));
+}
+
+#[cfg(unix)]
+#[test]
+fn paseo_materialize_leaves_archived_agents_archived() {
+    let source = Home::new();
+    let (native_id, native) = paseo_fixture(&source);
+    source.baton(&["import", "--agent", "paseo"]);
+    let session = source.sessions(&[]).remove(0);
+    let target = Home::new();
+    copy_session_files(&source, &target, &session);
+    target.install_paseo(true);
+    target.baton(&["materialize", "--in", "paseo"]);
+    let old = target.claude_transcripts().remove(0);
+    let record = target.path(".paseo/agents/work/restored-1.json");
+    let mut agent: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    agent["archivedAt"] = json!("2026-01-01T00:00:00.000Z");
+    fs::write(record, agent.to_string()).unwrap();
+    append(
+        &native,
+        &[
+            json!({"type": "user", "uuid": "a2", "parentUuid": "a1", "sessionId": native_id, "cwd": source.project(), "timestamp": "2026-01-01T00:00:01.000Z", "message": {"role": "user", "content": "new question"}}),
+        ],
+    );
+    source.baton(&["import", "--agent", "claude"]);
+    copy_session_files(&source, &target, &session);
+    target.baton(&["materialize", "--in", "paseo"]);
+    let log = fs::read_to_string(target.path("paseo.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.starts_with("import "))
+            .count(),
+        1
+    );
+    assert!(old.exists());
+    target.baton(&["materialize", "--in", "claude"]);
+    assert!(old.exists());
+    assert_eq!(target.claude_transcripts().len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
 fn paseo_materialize_replaces_stale_untouched_exports() {
     let source = Home::new();
     let (native_id, native) = paseo_fixture(&source);

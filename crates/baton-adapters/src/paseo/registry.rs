@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -8,7 +9,15 @@ use serde_json::Value;
 
 use crate::support::{files, program};
 
-/// A supported active Paseo agent and the provider session it wraps.
+const PROVIDERS: [Agent; 5] = [
+    Agent::Claude,
+    Agent::Codex,
+    Agent::Opencode,
+    Agent::Pi,
+    Agent::Omp,
+];
+
+/// A supported Paseo agent and the provider session it wraps
 #[derive(Clone, Debug)]
 pub struct PaseoAgent {
     /// The Paseo agent id.
@@ -25,15 +34,47 @@ pub struct PaseoAgent {
     pub title: Option<String>,
 }
 
+/// Paseo agents grouped by whether Paseo opens them
+#[derive(Default)]
+pub struct PaseoAgents {
+    /// Agents Paseo opens
+    pub active: Vec<PaseoAgent>,
+    /// Agents archived or of a provider Paseo has turned off, which baton leaves alone
+    pub inactive: Vec<PaseoAgent>,
+}
+
 /// Paseo's on-disk registrations and command-line operations.
 pub struct Paseo {
     home: PathBuf,
+    providers: Vec<Agent>,
 }
 
 impl Paseo {
-    /// Uses the given Paseo home directory.
-    pub fn new(home: PathBuf) -> Self {
-        Self { home }
+    /// Uses the given Paseo home directory, reading which providers its settings turn on
+    pub fn open(home: PathBuf) -> Result<Self> {
+        let path = home.join("config.json");
+        let settings: Value = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", path.display()))?,
+            Err(error) if error.kind() == ErrorKind::NotFound => Value::Null,
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        let providers = PROVIDERS
+            .into_iter()
+            .filter(|provider| {
+                // Paseo ships Oh My Pi turned off
+                settings["agents"]["providers"][provider.name()]["enabled"]
+                    .as_bool()
+                    .unwrap_or(*provider != Agent::Omp)
+            })
+            .collect();
+
+        Ok(Self { home, providers })
+    }
+
+    /// The supported providers this Paseo has turned on
+    pub fn providers(&self) -> &[Agent] {
+        &self.providers
     }
 
     /// Finds the home selected by Paseo's environment.
@@ -48,9 +89,9 @@ impl Paseo {
         }
     }
 
-    /// Discovers active supported agents at one directory level.
-    pub fn discover(&self) -> Result<Vec<PaseoAgent>> {
-        let mut result = Vec::new();
+    /// Discovers supported agents at one directory level and sorts them into active and inactive ones
+    pub fn discover(&self) -> Result<PaseoAgents> {
+        let mut result = PaseoAgents::default();
         for path in files::read_dir(&self.home.join("agents"))? {
             if path.is_dir() {
                 for path in files::read_dir(&path)? {
@@ -63,7 +104,7 @@ impl Paseo {
         Ok(result)
     }
 
-    fn read_record(&self, path: &Path, agents: &mut Vec<PaseoAgent>) -> Result<()> {
+    fn read_record(&self, path: &Path, agents: &mut PaseoAgents) -> Result<()> {
         if path.extension().is_none_or(|extension| extension != "json") {
             return Ok(());
         }
@@ -72,7 +113,7 @@ impl Paseo {
             Ok(record) => record,
             Err(_) => return Ok(()),
         };
-        if record["internal"].as_bool() == Some(true) || !record["archivedAt"].is_null() {
+        if record["internal"].as_bool() == Some(true) {
             return Ok(());
         }
         let (Some(id), Some(provider_name), Some(cwd), Some(persistence)) = (
@@ -99,23 +140,25 @@ impl Paseo {
         if !Self::supports(provider) {
             return Ok(());
         }
-        agents.push(PaseoAgent {
+        let agent = PaseoAgent {
             id: id.to_owned(),
             path: path.to_path_buf(),
             handle: handle.to_owned(),
             provider,
             cwd: cwd.to_owned(),
             title: record["title"].as_str().map(str::to_owned),
-        });
+        };
+        if record["archivedAt"].is_null() && self.providers.contains(&provider) {
+            agents.active.push(agent);
+        } else {
+            agents.inactive.push(agent);
+        }
         Ok(())
     }
 
     /// Whether Paseo supports registering this provider through baton.
     pub fn supports(agent: Agent) -> bool {
-        matches!(
-            agent,
-            Agent::Claude | Agent::Codex | Agent::Opencode | Agent::Pi | Agent::Omp
-        )
+        PROVIDERS.contains(&agent)
     }
 
     /// The Paseo handle for a provider session.
@@ -228,7 +271,7 @@ impl Paseo {
     /// Reads the persisted record of a newly registered agent
     pub fn record(&self, id: &str) -> Result<PaseoAgent> {
         let filename = format!("{id}.json");
-        let mut agents = Vec::new();
+        let mut agents = PaseoAgents::default();
         for path in files::read_dir(&self.home.join("agents"))? {
             if path.is_dir() {
                 let record = path.join(&filename);
@@ -243,6 +286,7 @@ impl Paseo {
             }
         }
         agents
+            .active
             .into_iter()
             .find(|agent| agent.id == id)
             .with_context(|| format!("paseo agent {id} has no active record"))

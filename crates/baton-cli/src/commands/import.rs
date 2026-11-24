@@ -105,12 +105,11 @@ pub(crate) fn finish(baton: &Baton, tally: &Tally) -> Result<()> {
 }
 
 fn import_paseo(baton: &mut Baton, path: Option<&Path>, tally: &mut Tally) -> Result<()> {
-    let paseo = Paseo::new(match path {
+    let paseo = Paseo::open(match path {
         Some(path) => path.to_path_buf(),
         None => Paseo::default_home()?,
-    });
-    let registrations = paseo.discover()?;
-    import_registrations(baton, &paseo, &registrations, tally)
+    })?;
+    import_registrations(baton, &paseo, &paseo.discover()?.active, tally)
 }
 
 // The sessions of a Paseo provider, by the handle Paseo knows them by
@@ -213,21 +212,7 @@ fn import_wrapped(
             };
             session.map(|session| (session, native.id.clone()))
         }
-        None if matches!(provider, Agent::Pi | Agent::Omp) => baton
-            .index
-            .linked_file(provider, Path::new(&registration.handle))?,
-        None => {
-            let session = match baton
-                .index
-                .linked_session_any_host(Some(provider), &registration.handle)?
-            {
-                Some(session) => Some(session),
-                None => baton
-                    .index
-                    .linked_session_any_host(None, &registration.handle)?,
-            };
-            session.map(|session| (session, registration.handle.clone()))
-        }
+        None => wrapped_session(baton, registration)?,
     };
     let Some((session, native_id)) = linked else {
         return Ok(None);
@@ -244,6 +229,30 @@ fn import_wrapped(
     )?;
 
     Ok(Some(session))
+}
+
+// The session holding the provider session a Paseo agent wraps, with that provider session's id, found through links so it may be gone
+pub(crate) fn wrapped_session(
+    baton: &Baton,
+    registration: &PaseoAgent,
+) -> Result<Option<(String, String)>> {
+    let provider = registration.provider;
+    if matches!(provider, Agent::Pi | Agent::Omp) {
+        return baton
+            .index
+            .linked_file(provider, Path::new(&registration.handle));
+    }
+    let session = match baton
+        .index
+        .linked_session_any_host(Some(provider), &registration.handle)?
+    {
+        Some(session) => Some(session),
+        None => baton
+            .index
+            .linked_session_any_host(None, &registration.handle)?,
+    };
+
+    Ok(session.map(|session| (session, registration.handle.clone())))
 }
 
 // A session keeps the direction it already links a Paseo agent with, so a registration baton made stays one it may delete

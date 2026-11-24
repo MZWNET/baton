@@ -73,9 +73,9 @@ fn native_session(
 }
 
 fn paseo_session(baton: &Baton, prefix: &str, linked: Option<String>) -> Result<String> {
-    let paseo = Paseo::new(Paseo::default_home()?);
+    let paseo = Paseo::open(Paseo::default_home()?)?;
     let mut unimported = Vec::new();
-    for registration in paseo.discover()? {
+    for registration in paseo.discover()?.active {
         if registration.id.starts_with(prefix)
             && baton
                 .index

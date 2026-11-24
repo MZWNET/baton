@@ -4,6 +4,7 @@ mod rediscovery;
 #[path = "../support/mod.rs"]
 mod support;
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,32 +21,70 @@ use serde_json::{Value, json};
 const PIXELS_SHA256: &str = "6ec9c2b0eb14010746c8bce8939303b382344b296206612eb8a907a37b2b2f37";
 
 #[test]
-fn paseo_reads_supported_active_records_and_path_handles() {
+fn paseo_sorts_supported_records_into_active_and_inactive_agents() {
     let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config.json");
+    fs::write(
+        &config,
+        json!({"agents": {"providers": {"codex": {"enabled": false}, "omp": {"enabled": true}}}})
+            .to_string(),
+    )
+    .unwrap();
     let directory = home.path().join("agents/project");
     fs::create_dir_all(&directory).unwrap();
     for (id, provider, handle, internal, archived) in [
         ("claude", "claude", "native-id", false, false),
         ("pi", "pi", "/home/me/session.jsonl", false, false),
+        ("omp", "omp", "/home/me/omp.jsonl", false, false),
         ("internal", "claude", "internal-id", true, false),
         ("archived", "claude", "archived-id", false, true),
+        ("codex", "codex", "codex-id", false, false),
         ("unsupported", "copilot", "other-id", false, false),
     ] {
         let record = json!({"id": id, "provider": provider, "cwd": "/work", "title": "name", "internal": internal, "archivedAt": if archived { Some("2026-01-01") } else { None }, "persistence": {"provider": provider, "sessionId": handle, "nativeHandle": handle, "metadata": {"mcpServers": {"secret": "never copied"}}}});
         fs::write(directory.join(format!("{id}.json")), record.to_string()).unwrap();
     }
-    let agents = Paseo::new(home.path().to_path_buf()).discover().unwrap();
-    assert_eq!(agents.len(), 2);
-    assert!(
-        agents
-            .iter()
-            .any(|agent| agent.provider == Agent::Claude && agent.handle == "native-id")
+    let agents = Paseo::open(home.path().to_path_buf())
+        .unwrap()
+        .discover()
+        .unwrap();
+    let active: HashSet<_> = agents
+        .active
+        .iter()
+        .map(|agent| (agent.provider, agent.handle.as_str()))
+        .collect();
+    assert_eq!(
+        active,
+        [
+            (Agent::Claude, "native-id"),
+            (Agent::Pi, "/home/me/session.jsonl"),
+            (Agent::Omp, "/home/me/omp.jsonl")
+        ]
+        .into_iter()
+        .collect()
     );
-    assert!(
-        agents
-            .iter()
-            .any(|agent| agent.provider == Agent::Pi && agent.handle == "/home/me/session.jsonl")
-    );
+    let inactive: HashSet<_> = agents
+        .inactive
+        .iter()
+        .map(|agent| agent.id.as_str())
+        .collect();
+    assert_eq!(inactive, ["archived", "codex"].into_iter().collect());
+
+    fs::write(
+        &config,
+        json!({"agents": {"providers": {"codex": {"enabled": false}}}}).to_string(),
+    )
+    .unwrap();
+    let agents = Paseo::open(home.path().to_path_buf())
+        .unwrap()
+        .discover()
+        .unwrap();
+    let inactive: HashSet<_> = agents
+        .inactive
+        .iter()
+        .map(|agent| agent.id.as_str())
+        .collect();
+    assert_eq!(inactive, ["archived", "codex", "omp"].into_iter().collect());
 }
 
 fn kinds(drafts: &[Draft]) -> Vec<(String, String)> {

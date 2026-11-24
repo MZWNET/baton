@@ -39,7 +39,7 @@ pub use mastracode::MastracodeAdapter;
 pub use muse::MuseAdapter;
 pub use opencode::OpencodeAdapter;
 pub use openhands::OpenhandsAdapter;
-pub use paseo::{Paseo, PaseoAgent};
+pub use paseo::{Paseo, PaseoAgent, PaseoAgents};
 pub use pi::PiAdapter;
 pub use qwen::QwenAdapter;
 pub use registry::{adapter, source};
