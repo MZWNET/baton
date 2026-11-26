@@ -9,7 +9,10 @@
   };
 
   git-hooks.hooks = {
-    alejandra.enable = true;
+    alejandra = {
+      enable = true;
+      excludes = ["^Cargo\\.nix$"];
+    };
     rustfmt.enable = true;
     clippy.enable = true;
   };

@@ -1,0 +1,51 @@
+name: Update lock files
+
+on:
+  schedule:
+    # nur-packages' update (08:23) pushes its lock within ~10 min; its build, which triggers nix-config's update, runs ~1 h
+    - cron: "38 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: update-lockfiles
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update lock files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Nix
+        uses: mzwing/nix-actions/nix/setup@master
+        with:
+          install-devenv: 'true'
+
+      - name: Update devenv inputs
+        run: devenv update
+
+      # Crate derivations are only shared with nur-packages when both build against the same nixpkgs
+      - name: Pin nixpkgs to nur-packages'
+        run: |
+          node="$(curl -fsSL https://raw.githubusercontent.com/mzwing/nur-packages/main/flake.lock | jq .nodes.nixpkgs)"
+          jq --indent 2 --argjson node "${node}" '.nodes.nixpkgs = $node' flake.lock >flake.lock.new
+          mv flake.lock.new flake.lock
+
+      # The devenv update may bring a crate2nix that writes a different Cargo.nix
+      - name: Regenerate Cargo.nix
+        shell: devenv shell -- bash -eo pipefail {0}
+        run: crate2nix generate
+
+      - name: Commit and push changes
+        uses: mzwing/nix-actions/git/commit-and-push@master
+        with:
+          paths: devenv.lock flake.lock Cargo.nix
+          message: "chore: update lockfile"
+          trigger-workflow: build.yml
+          github-token: ${{ github.token }}

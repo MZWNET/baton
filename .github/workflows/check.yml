@@ -81,7 +81,12 @@ jobs:
       - name: Check formatting
         run: |
           cargo fmt --all -- --check
-          git ls-files '*.nix' | xargs alejandra --check
+          git ls-files '*.nix' ':!:Cargo.nix' | xargs alejandra --check
+
+      - name: Check Cargo.nix is up to date
+        run: |
+          crate2nix generate
+          git diff --exit-code Cargo.nix
 
       - name: Check flake
         run: nix flake check

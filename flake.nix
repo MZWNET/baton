@@ -2,11 +2,11 @@
   description = "Keep the conversations of your coding agents in one append-only history and continue any of them in another agent";
 
   nixConfig = {
-    extra-substituters = ["https://mzwing.cachix.org"];
-    extra-trusted-public-keys = ["mzwing.cachix.org-1:tOO3NqAwrXyPCnecEl/0wXwparCRksM5TeuS/wZK+KA="];
+    extra-substituters = ["https://nix-cache.service.mzwing.eu.org"];
+    extra-trusted-public-keys = ["nix-cache.service.mzwing.eu.org-1:ZI+74ziFu8O5j5jSAz45VTPo09uLYH7O8F2dBYBQYsk="];
   };
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
   outputs = {nixpkgs, ...}: let
     forAllSystems = nixpkgs.lib.genAttrs [
